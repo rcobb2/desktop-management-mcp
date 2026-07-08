@@ -58,6 +58,15 @@ The Intune app registration needs these **Application** permissions (with admin 
 
 ## Client Configuration
 
+Point clients at `http://localhost:<port>/mcp` for a locally-running server, or at the `https://` hostname below when talking to the podman02 deployment (Caddy terminates TLS and reverse-proxies to the container over plain HTTP — the servers themselves never speak TLS directly).
+
+| Environment | JAMF URL | Intune URL |
+|---|---|---|
+| Local (`./start-jamf.sh` / `./start-intune.sh`) | `http://localhost:3001/mcp` | `http://localhost:3002/mcp` |
+| podman02 (internal DNS only) | `https://jamf-mcp.colgate.edu/mcp` | `https://intune-mcp.colgate.edu/mcp` |
+
+The podman02 hostnames resolve only inside Colgate's network (internal DNS locale) — see `IAC/ansible-servers/linux/apps/desktop-management-mcp.yml`. Neither deployment has authentication on the `/mcp` endpoint, and several JAMF tools are destructive (`EraseDevice`, `RestartDevice`, `UnlockUserAccount`, etc.) — treat the URL itself as sensitive.
+
 ### Claude Code (`~/.claude/claude_desktop_config.json` or MCP settings)
 
 ```json
@@ -65,11 +74,11 @@ The Intune app registration needs these **Application** permissions (with admin 
   "mcpServers": {
     "jamf": {
       "type": "http",
-      "url": "http://localhost:3001/mcp"
+      "url": "https://jamf-mcp.colgate.edu/mcp"
     },
     "intune": {
       "type": "http",
-      "url": "http://localhost:3002/mcp"
+      "url": "https://intune-mcp.colgate.edu/mcp"
     }
   }
 }
@@ -80,8 +89,8 @@ The Intune app registration needs these **Application** permissions (with admin 
 ```json
 {
   "mcpServers": {
-    "jamf": { "httpUrl": "http://localhost:3001/mcp" },
-    "intune": { "httpUrl": "http://localhost:3002/mcp" }
+    "jamf": { "httpUrl": "https://jamf-mcp.colgate.edu/mcp" },
+    "intune": { "httpUrl": "https://intune-mcp.colgate.edu/mcp" }
   }
 }
 ```
@@ -91,11 +100,13 @@ The Intune app registration needs these **Application** permissions (with admin 
 ```json
 {
   "mcp": {
-    "jamf":   { "type": "remote", "url": "http://localhost:3001/mcp", "enabled": true },
-    "intune": { "type": "remote", "url": "http://localhost:3002/mcp", "enabled": true }
+    "jamf":   { "type": "remote", "url": "https://jamf-mcp.colgate.edu/mcp", "enabled": true },
+    "intune": { "type": "remote", "url": "https://intune-mcp.colgate.edu/mcp", "enabled": true }
   }
 }
 ```
+
+Swap in the `http://localhost:<port>/mcp` URLs from the table above for local development.
 
 ## MCP Tools Reference
 
