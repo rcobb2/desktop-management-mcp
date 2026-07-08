@@ -2,6 +2,7 @@ import { Client } from "@microsoft/microsoft-graph-client";
 import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials";
 import { ClientSecretCredential } from "@azure/identity";
 import { createLogger, logApiCall } from '../utils/logger.js';
+import { AmbiguousMatchError } from '../utils/errors.js';
 
 export class IntuneClient {
     private client: Client;
@@ -178,15 +179,27 @@ export class IntuneClient {
                 const prefixMatches = prefixResponse.value || [];
                 if (prefixMatches.length > 0) {
                     const exactCaseInsensitive = prefixMatches.find((d: any) => String(d.deviceName || '').toLowerCase() === normalizedDeviceName.toLowerCase());
-                    const best = exactCaseInsensitive || prefixMatches[0];
+                    if (exactCaseInsensitive) {
+                        this.logger.info('Device found by prefix name search', {
+                            deviceName: normalizedDeviceName,
+                            matchedDeviceName: exactCaseInsensitive.deviceName,
+                            deviceId: exactCaseInsensitive.id
+                        });
+                        return exactCaseInsensitive;
+                    }
+                    if (prefixMatches.length > 1) {
+                        const candidates = prefixMatches.map((d: any) => `"${d.deviceName}" (${d.serialNumber || 'no serial'})`).join(', ');
+                        throw new AmbiguousMatchError(`Ambiguous device name "${normalizedDeviceName}" matches ${prefixMatches.length} devices and none is an exact match: ${candidates}. Retry with the exact name or a serial number.`);
+                    }
                     this.logger.info('Device found by prefix name search', {
                         deviceName: normalizedDeviceName,
-                        matchedDeviceName: best.deviceName,
-                        deviceId: best.id
+                        matchedDeviceName: prefixMatches[0].deviceName,
+                        deviceId: prefixMatches[0].id
                     });
-                    return best;
+                    return prefixMatches[0];
                 }
             } catch (prefixError) {
+                if (prefixError instanceof AmbiguousMatchError) throw prefixError;
                 this.logger.warn('Prefix device search failed; continuing with client-side fallback', {
                     deviceName: normalizedDeviceName,
                     error: (prefixError as Error).message
@@ -216,14 +229,18 @@ export class IntuneClient {
                 return exactClient;
             }
 
-            const containsClient = devices.find((device: any) => String(device.deviceName || '').toLowerCase().includes(lowerName));
-            if (containsClient) {
+            const containsMatches = devices.filter((device: any) => String(device.deviceName || '').toLowerCase().includes(lowerName));
+            if (containsMatches.length > 1) {
+                const candidates = containsMatches.map((d: any) => `"${d.deviceName}" (${d.serialNumber || 'no serial'})`).join(', ');
+                throw new AmbiguousMatchError(`Ambiguous device name "${normalizedDeviceName}" matches ${containsMatches.length} devices and none is an exact match: ${candidates}. Retry with the exact name or a serial number.`);
+            }
+            if (containsMatches.length === 1) {
                 this.logger.info('Device found by client-side contains fallback', {
                     deviceName: normalizedDeviceName,
-                    matchedDeviceName: containsClient.deviceName,
-                    deviceId: containsClient.id
+                    matchedDeviceName: containsMatches[0].deviceName,
+                    deviceId: containsMatches[0].id
                 });
-                return containsClient;
+                return containsMatches[0];
             }
 
             this.logger.warn('Device not found by name', { deviceName: normalizedDeviceName });
@@ -579,11 +596,13 @@ export class IntuneClient {
     /**
      * Get Intune configuration policies from both classic device configurations and settings catalog policies.
      */
-    public async getConfigurationPolicies(options?: { policyName?: string; platform?: string }) {
+    public async getConfigurationPolicies(options?: { policyName?: string; platform?: string; page?: number; pageSize?: number }) {
         const policyName = options?.policyName?.trim().toLowerCase();
         const platform = options?.platform?.trim().toLowerCase();
+        const page = options?.page ?? 0;
+        const pageSize = options?.pageSize ?? 100;
 
-        this.logger.info('Fetching configuration policies', { policyName: options?.policyName, platform: options?.platform });
+        this.logger.info('Fetching configuration policies', { policyName: options?.policyName, platform: options?.platform, page, pageSize });
         await this.trackAuthAttempt();
 
         const result: any = {
@@ -662,11 +681,18 @@ export class IntuneClient {
                 });
             }
 
-            result.combined = combined;
+            const totalCount = combined.length;
+            const start = page * pageSize;
+            result.combined = combined.slice(start, start + pageSize);
+            result.totalCount = totalCount;
+            result.page = page;
+            result.pageSize = pageSize;
+
             this.logger.info('Configuration policies retrieved', {
                 totalClassic: normalizedClassic.length,
                 totalSettingsCatalog: normalizedSettingsCatalog.length,
-                filteredTotal: combined.length
+                filteredTotal: totalCount,
+                returnedCount: result.combined.length
             });
 
             return result;
@@ -1218,15 +1244,19 @@ export class IntuneClient {
     /**
      * Read Intune app deployment definitions from mobile apps.
      */
-    public async getAppDeployments(options?: { appName?: string; publisher?: string; platform?: string }) {
+    public async getAppDeployments(options?: { appName?: string; publisher?: string; platform?: string; page?: number; pageSize?: number }) {
         const appName = options?.appName?.trim().toLowerCase();
         const publisher = options?.publisher?.trim().toLowerCase();
         const platform = options?.platform?.trim().toLowerCase();
+        const page = options?.page ?? 0;
+        const pageSize = options?.pageSize ?? 100;
 
         this.logger.info('Fetching app deployments', {
             appName: options?.appName,
             publisher: options?.publisher,
-            platform: options?.platform
+            platform: options?.platform,
+            page,
+            pageSize
         });
         await this.trackAuthAttempt();
 
@@ -1276,17 +1306,25 @@ export class IntuneClient {
                 filtered = filtered.filter((app: any) => String(app.platformHint || '').toLowerCase().includes(platform));
             }
 
+            const filteredTotal = filtered.length;
+            const start = page * pageSize;
+            const paged = filtered.slice(start, start + pageSize);
+
             const result = {
-                apps: filtered,
+                apps: paged,
+                page,
+                pageSize,
                 summary: {
                     totalApps: normalized.length,
-                    filteredApps: filtered.length
+                    filteredApps: filteredTotal,
+                    returnedApps: paged.length
                 }
             };
 
             this.logger.info('App deployments retrieved', {
                 totalApps: result.summary.totalApps,
-                filteredApps: result.summary.filteredApps
+                filteredApps: result.summary.filteredApps,
+                returnedApps: result.summary.returnedApps
             });
 
             return result;
@@ -1467,6 +1505,117 @@ export class IntuneClient {
                 error: (error as Error).message,
                 stack: (error as Error).stack
             });
+            throw error;
+        }
+    }
+
+    /**
+     * Trigger an immediate Intune sync check-in on a managed device.
+     */
+    public async syncDevice(deviceId: string) {
+        this.logger.info('Triggering device sync', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}/syncDevice`)
+                .version('v1.0')
+                .post({});
+            logApiCall(this.logger, 'POST', `/deviceManagement/managedDevices/${deviceId}/syncDevice`, 200, Date.now() - apiStart);
+            this.logger.info('Device sync triggered', { deviceId });
+            return { success: true, deviceId };
+        } catch (error) {
+            this.logger.error('Error triggering device sync', { deviceId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Reboot a managed device immediately.
+     */
+    public async rebootDevice(deviceId: string) {
+        this.logger.info('Triggering device reboot', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}/rebootNow`)
+                .version('v1.0')
+                .post({});
+            logApiCall(this.logger, 'POST', `/deviceManagement/managedDevices/${deviceId}/rebootNow`, 200, Date.now() - apiStart);
+            this.logger.info('Device reboot triggered', { deviceId });
+            return { success: true, deviceId };
+        } catch (error) {
+            this.logger.error('Error triggering device reboot', { deviceId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Remotely lock a managed device.
+     */
+    public async remoteLockDevice(deviceId: string) {
+        this.logger.info('Triggering remote lock', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}/remoteLock`)
+                .version('v1.0')
+                .post({});
+            logApiCall(this.logger, 'POST', `/deviceManagement/managedDevices/${deviceId}/remoteLock`, 200, Date.now() - apiStart);
+            this.logger.info('Remote lock triggered', { deviceId });
+            return { success: true, deviceId };
+        } catch (error) {
+            this.logger.error('Error triggering remote lock', { deviceId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Retire a managed device (removes company data, leaves personal data intact).
+     */
+    public async retireDevice(deviceId: string) {
+        this.logger.info('Triggering device retire', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}/retire`)
+                .version('v1.0')
+                .post({});
+            logApiCall(this.logger, 'POST', `/deviceManagement/managedDevices/${deviceId}/retire`, 200, Date.now() - apiStart);
+            this.logger.info('Device retire triggered', { deviceId });
+            return { success: true, deviceId };
+        } catch (error) {
+            this.logger.error('Error triggering device retire', { deviceId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Wipe a managed device (factory reset). IRREVERSIBLE.
+     */
+    public async wipeDevice(deviceId: string, options?: { keepEnrollmentData?: boolean; keepUserData?: boolean; macOsUnlockCode?: string }) {
+        this.logger.info('Triggering device wipe', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const body: Record<string, any> = {
+                keepEnrollmentData: options?.keepEnrollmentData ?? false,
+                keepUserData: options?.keepUserData ?? false,
+            };
+            if (options?.macOsUnlockCode) body.macOsUnlockCode = options.macOsUnlockCode;
+
+            const apiStart = Date.now();
+            await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}/wipe`)
+                .version('v1.0')
+                .post(body);
+            logApiCall(this.logger, 'POST', `/deviceManagement/managedDevices/${deviceId}/wipe`, 200, Date.now() - apiStart);
+            this.logger.info('Device wipe triggered', { deviceId });
+            return { success: true, deviceId };
+        } catch (error) {
+            this.logger.error('Error triggering device wipe', { deviceId, error: (error as Error).message });
             throw error;
         }
     }

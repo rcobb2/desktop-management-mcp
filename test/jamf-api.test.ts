@@ -131,7 +131,7 @@ describe("JamfClient", () => {
         });
 
         test("get FileVault status by serial returns disk encryption data", async () => {
-            const data: any = await client.getFilevaultStatus(TEST_COMPUTER_SERIAL);
+            const data: any = await client.getFilevaultStatus({ serialNumber: TEST_COMPUTER_SERIAL });
             assert.ok(data !== null, "should return data for known serial");
             assert.ok(data.name, "should include computer name");
             assert.ok(data.diskEncryption !== undefined, "diskEncryption section should be present");
@@ -361,13 +361,13 @@ describe("JamfClient", () => {
     describe("Write operations", () => {
 
         skipWrite("send BlankPush MDM command to test computer", async () => {
-            const result = await client.sendComputerMdmCommand(TEST_COMPUTER_SERIAL, "BlankPush");
+            const result = await client.sendComputerMdmCommand({ serialNumber: TEST_COMPUTER_SERIAL }, "BlankPush");
             assert.ok(result.success === true);
             assert.equal(result.command, "BlankPush");
         });
 
         skipWrite("trigger inventory update on test computer", async () => {
-            const result = await client.sendComputerMdmCommand(TEST_COMPUTER_SERIAL, "UpdateInventory");
+            const result = await client.sendComputerMdmCommand({ serialNumber: TEST_COMPUTER_SERIAL }, "UpdateInventory");
             assert.ok(result.success === true);
         });
 
@@ -380,15 +380,15 @@ describe("JamfClient", () => {
             const testRoom = `test-${Date.now()}`;
 
             // Write a test value
-            const update = await client.updateComputerRecord(TEST_COMPUTER_SERIAL, { room: testRoom });
+            const update = await client.updateComputerRecord({ serialNumber: TEST_COMPUTER_SERIAL }, { room: testRoom });
             assert.ok(update.success);
 
             // Restore original value
-            await client.updateComputerRecord(TEST_COMPUTER_SERIAL, { room: originalRoom });
+            await client.updateComputerRecord({ serialNumber: TEST_COMPUTER_SERIAL }, { room: originalRoom });
         });
 
         skipWrite("flush pending MDM commands from test computer", async () => {
-            const result = await client.flushComputerMdmCommands(TEST_COMPUTER_SERIAL, "Pending");
+            const result = await client.flushComputerMdmCommands({ serialNumber: TEST_COMPUTER_SERIAL }, "Pending");
             assert.ok(result.success === true);
         });
     });

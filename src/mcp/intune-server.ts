@@ -18,6 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { IntuneClient } from "../intune/graph-api.js";
+import { translateApiError } from "../utils/errors.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -39,10 +40,9 @@ function notFound(label: string): { content: [{ type: "text"; text: string }]; i
 }
 
 function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; isError: true } {
-    const msg = err instanceof Error ? err.message : String(err);
     return {
         isError: true,
-        content: [{ type: "text", text: `Error: ${msg}` }],
+        content: [{ type: "text", text: `Error: ${translateApiError(err)}` }],
     };
 }
 
@@ -51,18 +51,18 @@ function errorResult(err: unknown): { content: [{ type: "text"; text: string }];
 async function resolveDevice(
     client: IntuneClient,
     opts: { deviceName?: string; deviceId?: string; serialNumber?: string }
-): Promise<{ deviceId: string; azureADDeviceId?: string } | null> {
+): Promise<{ deviceId: string; azureADDeviceId?: string; deviceName?: string; serialNumber?: string } | null> {
     if (opts.deviceId) return { deviceId: opts.deviceId };
 
     if (opts.deviceName) {
-        const device = await client.getManagedDeviceByName(opts.deviceName);
-        if (device) return { deviceId: device.id, azureADDeviceId: device.azureADDeviceId };
+        const device: any = await client.getManagedDeviceByName(opts.deviceName);
+        if (device) return { deviceId: device.id, azureADDeviceId: device.azureADDeviceId, deviceName: device.deviceName, serialNumber: device.serialNumber };
         return null;
     }
 
     if (opts.serialNumber) {
-        const device = await client.getManagedDeviceBySerialNumber(opts.serialNumber);
-        if (device) return { deviceId: device.id, azureADDeviceId: device.azureADDeviceId };
+        const device: any = await client.getManagedDeviceBySerialNumber(opts.serialNumber);
+        if (device) return { deviceId: device.id, azureADDeviceId: device.azureADDeviceId, deviceName: device.deviceName, serialNumber: device.serialNumber };
         return null;
     }
 
@@ -79,8 +79,16 @@ async function resolveAppByName(
 
     const lower = appName.toLowerCase();
     const exact = apps.find((a: any) => String(a.name ?? "").toLowerCase() === lower);
-    const match = exact ?? apps[0];
-    return { appId: match.id, appName: match.name };
+    if (exact) return { appId: exact.id, appName: exact.name };
+
+    if (apps.length > 1) {
+        const candidates = apps.map((a: any) => `"${a.name}" (ID: ${a.id})`).join(", ");
+        throw new Error(
+            `Ambiguous app name "${appName}" matches ${apps.length} apps and none is an exact match: ${candidates}. Retry with the exact name or pass appId directly.`
+        );
+    }
+
+    return { appId: apps[0].id, appName: apps[0].name };
 }
 
 async function resolvePolicyByName(
@@ -96,8 +104,16 @@ async function resolvePolicyByName(
 
     const lower = policyName.toLowerCase();
     const exact = all.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
-    const match = exact ?? all[0];
-    return { policyId: match.id, policyName: match.name, source: match.source };
+    if (exact) return { policyId: exact.id, policyName: exact.name, source: exact.source };
+
+    if (all.length > 1) {
+        const candidates = all.map((p: any) => `"${p.name}" (ID: ${p.id}, source: ${p.source})`).join(", ");
+        throw new Error(
+            `Ambiguous policy name "${policyName}" matches ${all.length} policies and none is an exact match: ${candidates}. Retry with the exact name, a source filter, or pass policyId directly.`
+        );
+    }
+
+    return { policyId: all[0].id, policyName: all[0].name, source: all[0].source };
 }
 
 const DeviceIdentifierSchema = {
@@ -384,8 +400,9 @@ function createIntuneMcpServer(): McpServer {
                     const intuneSection =
                         intune.length > 0
                             ? `### Intune App Deployments (${intune.length})\n${intune
+                                  .slice(0, 50)
                                   .map((a: any) => `- **${a.displayName}** | Intent: ${a.intent ?? "—"} | State: ${a.installState ?? a.installSummary?.installedDeviceCount ?? "—"}`)
-                                  .join("\n")}`
+                                  .join("\n")}${intune.length > 50 ? `\n_…and ${intune.length - 50} more_` : ""}`
                             : "### Intune App Deployments\n_None_";
 
                     return `## Applications — ${label}\n\n${detectedSection}\n\n${intuneSection}`;
@@ -404,7 +421,7 @@ function createIntuneMcpServer(): McpServer {
         {
             description:
                 "List configuration policies in Microsoft Intune, including both classic device configuration profiles " +
-                "and modern Settings Catalog policies. Optionally filter by name or platform. " +
+                "and modern Settings Catalog policies. Optionally filter by name or platform. Paginated. " +
                 "Returns policy ID, name, platform, last modified date, and assignment count.",
             inputSchema: {
                 policyName: z
@@ -417,19 +434,22 @@ function createIntuneMcpServer(): McpServer {
                     .describe(
                         'Optional platform filter (e.g. "windows10", "macOS", "iOS", "android")'
                     ),
+                page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
                 response_format: ResponseFormatSchema,
             },
             annotations: { readOnlyHint: true, openWorldHint: true },
         },
-        async ({ policyName, platform, response_format = "markdown" }) => {
+        async ({ policyName, platform, page = 0, pageSize = 100, response_format = "markdown" }) => {
             try {
-                const data = await client.getConfigurationPolicies({ policyName, platform });
+                const data = await client.getConfigurationPolicies({ policyName, platform, page, pageSize });
 
                 const text = toText(data, response_format, () => {
                     const d = data as any;
                     const combined: any[] = d.combined ?? [];
+                    const totalCount: number = d.totalCount ?? combined.length;
 
-                    if (combined.length === 0) {
+                    if (totalCount === 0) {
                         const filters = [policyName && `name: "${policyName}"`, platform && `platform: "${platform}"`]
                             .filter(Boolean)
                             .join(", ");
@@ -462,7 +482,7 @@ function createIntuneMcpServer(): McpServer {
                             ? ` (filtered: ${[policyName && `name="${policyName}"`, platform && `platform="${platform}"`].filter(Boolean).join(", ")})`
                             : "";
 
-                    return `## Configuration Policies${filterNote} — ${combined.length} total\n\n${sections}`;
+                    return `## Configuration Policies${filterNote} — page ${page}, showing ${combined.length} of ${totalCount} total\n\n${sections}`;
                 });
 
                 return { content: [{ type: "text", text }] };
@@ -717,7 +737,7 @@ function createIntuneMcpServer(): McpServer {
         {
             description:
                 "List app deployments configured in Microsoft Intune. " +
-                "Optionally filter by app name, publisher, or platform. " +
+                "Optionally filter by app name, publisher, or platform. Paginated. " +
                 "Returns app ID, name, publisher, platform, app type, and deployment counts.",
             inputSchema: {
                 appName: z
@@ -732,19 +752,22 @@ function createIntuneMcpServer(): McpServer {
                     .string()
                     .optional()
                     .describe('Optional platform filter (e.g. "windows", "macOS", "iOS", "android")'),
+                page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
                 response_format: ResponseFormatSchema,
             },
             annotations: { readOnlyHint: true, openWorldHint: true },
         },
-        async ({ appName, publisher, platform, response_format = "markdown" }) => {
+        async ({ appName, publisher, platform, page = 0, pageSize = 100, response_format = "markdown" }) => {
             try {
-                const data = await client.getAppDeployments({ appName, publisher, platform });
+                const data = await client.getAppDeployments({ appName, publisher, platform, page, pageSize });
 
                 const text = toText(data, response_format, () => {
                     const d = data as any;
                     const apps: any[] = d.apps ?? [];
+                    const filteredTotal: number = d.summary?.filteredApps ?? apps.length;
 
-                    if (apps.length === 0) {
+                    if (filteredTotal === 0) {
                         const filters = [
                             appName && `name: "${appName}"`,
                             publisher && `publisher: "${publisher}"`,
@@ -770,7 +793,7 @@ function createIntuneMcpServer(): McpServer {
                         .filter(Boolean)
                         .join(", ");
 
-                    return `## App Deployments${filterNote ? ` (${filterNote})` : ""} — ${apps.length} found\n\n${rows}`;
+                    return `## App Deployments${filterNote ? ` (${filterNote})` : ""} — page ${page}, showing ${apps.length} of ${filteredTotal} total\n\n${rows}`;
                 });
 
                 return { content: [{ type: "text", text }] };
@@ -915,6 +938,162 @@ function createIntuneMcpServer(): McpServer {
                     }
                 );
 
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
+    // ── 14. intune_sync_device ───────────────────────────────────────────────
+    server.registerTool(
+        "intune_sync_device",
+        {
+            description:
+                "Trigger an immediate Intune check-in/sync on a managed device, so recently changed " +
+                "policies, apps, or compliance state are evaluated without waiting for the next scheduled sync. " +
+                "Accepts device name, Intune device ID, or serial number.",
+            inputSchema: {
+                ...DeviceIdentifierSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: false },
+        },
+        async ({ deviceName, deviceId, serialNumber }) => {
+            try {
+                const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                if (!resolved) {
+                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                }
+                await client.syncDevice(resolved.deviceId);
+                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const text = `Sync triggered successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
+    // ── 15. intune_reboot_device ─────────────────────────────────────────────
+    server.registerTool(
+        "intune_reboot_device",
+        {
+            description:
+                "Reboot a managed device immediately via Intune MDM. " +
+                "Accepts device name, Intune device ID, or serial number.",
+            inputSchema: {
+                ...DeviceIdentifierSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+        },
+        async ({ deviceName, deviceId, serialNumber }) => {
+            try {
+                const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                if (!resolved) {
+                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                }
+                await client.rebootDevice(resolved.deviceId);
+                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const text = `Reboot command sent successfully to **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
+    // ── 16. intune_remote_lock ───────────────────────────────────────────────
+    server.registerTool(
+        "intune_remote_lock",
+        {
+            description:
+                "Remotely lock a managed device via Intune MDM, requiring the device passcode/PIN to unlock. " +
+                "Accepts device name, Intune device ID, or serial number.",
+            inputSchema: {
+                ...DeviceIdentifierSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+        },
+        async ({ deviceName, deviceId, serialNumber }) => {
+            try {
+                const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                if (!resolved) {
+                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                }
+                await client.remoteLockDevice(resolved.deviceId);
+                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const text = `Remote lock command sent successfully to **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
+    // ── 17. intune_retire_device ─────────────────────────────────────────────
+    server.registerTool(
+        "intune_retire_device",
+        {
+            description:
+                "Retire a managed device from Intune: removes company data and management (Intune-deployed apps, " +
+                "profiles, email) but leaves personal data intact. Use for BYOD offboarding. " +
+                "This is IRREVERSIBLE — the device must be re-enrolled to be managed again. " +
+                "Accepts device name, Intune device ID, or serial number.",
+            inputSchema: {
+                ...DeviceIdentifierSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+        },
+        async ({ deviceName, deviceId, serialNumber }) => {
+            try {
+                const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                if (!resolved) {
+                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                }
+                await client.retireDevice(resolved.deviceId);
+                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const text = `Retire command sent successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}. Company data and management will be removed from this device.`;
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
+    // ── 18. intune_wipe_device ───────────────────────────────────────────────
+    server.registerTool(
+        "intune_wipe_device",
+        {
+            description:
+                "Factory-reset a managed device via Intune MDM. This is IRREVERSIBLE and erases ALL data on the device. " +
+                "Accepts device name, Intune device ID, or serial number. " +
+                "Use keepEnrollmentData/keepUserData to preserve enrollment or user data where the platform supports it.",
+            inputSchema: {
+                ...DeviceIdentifierSchema,
+                keepEnrollmentData: z
+                    .boolean()
+                    .optional()
+                    .describe("If true, preserves MDM enrollment data so the device re-enrolls automatically after wipe (default: false)"),
+                keepUserData: z
+                    .boolean()
+                    .optional()
+                    .describe("If true, preserves user data on the device where supported (default: false)"),
+                macOsUnlockCode: z
+                    .string()
+                    .optional()
+                    .describe("Required for some macOS devices: the unlock/recovery code needed to complete the wipe"),
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+        },
+        async ({ deviceName, deviceId, serialNumber, keepEnrollmentData, keepUserData, macOsUnlockCode }) => {
+            try {
+                const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                if (!resolved) {
+                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                }
+                await client.wipeDevice(resolved.deviceId, { keepEnrollmentData, keepUserData, macOsUnlockCode });
+                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const text = `Wipe command sent successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}. This device will be erased.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
                 return errorResult(err);

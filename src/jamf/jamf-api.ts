@@ -1,6 +1,12 @@
 import axios, { AxiosInstance } from 'axios';
 import { createLogger, logApiCall, logAuth } from '../utils/logger.js';
 
+export interface ComputerIdentifier {
+    computerId?: string;
+    computerName?: string;
+    serialNumber?: string;
+}
+
 export class JamfClient {
     private client: AxiosInstance;
     private token: string | null = null;
@@ -204,45 +210,51 @@ export class JamfClient {
         }
     }
 
-    public async getSmartComputerGroupMembers(groupId: string) {
+    public async getSmartComputerGroupMembers(groupId: string, page?: number, pageSize?: number) {
         await this.ensureAuthenticated();
-        this.logger.info('Fetching smart computer group members', { groupId });
+        this.logger.info('Fetching smart computer group members', { groupId, page: page ?? 0, pageSize: pageSize ?? 100 });
         try {
             // Using Jamf Pro API v2 to get member IDs
             const apiStart = Date.now();
             const response = await this.client.get(`/api/v2/computer-groups/smart-group-membership/${groupId}`);
-            let apiDuration = Date.now() - apiStart;
+            const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, response.status, apiDuration);
-            
-            const memberIds = response.data.members || [];
 
-            // Fetch computer details for each member to get hostname
-            const membersWithNames = await Promise.all(
-                memberIds.map(async (id: number) => {
-                    try {
-                        const apiStart2 = Date.now();
-                        const computerResponse = await this.client.get(`/api/v3/computers-inventory/${id}`, {
-                            params: { section: 'GENERAL' }
-                        });
-                        apiDuration = Date.now() - apiStart2;
-                        logApiCall(this.logger, 'GET', `/api/v3/computers-inventory/${id}`, computerResponse.status, apiDuration);
-                        return {
-                            id: id,
-                            name: computerResponse.data.general?.name || 'Unknown'
-                        };
-                    } catch (error) {
-                        this.logger.error(`Error fetching details for computer ID ${id}`, { error: (error as Error).message });
-                        return {
-                            id: id,
-                            name: 'Error fetching name'
-                        };
-                    }
-                })
-            );
+            const allMemberIds: number[] = response.data.members || [];
+            const totalCount = allMemberIds.length;
 
-            this.logger.info('Smart computer group members retrieved successfully', { groupId, memberCount: membersWithNames.length });
+            const start = (page ?? 0) * (pageSize ?? 100);
+            const pagedMemberIds = allMemberIds.slice(start, start + (pageSize ?? 100));
+
+            // Fetch computer details in concurrency-capped batches to avoid a request storm on large groups
+            const CONCURRENCY = 10;
+            const membersWithNames: Array<{ id: number; name: string }> = [];
+            for (let i = 0; i < pagedMemberIds.length; i += CONCURRENCY) {
+                const batch = pagedMemberIds.slice(i, i + CONCURRENCY);
+                const batchResults = await Promise.all(
+                    batch.map(async (id: number) => {
+                        try {
+                            const memberStart = Date.now();
+                            const computerResponse = await this.client.get(`/api/v3/computers-inventory/${id}`, {
+                                params: { section: 'GENERAL' }
+                            });
+                            logApiCall(this.logger, 'GET', `/api/v3/computers-inventory/${id}`, computerResponse.status, Date.now() - memberStart);
+                            return { id, name: computerResponse.data.general?.name || 'Unknown' };
+                        } catch (error) {
+                            this.logger.error(`Error fetching details for computer ID ${id}`, { error: (error as Error).message });
+                            return { id, name: 'Error fetching name' };
+                        }
+                    })
+                );
+                membersWithNames.push(...batchResults);
+            }
+
+            this.logger.info('Smart computer group members retrieved successfully', { groupId, returnedCount: membersWithNames.length, totalCount });
             return {
-                totalCount: membersWithNames.length,
+                totalCount,
+                returnedCount: membersWithNames.length,
+                page: page ?? 0,
+                pageSize: pageSize ?? 100,
                 members: membersWithNames
             };
         } catch (error) {
@@ -563,20 +575,45 @@ export class JamfClient {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    private async resolveComputerId(nameOrSerial: string): Promise<string> {
-        for (const filter of [
-            `hardware.serialNumber=="${nameOrSerial}"`,
-            `general.name=="${nameOrSerial}"`
-        ]) {
+    private async resolveComputer(identifier: ComputerIdentifier): Promise<{ id: string; name?: string; serialNumber?: string }> {
+        if (identifier.computerId) {
+            try {
+                const apiStart = Date.now();
+                const response = await this.client.get('/api/v3/computers-inventory', {
+                    params: { filter: `id==${identifier.computerId}`, 'page-size': 1, section: ['GENERAL', 'HARDWARE'] }
+                });
+                logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', response.status, Date.now() - apiStart);
+                const computer = response.data.results?.[0];
+                if (!computer) throw new Error(`Computer with ID ${identifier.computerId} not found.`);
+                return { id: String(computer.id), name: computer.general?.name, serialNumber: computer.hardware?.serialNumber };
+            } catch (error) {
+                if (axios.isAxiosError(error) && error.response?.status === 403) {
+                    throw new Error(`Permission denied (403). The API client may be missing 'Read Computers' permissions in JAMF Pro.`);
+                }
+                throw error;
+            }
+        }
+
+        const filters: string[] = [];
+        if (identifier.serialNumber) filters.push(`hardware.serialNumber=="${identifier.serialNumber}"`);
+        if (identifier.computerName) filters.push(`general.name=="${identifier.computerName}"`);
+
+        if (filters.length === 0) {
+            throw new Error('Provide computerId, computerName, or serialNumber to identify the computer.');
+        }
+
+        for (const filter of filters) {
             const apiStart = Date.now();
             const response = await this.client.get('/api/v3/computers-inventory', {
-                params: { filter, 'page-size': 1, section: 'GENERAL' }
+                params: { filter, 'page-size': 1, section: ['GENERAL', 'HARDWARE'] }
             });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', response.status, Date.now() - apiStart);
-            const id = response.data.results?.[0]?.id;
-            if (id) return String(id);
+            const computer = response.data.results?.[0];
+            if (computer) return { id: String(computer.id), name: computer.general?.name, serialNumber: computer.hardware?.serialNumber };
         }
-        throw new Error(`Computer not found: "${nameOrSerial}"`);
+
+        const label = identifier.serialNumber ?? identifier.computerName ?? identifier.computerId;
+        throw new Error(`Computer not found: "${label}"`);
     }
 
     // ── New public methods ───────────────────────────────────────────────────
@@ -608,19 +645,19 @@ export class JamfClient {
     }
 
     public async sendComputerMdmCommand(
-        nameOrSerial: string,
+        identifier: ComputerIdentifier,
         command: string,
         options?: { unlockUsername?: string; erasurePasscode?: string }
     ) {
         await this.ensureAuthenticated();
-        this.logger.info('Sending MDM command', { nameOrSerial, command });
+        this.logger.info('Sending MDM command', { identifier, command });
         try {
-            const computerId = await this.resolveComputerId(nameOrSerial);
+            const computer = await this.resolveComputer(identifier);
             let url = `/JSSResource/computercommands/command/${command}`;
             if (command === 'UnlockUserAccount' && options?.unlockUsername) {
                 url += `/username/${encodeURIComponent(options.unlockUsername)}`;
             }
-            url += `/id/${computerId}`;
+            url += `/id/${computer.id}`;
 
             const body = command === 'EraseDevice' && options?.erasurePasscode
                 ? { computer_command: { command: { passcode: options.erasurePasscode } } }
@@ -629,19 +666,19 @@ export class JamfClient {
             const apiStart = Date.now();
             const response = await this.client.post(url, body);
             logApiCall(this.logger, 'POST', url, response.status, Date.now() - apiStart);
-            this.logger.info('MDM command sent successfully', { nameOrSerial, command, computerId });
-            return { success: true, command, computerId };
+            this.logger.info('MDM command sent successfully', { identifier, command, computerId: computer.id });
+            return { success: true, command, computerId: computer.id, name: computer.name, serialNumber: computer.serialNumber };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Send Computer Remote Commands' permissions in JAMF Pro.`);
             }
-            this.logger.error('Error sending MDM command', { nameOrSerial, command, error: (error as Error).message });
+            this.logger.error('Error sending MDM command', { identifier, command, error: (error as Error).message });
             throw error;
         }
     }
 
     public async updateComputerRecord(
-        nameOrSerial: string,
+        identifier: ComputerIdentifier,
         updates: {
             username?: string;
             realName?: string;
@@ -653,9 +690,9 @@ export class JamfClient {
         }
     ) {
         await this.ensureAuthenticated();
-        this.logger.info('Updating computer record', { nameOrSerial, updates });
+        this.logger.info('Updating computer record', { identifier, updates });
         try {
-            const computerId = await this.resolveComputerId(nameOrSerial);
+            const computer = await this.resolveComputer(identifier);
             const body: any = { computer: {} };
 
             const location: any = {};
@@ -671,16 +708,24 @@ export class JamfClient {
                 body.computer.general = { asset_tag: updates.assetTag };
             }
 
+            const updatedFields = (Object.keys(updates) as Array<keyof typeof updates>).filter((key) => updates[key] !== undefined);
+
             const apiStart = Date.now();
-            const response = await this.client.put(`/JSSResource/computers/id/${computerId}`, body);
-            logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${computerId}`, response.status, Date.now() - apiStart);
-            this.logger.info('Computer record updated', { nameOrSerial, computerId });
-            return { success: true, computerId };
+            const response = await this.client.put(`/JSSResource/computers/id/${computer.id}`, body);
+            logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${computer.id}`, response.status, Date.now() - apiStart);
+            this.logger.info('Computer record updated', { identifier, computerId: computer.id, updatedFields });
+            return {
+                success: true,
+                computerId: computer.id,
+                name: computer.name,
+                serialNumber: computer.serialNumber,
+                updatedFields
+            };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Computers' permissions in JAMF Pro.`);
             }
-            this.logger.error('Error updating computer record', { nameOrSerial, error: (error as Error).message });
+            this.logger.error('Error updating computer record', { identifier, error: (error as Error).message });
             throw error;
         }
     }
@@ -820,53 +865,52 @@ export class JamfClient {
         }
     }
 
-    public async flushComputerMdmCommands(nameOrSerial: string, status: 'Pending' | 'Failed' | 'Pending+Failed') {
+    public async flushComputerMdmCommands(identifier: ComputerIdentifier, status: 'Pending' | 'Failed' | 'Pending+Failed') {
         await this.ensureAuthenticated();
-        this.logger.info('Flushing MDM commands', { nameOrSerial, status });
+        this.logger.info('Flushing MDM commands', { identifier, status });
         try {
-            const computerId = await this.resolveComputerId(nameOrSerial);
+            const computer = await this.resolveComputer(identifier);
             const apiStart = Date.now();
             const response = await this.client.delete(
-                `/JSSResource/commandflush/computers/id/${computerId}/status/${status}`
+                `/JSSResource/commandflush/computers/id/${computer.id}/status/${status}`
             );
-            logApiCall(this.logger, 'DELETE', `/JSSResource/commandflush/computers/id/${computerId}/status/${status}`, response.status, Date.now() - apiStart);
-            this.logger.info('MDM commands flushed', { nameOrSerial, computerId, status });
-            return { success: true, computerId, status };
+            logApiCall(this.logger, 'DELETE', `/JSSResource/commandflush/computers/id/${computer.id}/status/${status}`, response.status, Date.now() - apiStart);
+            this.logger.info('MDM commands flushed', { identifier, computerId: computer.id, status });
+            return { success: true, computerId: computer.id, name: computer.name, serialNumber: computer.serialNumber, status };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Flush MDM Commands' permissions in JAMF Pro.`);
             }
-            this.logger.error('Error flushing MDM commands', { nameOrSerial, status, error: (error as Error).message });
+            this.logger.error('Error flushing MDM commands', { identifier, status, error: (error as Error).message });
             throw error;
         }
     }
 
-    public async getFilevaultStatus(nameOrSerial: string) {
+    public async getFilevaultStatus(identifier: ComputerIdentifier) {
         await this.ensureAuthenticated();
-        this.logger.info('Fetching FileVault status', { nameOrSerial });
+        this.logger.info('Fetching FileVault status', { identifier });
         try {
+            const computer = await this.resolveComputer(identifier);
             const apiStart = Date.now();
             const response = await this.client.get('/api/v3/computers-inventory', {
                 params: {
-                    filter: nameOrSerial.length <= 12 && /^[A-Z0-9]+$/.test(nameOrSerial)
-                        ? `hardware.serialNumber=="${nameOrSerial}"`
-                        : `general.name=="${nameOrSerial}"`,
+                    filter: `id==${computer.id}`,
                     'page-size': 1,
                     section: ['GENERAL', 'DISK_ENCRYPTION', 'HARDWARE']
                 }
             });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', response.status, Date.now() - apiStart);
-            const computer = response.data.results?.[0];
-            if (!computer) return null;
-            this.logger.info('FileVault status retrieved', { nameOrSerial });
+            const detail = response.data.results?.[0];
+            if (!detail) return null;
+            this.logger.info('FileVault status retrieved', { identifier });
             return {
-                id: computer.id,
-                name: computer.general?.name,
-                serialNumber: computer.hardware?.serialNumber,
-                diskEncryption: computer.diskEncryption
+                id: detail.id,
+                name: detail.general?.name,
+                serialNumber: detail.hardware?.serialNumber,
+                diskEncryption: detail.diskEncryption
             };
         } catch (error) {
-            this.logger.error('Error fetching FileVault status', { nameOrSerial, error: (error as Error).message });
+            this.logger.error('Error fetching FileVault status', { identifier, error: (error as Error).message });
             throw error;
         }
     }

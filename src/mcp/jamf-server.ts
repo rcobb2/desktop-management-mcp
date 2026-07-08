@@ -18,6 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { JamfClient } from "../jamf/jamf-api.js";
+import { translateApiError } from "../utils/errors.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -41,12 +42,17 @@ function notFound(label: string): { content: [{ type: "text"; text: string }]; i
 }
 
 function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; isError: true } {
-    const msg = err instanceof Error ? err.message : String(err);
     return {
         isError: true,
-        content: [{ type: "text", text: `Error: ${msg}` }],
+        content: [{ type: "text", text: `Error: ${translateApiError(err)}` }],
     };
 }
+
+const ComputerIdentifierSchema = {
+    computerName: z.string().optional().describe("Computer display name in JAMF Pro"),
+    serialNumber: z.string().optional().describe("Computer serial number"),
+    computerId: z.string().optional().describe("JAMF Pro numeric computer ID"),
+};
 
 // ─── Server factory ──────────────────────────────────────────────────────────
 
@@ -279,30 +285,30 @@ function createJamfMcpServer(): McpServer {
         "jamf_get_smart_group_members",
         {
             description:
-                "Get the list of Mac computers that currently belong to a JAMF Pro smart computer group. " +
-                "Returns member names, serials, models, and last check-in times. " +
+                "Get the list of Mac computers that currently belong to a JAMF Pro smart computer group. Paginated — " +
+                "large groups are fetched in concurrency-capped batches. Returns member names and JAMF computer IDs. " +
                 "Use jamf_list_smart_groups first to find a group ID.",
             inputSchema: {
                 groupId: z.string().describe("The JAMF Pro ID of the smart computer group"),
+                page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                pageSize: z.number().int().min(1).max(200).default(100).describe("Members per page (default: 100, max: 200)"),
                 response_format: ResponseFormatSchema,
             },
             annotations: { readOnlyHint: true, openWorldHint: true },
         },
-        async ({ groupId, response_format = "markdown" }) => {
+        async ({ groupId, page = 0, pageSize = 100, response_format = "markdown" }) => {
             try {
-                const data = await client.getSmartComputerGroupMembers(groupId);
-                // getSmartComputerGroupMembers returns { totalCount, members }
+                const data = await client.getSmartComputerGroupMembers(groupId, page, pageSize);
                 const members: any[] = (data as any).members ?? [];
+                const totalCount: number = (data as any).totalCount ?? members.length;
 
                 const text = toText(data, response_format, () => {
-                    if (members.length === 0) return `Smart group ${groupId} has no members.`;
+                    if (totalCount === 0) return `Smart group ${groupId} has no members.`;
+                    if (members.length === 0) return `Smart group ${groupId} has ${totalCount} members total, but page ${page} is out of range.`;
                     const rows = members
-                        .map((m: any) => {
-                            const gen = m.general ?? m;
-                            return `- **${gen.name ?? "Unknown"}** | Serial: ${gen.serialNumber ?? "—"} | Model: ${m.hardware?.model ?? "—"} | Last seen: ${gen.lastContactTime ?? "—"}`;
-                        })
+                        .map((m: any) => `- **${m.name ?? "Unknown"}** (Computer ID: ${m.id})`)
                         .join("\n");
-                    return `## Smart Group ${groupId} Members (${members.length})\n\n${rows}`;
+                    return `## Smart Group ${groupId} Members (page ${page}, showing ${members.length} of ${totalCount} total)\n\n${rows}`;
                 });
 
                 return { content: [{ type: "text", text }] };
@@ -590,14 +596,14 @@ function createJamfMcpServer(): McpServer {
         {
             description:
                 "Send an MDM command to a Mac managed by JAMF Pro. " +
-                "Accepts the computer name or serial number. " +
+                "Accepts computerName, serialNumber, or computerId to identify the target device. " +
                 "Supported commands: RestartDevice, ShutDownDevice, EraseDevice (IRREVERSIBLE), " +
                 "EnableRemoteDesktop, DisableRemoteDesktop, UnlockUserAccount, UpdateInventory, " +
                 "RotateFileVaultKey, BlankPush. " +
                 "EraseDevice requires erasurePasscode for Apple Silicon Macs. " +
                 "UnlockUserAccount requires the unlockUsername parameter.",
             inputSchema: {
-                computerNameOrSerial: z.string().describe("Computer display name or serial number"),
+                ...ComputerIdentifierSchema,
                 command: z.enum([
                     "RestartDevice",
                     "ShutDownDevice",
@@ -620,14 +626,21 @@ function createJamfMcpServer(): McpServer {
             },
             annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
         },
-        async ({ computerNameOrSerial, command, unlockUsername, erasurePasscode }) => {
+        async ({ computerName, serialNumber, computerId, command, unlockUsername, erasurePasscode }) => {
+            if (command === "UnlockUserAccount" && !unlockUsername) {
+                return {
+                    isError: true,
+                    content: [{ type: "text", text: "Error: unlockUsername is required when command=UnlockUserAccount." }],
+                };
+            }
             try {
                 const result = await client.sendComputerMdmCommand(
-                    computerNameOrSerial,
+                    { computerId, computerName, serialNumber },
                     command,
                     { unlockUsername, erasurePasscode }
                 );
-                const text = `MDM command **${command}** sent successfully to computer ID ${result.computerId}.`;
+                const label = result.name ?? computerName ?? serialNumber ?? result.computerId;
+                const text = `MDM command **${command}** sent successfully to **${label}**${result.serialNumber ? ` (${result.serialNumber})` : ""} [JAMF ID: ${result.computerId}].`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
                 return errorResult(err);
@@ -641,11 +654,11 @@ function createJamfMcpServer(): McpServer {
         {
             description:
                 "Update a Mac's inventory record in JAMF Pro. " +
-                "Accepts the computer name or serial number to identify the device. " +
+                "Accepts computerName, serialNumber, or computerId to identify the device. " +
                 "Can update: assigned username, real name, email, department, building, room, and asset tag. " +
                 "Only fields you provide will be changed — omitted fields are left as-is.",
             inputSchema: {
-                computerNameOrSerial: z.string().describe("Computer display name or serial number"),
+                ...ComputerIdentifierSchema,
                 username: z.string().optional().describe("JAMF username to assign to this computer"),
                 realName: z.string().optional().describe("Full name of the assigned user"),
                 emailAddress: z.string().optional().describe("Email address of the assigned user"),
@@ -656,12 +669,16 @@ function createJamfMcpServer(): McpServer {
             },
             annotations: { readOnlyHint: false, openWorldHint: true },
         },
-        async ({ computerNameOrSerial, username, realName, emailAddress, department, building, room, assetTag }) => {
+        async ({ computerName, serialNumber, computerId, username, realName, emailAddress, department, building, room, assetTag }) => {
             try {
-                const result = await client.updateComputerRecord(computerNameOrSerial, {
-                    username, realName, emailAddress, department, building, room, assetTag
-                });
-                const text = `Computer record updated successfully (JAMF ID: ${result.computerId}).`;
+                const result = await client.updateComputerRecord(
+                    { computerId, computerName, serialNumber },
+                    { username, realName, emailAddress, department, building, room, assetTag }
+                );
+                const label = result.name ?? computerName ?? serialNumber ?? result.computerId;
+                const changeSummary: Record<string, string | undefined> = { username, realName, emailAddress, department, building, room, assetTag };
+                const changes = result.updatedFields.map((field) => `${field} → ${changeSummary[field]}`).join(", ");
+                const text = `Updated **${label}**${result.serialNumber ? ` (${result.serialNumber})` : ""} [JAMF ID: ${result.computerId}]${changes ? `: ${changes}` : " (no fields changed)"}.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
                 return errorResult(err);
@@ -901,9 +918,9 @@ function createJamfMcpServer(): McpServer {
             description:
                 "Flush pending or failed MDM commands from a Mac's command queue in JAMF Pro. " +
                 "Use this when a device has stuck MDM commands that are blocking other management tasks. " +
-                "Accepts computer name or serial number.",
+                "Accepts computerName, serialNumber, or computerId.",
             inputSchema: {
-                computerNameOrSerial: z.string().describe("Computer display name or serial number"),
+                ...ComputerIdentifierSchema,
                 status: z
                     .enum(["Pending", "Failed", "Pending+Failed"])
                     .default("Pending+Failed")
@@ -911,10 +928,11 @@ function createJamfMcpServer(): McpServer {
             },
             annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: false },
         },
-        async ({ computerNameOrSerial, status = "Pending+Failed" }) => {
+        async ({ computerName, serialNumber, computerId, status = "Pending+Failed" }) => {
             try {
-                const result = await client.flushComputerMdmCommands(computerNameOrSerial, status);
-                const text = `Successfully flushed **${status}** MDM commands for computer ID ${result.computerId}.`;
+                const result = await client.flushComputerMdmCommands({ computerId, computerName, serialNumber }, status);
+                const label = result.name ?? computerName ?? serialNumber ?? result.computerId;
+                const text = `Successfully flushed **${status}** MDM commands for **${label}**${result.serialNumber ? ` (${result.serialNumber})` : ""} [JAMF ID: ${result.computerId}].`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
                 return errorResult(err);
@@ -929,23 +947,23 @@ function createJamfMcpServer(): McpServer {
             description:
                 "Get FileVault encryption status for a Mac managed by JAMF Pro. " +
                 "Returns encryption state, individual disk partition status, and whether the recovery key is escrowed. " +
-                "Accepts computer name or serial number.",
+                "Accepts computerName, serialNumber, or computerId.",
             inputSchema: {
-                computerNameOrSerial: z.string().describe("Computer display name or serial number"),
+                ...ComputerIdentifierSchema,
                 response_format: ResponseFormatSchema,
             },
             annotations: { readOnlyHint: true, openWorldHint: true },
         },
-        async ({ computerNameOrSerial, response_format = "markdown" }) => {
+        async ({ computerName, serialNumber, computerId, response_format = "markdown" }) => {
             try {
-                const data = await client.getFilevaultStatus(computerNameOrSerial);
-                if (!data) return notFound(`computer "${computerNameOrSerial}"`);
+                const data = await client.getFilevaultStatus({ computerId, computerName, serialNumber });
+                if (!data) return notFound(`computer (name: "${computerName ?? "—"}", id: "${computerId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
 
                 const text = toText(data, response_format, () => {
                     const fv = (data as any).diskEncryption ?? {};
                     const partitions: any[] = fv.individualDiskEncryptionCapabilities ?? fv.partitions ?? [];
                     const lines = [
-                        `## FileVault Status — ${(data as any).name ?? computerNameOrSerial}`,
+                        `## FileVault Status — ${(data as any).name ?? computerName ?? serialNumber}`,
                         `- **Serial:** ${(data as any).serialNumber ?? "—"}`,
                         `- **Overall State:** ${fv.bootPartitionEncryptionDetails?.partitionFileVault2State ?? fv.overallEncryptionStatus ?? "—"}`,
                         `- **Recovery Key Escrowed:** ${fv.institutionalRecoveryKeyPresent ? "Yes" : fv.individualRecoveryKeyPresent ? "Yes (personal)" : "No"}`,
