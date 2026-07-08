@@ -10,6 +10,14 @@ export class AmbiguousMatchError extends Error {
     }
 }
 
+/** Thrown by resolution helpers when no candidate matches at all. MCP tool handlers catch this to render a curated "Not found" message instead of a generic error. */
+export class NotFoundError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'NotFoundError';
+    }
+}
+
 function extractStatusCode(err: unknown): number | undefined {
     if (err && typeof err === 'object') {
         const anyErr = err as any;
@@ -38,7 +46,11 @@ export function translateApiError(err: unknown): string {
         case 401:
             return `Authentication failed (401). Credentials may be invalid, expired, or the app registration/API client lacks the required scope. Verify the configured client ID/secret and try again. (${raw})`;
         case 403:
-            return raw; // call sites already attach specific permission guidance
+            // JAMF call sites already rewrite 403s with specific permission guidance (message contains "permission").
+            // Intune's Graph SDK errors don't, so add generic actionable guidance in that case.
+            return /permission/i.test(raw)
+                ? raw
+                : `Permission denied (403): ${raw}. The app registration/API client may be missing the required scope or role assignment for this operation.`;
         case 404:
             return `Not found (404): the requested resource does not exist or the ID/name is wrong. (${raw})`;
         case 429: {

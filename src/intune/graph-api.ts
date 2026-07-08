@@ -3,6 +3,7 @@ import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-grap
 import { ClientSecretCredential } from "@azure/identity";
 import { createLogger, logApiCall } from '../utils/logger.js';
 import { AmbiguousMatchError } from '../utils/errors.js';
+import { paginate } from '../utils/pagination.js';
 
 export class IntuneClient {
     private client: Client;
@@ -599,10 +600,8 @@ export class IntuneClient {
     public async getConfigurationPolicies(options?: { policyName?: string; platform?: string; page?: number; pageSize?: number }) {
         const policyName = options?.policyName?.trim().toLowerCase();
         const platform = options?.platform?.trim().toLowerCase();
-        const page = options?.page ?? 0;
-        const pageSize = options?.pageSize ?? 100;
 
-        this.logger.info('Fetching configuration policies', { policyName: options?.policyName, platform: options?.platform, page, pageSize });
+        this.logger.info('Fetching configuration policies', { policyName: options?.policyName, platform: options?.platform, page: options?.page, pageSize: options?.pageSize });
         await this.trackAuthAttempt();
 
         const result: any = {
@@ -681,17 +680,16 @@ export class IntuneClient {
                 });
             }
 
-            const totalCount = combined.length;
-            const start = page * pageSize;
-            result.combined = combined.slice(start, start + pageSize);
-            result.totalCount = totalCount;
-            result.page = page;
-            result.pageSize = pageSize;
+            const paged = paginate(combined, options?.page, options?.pageSize);
+            result.combined = paged.items;
+            result.totalCount = paged.totalCount;
+            result.page = paged.page;
+            result.pageSize = paged.pageSize;
 
             this.logger.info('Configuration policies retrieved', {
                 totalClassic: normalizedClassic.length,
                 totalSettingsCatalog: normalizedSettingsCatalog.length,
-                filteredTotal: totalCount,
+                filteredTotal: paged.totalCount,
                 returnedCount: result.combined.length
             });
 
@@ -1248,15 +1246,13 @@ export class IntuneClient {
         const appName = options?.appName?.trim().toLowerCase();
         const publisher = options?.publisher?.trim().toLowerCase();
         const platform = options?.platform?.trim().toLowerCase();
-        const page = options?.page ?? 0;
-        const pageSize = options?.pageSize ?? 100;
 
         this.logger.info('Fetching app deployments', {
             appName: options?.appName,
             publisher: options?.publisher,
             platform: options?.platform,
-            page,
-            pageSize
+            page: options?.page,
+            pageSize: options?.pageSize
         });
         await this.trackAuthAttempt();
 
@@ -1306,25 +1302,22 @@ export class IntuneClient {
                 filtered = filtered.filter((app: any) => String(app.platformHint || '').toLowerCase().includes(platform));
             }
 
-            const filteredTotal = filtered.length;
-            const start = page * pageSize;
-            const paged = filtered.slice(start, start + pageSize);
+            const paged = paginate(filtered, options?.page, options?.pageSize);
 
             const result = {
-                apps: paged,
-                page,
-                pageSize,
+                apps: paged.items,
+                page: paged.page,
+                pageSize: paged.pageSize,
                 summary: {
                     totalApps: normalized.length,
-                    filteredApps: filteredTotal,
-                    returnedApps: paged.length
+                    filteredApps: paged.totalCount
                 }
             };
 
             this.logger.info('App deployments retrieved', {
                 totalApps: result.summary.totalApps,
                 filteredApps: result.summary.filteredApps,
-                returnedApps: result.summary.returnedApps
+                returnedApps: result.apps.length
             });
 
             return result;

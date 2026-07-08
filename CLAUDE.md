@@ -33,7 +33,7 @@ MCP endpoints: `http://localhost:3001/mcp` (JAMF) / `http://localhost:3002/mcp` 
 
 ### Device resolution (Intune)
 
-`resolveDevice()` accepts `deviceName`, `deviceId`, or `serialNumber` and normalizes to `{ deviceId, azureADDeviceId }`. `resolveAppByName()` and `resolvePolicyByName()` resolve human-readable names to GUIDs by fetching the full list and matching case-insensitively (exact match preferred, first partial match as fallback).
+`resolveDevice()` accepts `deviceName`, `deviceId`, or `serialNumber` and normalizes to `{ deviceId, azureADDeviceId }`. `resolveAppByName()` and `resolvePolicyByName()` resolve human-readable names to GUIDs by fetching the full list and matching case-insensitively (exact match preferred; if no exact match and multiple candidates remain, they throw an `AmbiguousMatchError` listing candidates rather than guessing).
 
 ### Tool registration pattern
 

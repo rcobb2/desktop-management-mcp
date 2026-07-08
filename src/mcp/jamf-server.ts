@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { JamfClient } from "../jamf/jamf-api.js";
-import { translateApiError } from "../utils/errors.js";
+import { translateApiError, NotFoundError } from "../utils/errors.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -42,6 +42,7 @@ function notFound(label: string): { content: [{ type: "text"; text: string }]; i
 }
 
 function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; isError: true } {
+    if (err instanceof NotFoundError) return notFound(err.message);
     return {
         isError: true,
         content: [{ type: "text", text: `Error: ${translateApiError(err)}` }],
@@ -957,7 +958,6 @@ function createJamfMcpServer(): McpServer {
         async ({ computerName, serialNumber, computerId, response_format = "markdown" }) => {
             try {
                 const data = await client.getFilevaultStatus({ computerId, computerName, serialNumber });
-                if (!data) return notFound(`computer (name: "${computerName ?? "—"}", id: "${computerId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
 
                 const text = toText(data, response_format, () => {
                     const fv = (data as any).diskEncryption ?? {};

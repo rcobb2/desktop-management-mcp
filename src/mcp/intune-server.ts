@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { IntuneClient } from "../intune/graph-api.js";
-import { translateApiError } from "../utils/errors.js";
+import { translateApiError, AmbiguousMatchError } from "../utils/errors.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +69,17 @@ async function resolveDevice(
     return null;
 }
 
+function deviceNotFound(opts: { deviceName?: string; deviceId?: string; serialNumber?: string }) {
+    return notFound(`device (name: "${opts.deviceName ?? "—"}", id: "${opts.deviceId ?? "—"}", serial: "${opts.serialNumber ?? "—"}")`);
+}
+
+function deviceLabel(
+    resolved: { deviceId: string; deviceName?: string },
+    opts: { deviceName?: string; deviceId?: string; serialNumber?: string }
+): string {
+    return resolved.deviceName ?? opts.deviceName ?? opts.deviceId ?? opts.serialNumber ?? resolved.deviceId;
+}
+
 async function resolveAppByName(
     client: IntuneClient,
     appName: string
@@ -83,7 +94,7 @@ async function resolveAppByName(
 
     if (apps.length > 1) {
         const candidates = apps.map((a: any) => `"${a.name}" (ID: ${a.id})`).join(", ");
-        throw new Error(
+        throw new AmbiguousMatchError(
             `Ambiguous app name "${appName}" matches ${apps.length} apps and none is an exact match: ${candidates}. Retry with the exact name or pass appId directly.`
         );
     }
@@ -108,7 +119,7 @@ async function resolvePolicyByName(
 
     if (all.length > 1) {
         const candidates = all.map((p: any) => `"${p.name}" (ID: ${p.id}, source: ${p.source})`).join(", ");
-        throw new Error(
+        throw new AmbiguousMatchError(
             `Ambiguous policy name "${policyName}" matches ${all.length} policies and none is an exact match: ${candidates}. Retry with the exact name, a source filter, or pass policyId directly.`
         );
     }
@@ -329,7 +340,7 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
 
                 const data = await client.getDeviceGroupMemberships(resolved.deviceId, resolved.azureADDeviceId);
@@ -378,7 +389,7 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
 
                 const data = await client.getDeviceApplications(resolved.deviceId);
@@ -593,7 +604,7 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
 
                 const data = await client.getDevicePolicyDeploymentTroubleshooting(resolved.deviceId);
@@ -670,7 +681,7 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolvedDevice = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolvedDevice) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
 
                 let resolvedPolicyId = policyId;
@@ -703,7 +714,7 @@ function createIntuneMcpServer(): McpServer {
                     response_format,
                     () => {
                         const d = data as any;
-                        const devLabel = deviceName ?? deviceId ?? serialNumber ?? resolvedDevice.deviceId;
+                        const devLabel = deviceLabel(resolvedDevice, { deviceName, deviceId, serialNumber });
                         const polLabel = resolvedPolicyName ?? resolvedPolicyId;
 
                         const findings: any[] = d.findings ?? [];
@@ -890,7 +901,7 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolvedDevice = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolvedDevice) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
 
                 let resolvedAppId = appId;
@@ -917,7 +928,7 @@ function createIntuneMcpServer(): McpServer {
                     response_format,
                     () => {
                         const d = data as any;
-                        const devLabel = deviceName ?? deviceId ?? serialNumber ?? resolvedDevice.deviceId;
+                        const devLabel = deviceLabel(resolvedDevice, { deviceName, deviceId, serialNumber });
                         const appLabel = resolvedAppName ?? resolvedAppId;
 
                         const installState = d.installState ?? d.deviceInstallState?.installState;
@@ -962,10 +973,10 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
                 await client.syncDevice(resolved.deviceId);
-                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const label = deviceLabel(resolved, { deviceName, deviceId, serialNumber });
                 const text = `Sync triggered successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
@@ -990,10 +1001,10 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
                 await client.rebootDevice(resolved.deviceId);
-                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const label = deviceLabel(resolved, { deviceName, deviceId, serialNumber });
                 const text = `Reboot command sent successfully to **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
@@ -1018,10 +1029,10 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
                 await client.remoteLockDevice(resolved.deviceId);
-                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const label = deviceLabel(resolved, { deviceName, deviceId, serialNumber });
                 const text = `Remote lock command sent successfully to **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
@@ -1048,10 +1059,10 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
                 await client.retireDevice(resolved.deviceId);
-                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const label = deviceLabel(resolved, { deviceName, deviceId, serialNumber });
                 const text = `Retire command sent successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}. Company data and management will be removed from this device.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
@@ -1089,10 +1100,10 @@ function createIntuneMcpServer(): McpServer {
             try {
                 const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
                 if (!resolved) {
-                    return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    return deviceNotFound({ deviceName, deviceId, serialNumber });
                 }
                 await client.wipeDevice(resolved.deviceId, { keepEnrollmentData, keepUserData, macOsUnlockCode });
-                const label = resolved.deviceName ?? deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
+                const label = deviceLabel(resolved, { deviceName, deviceId, serialNumber });
                 const text = `Wipe command sent successfully for **${label}**${resolved.serialNumber ? ` (${resolved.serialNumber})` : ""}. This device will be erased.`;
                 return { content: [{ type: "text", text }] };
             } catch (err) {
