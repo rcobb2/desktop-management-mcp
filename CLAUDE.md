@@ -26,6 +26,8 @@ Two standalone Streamable HTTP servers built on Express + `@modelcontextprotocol
 
 Both expose `GET /health` for load balancer checks and return 405 on `GET`/`DELETE /mcp` (stateless servers don't support session resumption). MCP endpoints: `http://localhost:3001/mcp` (JAMF) / `http://localhost:3002/mcp` (Intune)
 
+Both require `Authorization: Bearer <token>` on `/mcp` (not on `/health`), enforced by the shared `src/utils/auth.ts` `requireBearerAuth(envVarName)` middleware — the one piece of cross-server shared code, since duplicating an auth check risks the two copies drifting out of sync. Fails closed: if the server's token env var isn't set, every `/mcp` request gets `503` rather than being let through. Accepts a comma-separated list of valid tokens per server, so a token can be rotated by adding the new one, redeploying, then removing the old one.
+
 ### API Clients
 
 - `src/jamf/jamf-api.ts` — `JamfClient`: authenticates via OAuth2 client-credentials (`POST /api/v1/oauth/token`), caches the bearer token and re-authenticates lazily via `ensureAuthenticated()` once it's within 60s of `expires_in`. Uses JAMF Pro REST API v1/v3 for most endpoints (e.g. computer lookups go through `computers-inventory` to resolve an ID, then `computers-inventory-detail/:id` for the full record); falls back to the Classic API (XML-based, e.g. policies, configuration profiles) where v1/v3 doesn't cover a resource.
@@ -48,9 +50,11 @@ Tools are registered via `server.registerTool(name, schema, handler)` with Zod s
 **JAMF** (injected by BWS from `bws-secrets.map`):
 - `JAMF_URL` — e.g. `https://yourorg.jamfcloud.com`
 - `JAMF_CLIENT_ID`, `JAMF_CLIENT_SECRET`
+- `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 
 **Intune** (injected by BWS from `bws-secrets.map`):
 - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+- `INTUNE_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 
 ## Tests
 
@@ -58,4 +62,4 @@ Tools are registered via `server.registerTool(name, schema, handler)` with Zod s
 
 ## Deployment
 
-Both servers run in production as Podman quadlet containers on `podman02` (built from the repo-root `Dockerfile`, one image, two containers — the Intune container overrides the image's default `CMD` via the quadlet's `Exec=`), fronted by Caddy which terminates TLS and reverse-proxies to the container's plain-HTTP port. The servers themselves never see TLS directly. Client-facing URLs are `https://jamf-mcp.colgate.edu/mcp` and `https://intune-mcp.colgate.edu/mcp` — internal DNS only, no public exposure, since neither server authenticates requests and several JAMF tools are destructive. Deploy/redeploy playbooks live in `IAC/ansible-servers/linux/apps/desktop-management-mcp.yml` (full deploy) and `desktop-management-mcp-update.yml` (code-only redeploy); see `IAC/CLAUDE.md` for the broader Terraform → Ansible dispatch pipeline.
+Both servers run in production as Podman quadlet containers on `podman02` (built from the repo-root `Dockerfile`, one image, two containers — the Intune container overrides the image's default `CMD` via the quadlet's `Exec=`), fronted by Caddy which terminates TLS and reverse-proxies to the container's plain-HTTP port. The servers themselves never see TLS directly. Client-facing URLs are `https://jamf-mcp.colgate.edu/mcp` and `https://intune-mcp.colgate.edu/mcp` — internal DNS only, no public exposure, and several JAMF tools are destructive, so `/mcp` also requires a bearer token (see Environment Variables) on top of the network restriction — defense in depth, not a substitute for it. Deploy/redeploy playbooks live in `IAC/ansible-servers/linux/apps/desktop-management-mcp.yml` (full deploy) and `desktop-management-mcp-update.yml` (code-only redeploy); see `IAC/CLAUDE.md` for the broader Terraform → Ansible dispatch pipeline.

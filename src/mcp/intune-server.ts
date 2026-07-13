@@ -7,10 +7,11 @@
  * Transport: Streamable HTTP — deploy behind Azure APIM or any reverse proxy.
  *
  * Environment variables:
- *   AZURE_TENANT_ID      Azure AD tenant ID
- *   AZURE_CLIENT_ID      App registration client ID
- *   AZURE_CLIENT_SECRET  App registration client secret
- *   PORT                 HTTP port to listen on (default: 3002)
+ *   AZURE_TENANT_ID        Azure AD tenant ID
+ *   AZURE_CLIENT_ID        App registration client ID
+ *   AZURE_CLIENT_SECRET    App registration client secret
+ *   INTUNE_MCP_AUTH_TOKEN  Bearer token(s) required on /mcp requests (comma-separated to allow rotation)
+ *   PORT                   HTTP port to listen on (default: 3002)
  */
 
 import express, { Request, Response } from "express";
@@ -18,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { IntuneClient } from "../intune/graph-api.js";
+import { requireBearerAuth } from "../utils/auth.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -148,8 +150,6 @@ function createIntuneMcpServer(): McpServer {
                         `- **Assigned User:** ${d.userDisplayName ?? "—"} (${d.userPrincipalName ?? "—"})`,
                         `- **Intune Device ID:** ${d.id ?? "—"}`,
                         `- **Azure AD Device ID:** ${d.azureADDeviceId ?? "—"}`,
-                        `- **Join Type:** ${d.joinType ?? "—"}`,
-                        `- **Autopilot:** ${d.autopilotEnrolled ? "Yes" : "No"}`,
                     ].join("\n");
                 });
 
@@ -932,6 +932,8 @@ async function main() {
     app.use(express.json());
 
     const PORT = parseInt(process.env.PORT ?? "3002", 10);
+
+    app.use("/mcp", requireBearerAuth("INTUNE_MCP_AUTH_TOKEN"));
 
     // Each request gets its own transport (stateless mode — required for APIM / multi-instance)
     app.post("/mcp", async (req: Request, res: Response) => {

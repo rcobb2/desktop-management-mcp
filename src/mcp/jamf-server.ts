@@ -10,6 +10,7 @@
  *   JAMF_URL             JAMF Pro tenant URL (e.g. https://your-org.jamfcloud.com)
  *   JAMF_CLIENT_ID       OAuth client ID
  *   JAMF_CLIENT_SECRET   OAuth client secret
+ *   JAMF_MCP_AUTH_TOKEN  Bearer token(s) required on /mcp requests (comma-separated to allow rotation)
  *   PORT                 HTTP port to listen on (default: 3001)
  */
 
@@ -18,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { JamfClient } from "../jamf/jamf-api.js";
+import { requireBearerAuth } from "../utils/auth.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1012,6 +1014,8 @@ async function main() {
     app.use(express.json());
 
     const PORT = parseInt(process.env.PORT ?? "3001", 10);
+
+    app.use("/mcp", requireBearerAuth("JAMF_MCP_AUTH_TOKEN"));
 
     // Each request gets its own transport (stateless mode — required for APIM / multi-instance)
     app.post("/mcp", async (req: Request, res: Response) => {

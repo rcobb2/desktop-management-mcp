@@ -149,7 +149,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`deviceName eq '${escapedName}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
                 .get();
             
             const apiDuration = Date.now() - apiStart;
@@ -168,7 +168,7 @@ export class IntuneClient {
                     .api('/deviceManagement/managedDevices')
                     .version('v1.0')
                     .filter(`startswith(deviceName,'${escapedName}')`)
-                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime')
+                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
                     .top(25)
                     .get();
 
@@ -198,7 +198,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
                 .top(999)
                 .get();
 
@@ -252,7 +252,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`serialNumber eq '${escapedSerial}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
                 .get();
 
             const apiDuration = Date.now() - apiStart;
@@ -268,7 +268,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
                 .top(999)
                 .get();
 
@@ -365,7 +365,7 @@ export class IntuneClient {
             }
 
             const dedupedCandidateUpns = Array.from(new Set(candidateUpns.filter(Boolean).map((upn) => String(upn).toLowerCase())));
-            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime';
+            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName';
 
             for (const upnLower of dedupedCandidateUpns) {
                 const escapedUpn = this.escapeODataString(upnLower);
