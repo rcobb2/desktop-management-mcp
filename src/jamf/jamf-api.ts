@@ -517,18 +517,104 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Fetching computer prestage assignments');
         try {
-            const apiStart = Date.now();
-            const response = await this.client.get('/api/v2/computer-prestages');
-            const apiDuration = Date.now() - apiStart;
-            logApiCall(this.logger, 'GET', '/api/v2/computer-prestages', response.status, apiDuration);
-            this.logger.info('Computer prestage assignments retrieved successfully');
-            return response.data;
+            const pageSize = 100;
+            let page = 0;
+            const results: any[] = [];
+            let totalCount = 0;
+
+            while (true) {
+                const apiStart = Date.now();
+                const response = await this.client.get('/api/v3/computer-prestages', {
+                    params: { page, 'page-size': pageSize, sort: 'id:desc' }
+                });
+                const apiDuration = Date.now() - apiStart;
+                logApiCall(this.logger, 'GET', '/api/v3/computer-prestages', response.status, apiDuration);
+
+                totalCount = response.data.totalCount ?? 0;
+                results.push(...(response.data.results ?? []));
+                if (results.length >= totalCount || (response.data.results ?? []).length < pageSize) break;
+                page++;
+            }
+
+            this.logger.info('Computer prestage assignments retrieved successfully', { count: results.length });
+            return { totalCount, results };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching prestage assignments');
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Prestage Assignments' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching prestage assignments", { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    public async getPrestageScope(prestageId: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching prestage scope', { prestageId });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/api/v2/computer-prestages/${prestageId}/scope`);
+            logApiCall(this.logger, 'GET', `/api/v2/computer-prestages/${prestageId}/scope`, response.status, Date.now() - apiStart);
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Prestage Assignments' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching prestage scope', { prestageId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async resolvePrestage(nameOrId: string): Promise<{ id: string; displayName: string }> {
+        const data = await this.getPrestageAssignments();
+        const prestages: any[] = Array.isArray(data) ? data : (data as any).results ?? [];
+        const lower = nameOrId.toLowerCase();
+        const match =
+            prestages.find((p) => String(p.id) === nameOrId || p.displayName?.toLowerCase() === lower) ??
+            prestages.find((p) => p.displayName?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`Prestage not found: "${nameOrId}"`);
+        return { id: String(match.id), displayName: match.displayName ?? String(match.id) };
+    }
+
+    // Adds serials to a computer prestage's scope without disturbing existing
+    // assignments. Jamf's scope endpoint replaces the entire scope on write, so
+    // this reads the current scope, merges in only the new serials, and writes
+    // the full list back with the versionLock Jamf requires for optimistic
+    // concurrency. Does NOT remove a serial from any other prestage it may
+    // already be scoped to.
+    public async assignSerialsToPrestage(prestageNameOrId: string, serialNumbers: string[]) {
+        await this.ensureAuthenticated();
+        const { id: prestageId, displayName } = await this.resolvePrestage(prestageNameOrId);
+        this.logger.info('Assigning serials to prestage', { prestageId, displayName, count: serialNumbers.length });
+        try {
+            const scope = await this.getPrestageScope(prestageId);
+            const existing: string[] = (scope.assignments ?? []).map((a: any) => a.serialNumber);
+            const versionLock = scope.versionLock;
+
+            const normalized = serialNumbers.map((s) => s.trim().toUpperCase()).filter(Boolean);
+            const alreadyScoped = normalized.filter((s) => existing.includes(s));
+            const toAdd = normalized.filter((s) => !existing.includes(s));
+
+            if (toAdd.length === 0) {
+                this.logger.info('No new serials to add', { prestageId });
+                return { success: true, prestageId, prestageName: displayName, added: [], alreadyScoped, totalScoped: existing.length };
+            }
+
+            const merged = [...existing, ...toAdd];
+            const apiStart = Date.now();
+            const response = await this.client.put(`/api/v2/computer-prestages/${prestageId}/scope`, {
+                serialNumbers: merged,
+                versionLock,
+            });
+            logApiCall(this.logger, 'PUT', `/api/v2/computer-prestages/${prestageId}/scope`, response.status, Date.now() - apiStart);
+
+            this.logger.info('Serials assigned to prestage', { prestageId, added: toAdd.length });
+            return { success: true, prestageId, prestageName: displayName, added: toAdd, alreadyScoped, totalScoped: merged.length };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Prestage Assignments' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error assigning serials to prestage', { prestageId, error: (error as Error).message });
             throw error;
         }
     }

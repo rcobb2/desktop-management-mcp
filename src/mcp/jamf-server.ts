@@ -669,6 +669,42 @@ function createJamfMcpServer(): McpServer {
         }
     );
 
+    // ── 15b. jamf_assign_computers_to_prestage ───────────────────────────────
+    server.registerTool(
+        "jamf_assign_computers_to_prestage",
+        {
+            description:
+                "Assign one or more Mac serial numbers to a computer prestage enrollment's scope in JAMF Pro. " +
+                "Safely merges with the prestage's existing scope (read-modify-write with versionLock) — " +
+                "existing serials already scoped there are left untouched. Does NOT un-scope a serial from any " +
+                "OTHER prestage it may currently belong to. Accepts the prestage by its displayName (e.g. " +
+                "\"Classroom\") or numeric ID — use jamf_list_prestage_configs to see available prestages.",
+            inputSchema: {
+                prestage: z.string().describe('Prestage displayName (e.g. "Classroom") or numeric ID'),
+                serialNumbers: z.array(z.string()).min(1).describe("Mac serial numbers to add to this prestage's scope"),
+                response_format: ResponseFormatSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true },
+        },
+        async ({ prestage, serialNumbers, response_format = "markdown" }) => {
+            try {
+                const result = await client.assignSerialsToPrestage(prestage, serialNumbers);
+                const text = toText(result, response_format, () => {
+                    const lines = [`## Assigned to prestage **${result.prestageName}** (ID: ${result.prestageId})`];
+                    lines.push(`- Newly added (${result.added.length}): ${result.added.length ? result.added.join(", ") : "none"}`);
+                    if (result.alreadyScoped.length) {
+                        lines.push(`- Already scoped, skipped (${result.alreadyScoped.length}): ${result.alreadyScoped.join(", ")}`);
+                    }
+                    lines.push(`- Total serials now scoped: ${result.totalScoped}`);
+                    return lines.join("\n");
+                });
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
     // ── 16. jamf_list_policies ───────────────────────────────────────────────
     server.registerTool(
         "jamf_list_policies",
