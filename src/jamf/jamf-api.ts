@@ -513,6 +513,109 @@ export class JamfClient {
         }
     }
 
+    // Inventory Preload has no serial-number filter query param (confirmed against
+    // the live API — passing filter= is silently ignored), so finding an existing
+    // record means paging through the full set client-side.
+    private async findInventoryPreloadRecordBySerial(serialNumber: string): Promise<any | null> {
+        const target = serialNumber.trim().toUpperCase();
+        const pageSize = 200;
+        let page = 0;
+        while (true) {
+            const data = await this.getInventoryPreload(page, pageSize);
+            const results: any[] = data.results ?? [];
+            const match = results.find((r) => r.serialNumber?.toUpperCase() === target);
+            if (match) return match;
+            const totalCount = data.totalCount ?? 0;
+            if ((page + 1) * pageSize >= totalCount || results.length === 0) return null;
+            page++;
+        }
+    }
+
+    public async createInventoryPreloadRecord(record: {
+        serialNumber: string;
+        assetTag?: string;
+        building?: string;
+        room?: string;
+        username?: string;
+        fullName?: string;
+        emailAddress?: string;
+        deviceType?: string;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Creating inventory preload record', { serialNumber: record.serialNumber });
+        try {
+            const body = {
+                serialNumber: record.serialNumber,
+                assetTag: record.assetTag ?? '',
+                building: record.building ?? '',
+                room: record.room ?? '',
+                username: record.username ?? '',
+                fullName: record.fullName ?? '',
+                emailAddress: record.emailAddress ?? '',
+                deviceType: record.deviceType ?? 'Computer',
+            };
+            const apiStart = Date.now();
+            const response = await this.client.post('/api/v1/inventory-preload', body);
+            logApiCall(this.logger, 'POST', '/api/v1/inventory-preload', response.status, Date.now() - apiStart);
+            this.logger.info('Inventory preload record created', { serialNumber: record.serialNumber });
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Inventory Preload Records' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating inventory preload record', { serialNumber: record.serialNumber, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async updateInventoryPreloadRecordById(id: string, updates: {
+        assetTag?: string;
+        building?: string;
+        room?: string;
+        username?: string;
+        fullName?: string;
+        emailAddress?: string;
+    }, existing: any) {
+        await this.ensureAuthenticated();
+        this.logger.info('Updating inventory preload record', { id });
+        try {
+            const body = { ...existing, ...updates };
+            const apiStart = Date.now();
+            const response = await this.client.put(`/api/v1/inventory-preload/${id}`, body);
+            logApiCall(this.logger, 'PUT', `/api/v1/inventory-preload/${id}`, response.status, Date.now() - apiStart);
+            this.logger.info('Inventory preload record updated', { id });
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Inventory Preload Records' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating inventory preload record', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Upsert by serial: creates a new record if none exists for this serial,
+    // otherwise merges the given fields into the existing record and PUTs the
+    // whole thing back (Jamf's PUT here replaces the record, not a partial patch).
+    public async upsertInventoryPreloadRecord(record: {
+        serialNumber: string;
+        assetTag?: string;
+        building?: string;
+        room?: string;
+        username?: string;
+        fullName?: string;
+        emailAddress?: string;
+        deviceType?: string;
+    }) {
+        const existing = await this.findInventoryPreloadRecordBySerial(record.serialNumber);
+        if (!existing) {
+            const created = await this.createInventoryPreloadRecord(record);
+            return { action: 'created', serialNumber: record.serialNumber, record: created };
+        }
+        const updated = await this.updateInventoryPreloadRecordById(String(existing.id), record, existing);
+        return { action: 'updated', serialNumber: record.serialNumber, id: existing.id, record: updated };
+    }
+
     public async getPrestageAssignments() {
         await this.ensureAuthenticated();
         this.logger.info('Fetching computer prestage assignments');

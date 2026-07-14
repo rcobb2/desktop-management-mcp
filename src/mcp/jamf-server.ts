@@ -707,6 +707,48 @@ function createJamfMcpServer(): McpServer {
         }
     );
 
+    // ── 15c. jamf_upsert_inventory_preload_record ────────────────────────────
+    server.registerTool(
+        "jamf_upsert_inventory_preload_record",
+        {
+            description:
+                "Create or update a JAMF Pro inventory preload record, identified by serial number. " +
+                "Inventory Preload records pre-populate a device's asset tag/building/room/user info so it's " +
+                "applied automatically at prestage enrollment — this is the correct way to set that data " +
+                "for a device that hasn't enrolled yet (jamf_update_computer only works on already-enrolled " +
+                "computers). If no preload record exists for the serial, one is created; if one exists, the " +
+                "given fields are merged into it (omitted fields keep their current value).",
+            inputSchema: {
+                serialNumber: z.string().describe("Mac serial number (e.g. C02ABC123DEF)"),
+                assetTag: z.string().optional().describe("Asset tag"),
+                building: z.string().optional().describe("Building name — must match a JAMF building exactly"),
+                room: z.string().optional().describe("Room number or name"),
+                username: z.string().optional().describe("Assigned username"),
+                fullName: z.string().optional().describe("Full name of the assigned user"),
+                emailAddress: z.string().optional().describe("Email address of the assigned user"),
+                deviceType: z.string().optional().describe('Device type, e.g. "Computer" (default) or "Mobile Device"'),
+                response_format: ResponseFormatSchema,
+            },
+            annotations: { readOnlyHint: false, openWorldHint: true },
+        },
+        async ({ serialNumber, assetTag, building, room, username, fullName, emailAddress, deviceType, response_format = "markdown" }) => {
+            try {
+                const result = await client.upsertInventoryPreloadRecord({
+                    serialNumber: serialNumber.trim().toUpperCase(),
+                    assetTag, building, room, username, fullName, emailAddress, deviceType,
+                });
+                const text = toText(result, response_format, () =>
+                    result.action === "created"
+                        ? `Created inventory preload record for serial **${result.serialNumber}**.`
+                        : `Updated inventory preload record (ID ${result.id}) for serial **${result.serialNumber}**.`
+                );
+                return { content: [{ type: "text", text }] };
+            } catch (err) {
+                return errorResult(err);
+            }
+        }
+    );
+
     // ── 16. jamf_list_policies ───────────────────────────────────────────────
     server.registerTool(
         "jamf_list_policies",
