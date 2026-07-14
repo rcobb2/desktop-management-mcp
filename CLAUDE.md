@@ -9,8 +9,9 @@ npm run build          # compile TypeScript to dist/
 npm run clean          # remove dist/
 npm run start:jamf     # run standalone JAMF MCP HTTP server (port 3001)
 npm run start:intune   # run standalone Intune MCP HTTP server (port 3002)
-npm test               # compile (tsconfig.test.json) + run integration tests against live JAMF
+npm test               # compile (tsconfig.test.json) + run integration tests against live JAMF, plus the auth unit tests
 npm run test:write     # same, but enables destructive write tests (BlankPush, UpdateInventory, etc.)
+npm run test:unit      # auth/roles unit tests only — no live JAMF credentials or network required
 ```
 
 Start scripts use Bitwarden Secrets Manager — set `BWS_ACCESS_TOKEN` in your shell, then run `./start-jamf.sh` or `./start-intune.sh`. The `bws run --` wrapper injects credentials as env vars.
@@ -21,12 +22,27 @@ Tests require credentials as env vars (set by BWS or manually) plus `TEST_COMPUT
 
 Two standalone Streamable HTTP servers built on Express + `@modelcontextprotocol/sdk`. Each is single-file and self-contained — helpers like `toText`/`notFound`/`errorResult`/`resolveDevice` are duplicated per server rather than shared, so a fix in one server file does not propagate to the other:
 
-- **`src/mcp/jamf-server.ts`** — JAMF MCP server on port 3001. `createJamfMcpServer()` builds a fresh `McpServer` + `JamfClient` per HTTP request (stateless mode, required for load-balanced/APIM deployment); every POST to `/mcp` gets its own `StreamableHTTPServerTransport` with `sessionIdGenerator: undefined`, torn down on `res.on("close")`. Exposes read tools plus write tools (`jamf_send_mdm_command`, `jamf_update_computer`, `jamf_flush_mdm_commands`).
+- **`src/mcp/jamf-server.ts`** — JAMF MCP server on port 3001. `createJamfMcpServer(roles)` builds a fresh `McpServer` + `JamfClient` per HTTP request (stateless mode, required for load-balanced/APIM deployment), registering only the tools the caller's resolved roles permit; every POST to `/mcp` gets its own `StreamableHTTPServerTransport` with `sessionIdGenerator: undefined`, torn down on `res.on("close")`. Exposes read tools plus write tools (`jamf_send_mdm_command`, `jamf_update_computer`, `jamf_assign_computers_to_prestage`, `jamf_flush_mdm_commands`).
 - **`src/mcp/intune-server.ts`** — Intune MCP server on port 3002. Same per-request stateless transport pattern.
 
 Both expose `GET /health` for load balancer checks and return 405 on `GET`/`DELETE /mcp` (stateless servers don't support session resumption). MCP endpoints: `http://localhost:3001/mcp` (JAMF) / `http://localhost:3002/mcp` (Intune)
 
-Both require `Authorization: Bearer <token>` on `/mcp` (not on `/health`), enforced by the shared `src/utils/auth.ts` `requireBearerAuth(envVarName)` middleware — the one piece of cross-server shared code, since duplicating an auth check risks the two copies drifting out of sync. Fails closed: if the server's token env var isn't set, every `/mcp` request gets `503` rather than being let through. Accepts a comma-separated list of valid tokens per server, so a token can be rotated by adding the new one, redeploying, then removing the old one.
+Both require `Authorization: Bearer <token>` on `/mcp` (not on `/health`), enforced by the shared `src/utils/auth.ts` `requireMcpAuth(options)` middleware — one of three intentionally-shared modules (alongside `src/utils/entra-jwt.ts` and `src/utils/roles.ts`), since duplicating auth/role logic risks the two servers' copies drifting out of sync. `requireMcpAuth` accepts EITHER of two independent auth modes on the same request:
+1. A static bearer token from `JAMF_MCP_AUTH_TOKEN`/`INTUNE_MCP_AUTH_TOKEN` (comma-separated to allow rotation) — unchanged from before Entra auth existed, and still the only mechanism for non-interactive automation (scripts, n8n). Grants that server's full role set (see below), matching this token's original behavior exactly.
+2. When `ENTRA_OAUTH_ENABLED=true`, an Entra-issued JWT verified against Entra's JWKS (`src/utils/entra-jwt.ts`, using `jose`) — tool visibility is then driven by the token's `roles` claim.
+
+Fails closed exactly as before: if neither mode is configured for a server, every `/mcp` request gets `503`.
+
+### Authentication and roles
+
+Role names are Entra App Roles defined on one shared "Desktop Management MCP" resource app registration: `Jamf.Read`, `Jamf.Write`, `Intune.Read` (`src/utils/roles.ts`). Each server only inspects its own role names via `hasRole()`/`resolveRolesFromAuthInfo()` and ignores the rest — there's no isolation lost by sharing one resource app, since role *assignment* (who gets which role) is still granted per-role, per-user/group in Entra independently.
+
+Both `createJamfMcpServer(roles)` / `createIntuneMcpServer(roles)` take the caller's resolved role array and wrap each `server.registerTool(...)` call in `if (hasRole(roles, ...))` — a tool a caller's role doesn't grant is never registered on that request's `McpServer`, so it's simply not callable (not just hidden). The four destructive/mutating JAMF tools (`jamf_send_mdm_command`, `jamf_update_computer`, `jamf_assign_computers_to_prestage`, `jamf_flush_mdm_commands`) additionally call `assertRole(roles, JAMF_WRITE)` inside their own handler as a defense-in-depth check against a future refactor accidentally omitting the registration-time gate. All other tools rely solely on the registration-time gate.
+
+**Entra ID does not support OAuth Dynamic Client Registration (RFC 7591)**, which real MCP clients lean on for zero-config setup — this project deliberately does NOT implement a custom OAuth broker/proxy to paper over that gap (see the plan history for the phased rationale); it's a resource-server-only integration. Practical per-client setup as of this writing:
+- **OpenCode** — works today: register a small native/public Entra client app (PKCE, no secret) and configure it as `oauth.clientId` in `opencode.json`, pointed at Entra's real `/authorize`/`/token` endpoints. `opencode mcp auth` drives a normal browser PKCE flow.
+- **Codex CLI** — no static-`clientId` OAuth support upstream yet; keep using `bearer_token_env_var` pointing at the existing static token. Not tied to per-user Entra identity in this phase.
+- **Claude Code** — has open upstream bugs handling non-DCR authorization servers even with a manually pinned client ID; use the `mcp-remote` npm package's `--static-oauth-client-information` flag as a local stdio↔http bridge workaround, pointed at the same public client app, until/unless those bugs are fixed upstream.
 
 ### API Clients
 
@@ -51,14 +67,23 @@ Tools are registered via `server.registerTool(name, schema, handler)` with Zod s
 - `JAMF_URL` — e.g. `https://yourorg.jamfcloud.com`
 - `JAMF_CLIENT_ID`, `JAMF_CLIENT_SECRET`
 - `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
+- `JAMF_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://jamf-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`)
 
 **Intune** (injected by BWS from `bws-secrets.map`):
-- `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+- `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — Graph app-only client credentials for device data, unrelated to the Entra auth vars below
 - `INTUNE_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
+- `INTUNE_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://intune-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`)
+
+**Entra ID auth** (shared by both servers, each can enable independently; injected by BWS from `bws-secrets.map`):
+- `ENTRA_OAUTH_ENABLED` — `"true"` to accept Entra-issued bearer tokens on `/mcp` in addition to the static token
+- `ENTRA_TENANT_ID` — Entra tenant GUID (deliberately separate from `AZURE_TENANT_ID` above — different app registration, different purpose)
+- `ENTRA_RESOURCE_APP_ID_URI` — Application ID URI of the "Desktop Management MCP" resource app, e.g. `api://desktop-mgmt-mcp`
 
 ## Tests
 
 `test/jamf-api.test.ts` uses Node.js built-in `node:test` — no extra test framework. Tests are live integration tests against a real JAMF Pro API. Write operations are gated behind `JAMF_TEST_WRITE=1`. Tests that may fail due to API client permissions use `permissionAwareTest()` which treats 401/403/404 as a skip rather than a failure.
+
+`test/auth.test.ts` covers `requireMcpAuth`'s dual-mode fallback/fail-closed behavior and the `roles.ts` helpers with fakes — no live credentials or network access needed, hence the separate `npm run test:unit` script.
 
 ## Deployment
 
