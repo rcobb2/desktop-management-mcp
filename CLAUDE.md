@@ -78,6 +78,7 @@ Tools are registered via `server.registerTool(name, schema, handler)` with Zod s
 - `ENTRA_OAUTH_ENABLED` — `"true"` to accept Entra-issued bearer tokens on `/mcp` in addition to the static token
 - `ENTRA_TENANT_ID` — Entra tenant GUID (deliberately separate from `AZURE_TENANT_ID` above — different app registration, different purpose)
 - `ENTRA_RESOURCE_APP_ID_URI` — Application ID URI of the "Desktop Management MCP" resource app, e.g. `api://desktop-mgmt-mcp`
+- `ENTRA_RESOURCE_APP_ID` — GUID app ID of the same resource app; accepted as an alternate `aud` value. MCP-spec clients that send the RFC 8707 `resource` parameter (e.g. OpenCode) get tokens audienced to this GUID rather than the URI above, even with `requestedAccessTokenVersion: 2` set on the app — confirmed against a real issued token, not assumed from docs.
 
 ## Tests
 

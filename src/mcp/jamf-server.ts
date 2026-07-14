@@ -18,6 +18,11 @@
  *   ENTRA_TENANT_ID            Entra tenant GUID (required when ENTRA_OAUTH_ENABLED=true)
  *   ENTRA_RESOURCE_APP_ID_URI  Application ID URI of the "Desktop Management MCP" resource app,
  *                              e.g. api://desktop-mgmt-mcp (required when ENTRA_OAUTH_ENABLED=true)
+ *   ENTRA_RESOURCE_APP_ID      GUID app ID of the same resource app. Accepted as an alternate `aud`
+ *                              value alongside ENTRA_RESOURCE_APP_ID_URI — a client that sends the
+ *                              RFC 8707 `resource` parameter (as MCP-spec clients like OpenCode do)
+ *                              gets back a token audienced to this GUID, not the URI, even on the
+ *                              v2 endpoint. Optional but recommended once any such client is in use.
  *   JAMF_MCP_PUBLIC_URL        This server's externally-visible origin, e.g. https://jamf-mcp.colgate.edu
  *                              (required when ENTRA_OAUTH_ENABLED=true, used for RFC 9728 resource metadata)
  *   PORT                       HTTP port to listen on (default: 3001)
@@ -1151,7 +1156,9 @@ async function main() {
             allRoles: JAMF_ALL_ROLES,
             entraVerifier: createEntraVerifier({
                 tenantId: process.env.ENTRA_TENANT_ID ?? "",
-                audience: process.env.ENTRA_RESOURCE_APP_ID_URI ?? "",
+                audience: [process.env.ENTRA_RESOURCE_APP_ID_URI, process.env.ENTRA_RESOURCE_APP_ID].filter(
+                    (v): v is string => !!v
+                ),
             }),
             entraEnabledEnvVar: "ENTRA_OAUTH_ENABLED",
             resourceMetadataUrl,

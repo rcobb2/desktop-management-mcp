@@ -76,8 +76,16 @@ function stringClaim(payload: JWTPayload, key: string): string | undefined {
 /**
  * Builds a verifier bound to one Entra tenant + resource app audience.
  * Throws on any signature/issuer/audience/tenant mismatch.
+ *
+ * `audience` accepts multiple acceptable values because Entra's `aud` claim
+ * isn't stable across clients: a client that sends the RFC 8707 `resource`
+ * parameter (as MCP-spec clients like OpenCode do) gets back a token audienced
+ * to the resource app's GUID app ID, not its Application ID URI, even with
+ * requestedAccessTokenVersion=2 — confirmed empirically against a real token,
+ * not documented behavior we're relying on blind. A client that never sends
+ * `resource` may still get the URI form, so both must be accepted.
  */
-export function createEntraVerifier(opts: { tenantId: string; audience: string }) {
+export function createEntraVerifier(opts: { tenantId: string; audience: string | string[] }) {
     return async function verifyEntraAccessToken(token: string): Promise<EntraAuthInfo> {
         const jose = await loadJose();
         const { issuer, jwks } = await getIssuerAndJwks(opts.tenantId);
