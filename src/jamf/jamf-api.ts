@@ -172,6 +172,98 @@ export class JamfClient {
         }
     }
 
+    /**
+     * List mobile devices tenant-wide, optionally filtered by type, managed state, or supervised
+     * state. Merges two sources because neither alone has the fields needed for an accurate fleet
+     * breakdown: v2 /mobile-devices carries `type`/`model` but not `managed`/`supervised`, while the
+     * Classic API carries `managed`/`supervised` but not `type`. Paginates the v2 side (up to a
+     * safety cap) so counts reflect the whole fleet rather than a single page.
+     */
+    public async listMobileDevices(options?: { type?: string; managed?: boolean; supervised?: boolean }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Listing mobile devices', options ?? {});
+
+        const MAX_PAGES = 20; // 20 * 1000 = 20k devices — far above any real fleet size here
+        const PAGE_SIZE = 1000;
+
+        try {
+            const v2Devices: any[] = [];
+            let page = 0;
+            let totalCount = 0;
+            let truncated = false;
+
+            while (page < MAX_PAGES) {
+                const apiStart = Date.now();
+                const response = await this.client.get('/api/v2/mobile-devices', {
+                    params: { page, 'page-size': PAGE_SIZE }
+                });
+                logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, Date.now() - apiStart);
+
+                const pageResults: any[] = response.data.results || [];
+                totalCount = response.data.totalCount ?? totalCount;
+                v2Devices.push(...pageResults);
+
+                if (pageResults.length === 0 || v2Devices.length >= totalCount) break;
+                page++;
+                if (page >= MAX_PAGES) {
+                    truncated = true;
+                    this.logger.warn('listMobileDevices hit the pagination safety cap; results are truncated', {
+                        pagesFetched: page,
+                        deviceCount: v2Devices.length,
+                        totalCount
+                    });
+                }
+            }
+
+            // Classic API returns managed/supervised in one shot (no pagination controls on this
+            // endpoint) — merged in by id to fill the gap in v2's field set.
+            const classicStart = Date.now();
+            const classicResponse = await this.client.get('/JSSResource/mobiledevices', {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', '/JSSResource/mobiledevices', classicResponse.status, Date.now() - classicStart);
+            const classicDevices: any[] = classicResponse.data.mobile_devices || [];
+            const classicById = new Map(classicDevices.map((d: any) => [String(d.id), d]));
+
+            let devices = v2Devices.map((d: any) => {
+                const classic = classicById.get(String(d.id));
+                return {
+                    id: d.id,
+                    name: d.name,
+                    model: d.model,
+                    modelIdentifier: d.modelIdentifier,
+                    serialNumber: d.serialNumber,
+                    udid: d.udid,
+                    type: d.type,
+                    username: d.username || classic?.username || null,
+                    managed: classic?.managed ?? null,
+                    supervised: classic?.supervised ?? null
+                };
+            });
+
+            if (options?.type) {
+                const typeLower = options.type.toLowerCase();
+                devices = devices.filter((d) => String(d.type ?? '').toLowerCase() === typeLower);
+            }
+            if (options?.managed !== undefined) {
+                devices = devices.filter((d) => d.managed === options.managed);
+            }
+            if (options?.supervised !== undefined) {
+                devices = devices.filter((d) => d.supervised === options.supervised);
+            }
+
+            this.logger.info('Mobile devices listed', { count: devices.length, rawTotalCount: totalCount, truncated });
+            return { devices, totalCount: devices.length, rawTotalCount: totalCount, truncated };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                this.logger.error('Permission denied listing mobile devices');
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Mobile Devices' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error listing mobile devices', { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
     public async getSmartComputerGroups() {
         await this.ensureAuthenticated();
         this.logger.info('Fetching smart computer groups');

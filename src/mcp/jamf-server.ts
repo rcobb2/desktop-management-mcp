@@ -1118,6 +1118,88 @@ function createJamfMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 24. jamf_list_mobile_devices ─────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_mobile_devices",
+            {
+                description:
+                    "List mobile devices (iOS/iPadOS/tvOS) across the whole JAMF fleet, optionally filtered by " +
+                    "device type, managed state, or supervised state. Pages through the full result set for an " +
+                    "accurate fleet-wide count and breakdown by type, managed/supervised state, and model. " +
+                    "Use this for fleet counts rather than repeated single-device lookups.",
+                inputSchema: {
+                    type: z.string().optional().describe('Filter by device type, e.g. "ios", "tvos"'),
+                    managed: z.boolean().optional().describe("Filter to only managed (true) or unmanaged (false) devices"),
+                    supervised: z.boolean().optional().describe("Filter to only supervised (true) or unsupervised (false) devices"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ type, managed, supervised, response_format = "markdown" }) => {
+                try {
+                    const data = await client.listMobileDevices({ type, managed, supervised });
+
+                    const text = toText(data, response_format, () => {
+                        const devices: any[] = data.devices ?? [];
+                        const filterNote = [
+                            type && `type="${type}"`,
+                            managed !== undefined && `managed=${managed}`,
+                            supervised !== undefined && `supervised=${supervised}`,
+                        ]
+                            .filter(Boolean)
+                            .join(", ");
+
+                        if (devices.length === 0) {
+                            return `No mobile devices found${filterNote ? ` matching ${filterNote}` : ""}.`;
+                        }
+
+                        const byType = new Map<string, number>();
+                        const byManaged = new Map<string, number>();
+                        const byModel = new Map<string, number>();
+                        for (const d of devices) {
+                            const t = d.type ?? "unknown";
+                            const m = d.managed === null ? "unknown" : d.managed ? "managed" : "unmanaged";
+                            const model = d.model ?? "Unknown";
+                            byType.set(t, (byType.get(t) ?? 0) + 1);
+                            byManaged.set(m, (byManaged.get(m) ?? 0) + 1);
+                            byModel.set(model, (byModel.get(model) ?? 0) + 1);
+                        }
+
+                        const sortedEntries = (m: Map<string, number>) =>
+                            [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+
+                        const rows = devices
+                            .slice(0, 50)
+                            .map(
+                                (d: any) =>
+                                    `- **${d.name ?? "Unknown"}** | ${d.model ?? "—"} | Managed: ${d.managed === null ? "—" : d.managed ? "Yes" : "No"} | Supervised: ${d.supervised === null ? "—" : d.supervised ? "Yes" : "No"} | Serial: ${d.serialNumber ?? "—"}`
+                            )
+                            .join("\n");
+
+                        const truncationNote = data.truncated
+                            ? `\n\n_⚠️ Hit the pagination safety cap — counts above reflect only the first ${devices.length} devices fetched, not necessarily the entire tenant._`
+                            : "";
+
+                        return (
+                            [
+                                `## Mobile Devices${filterNote ? ` (${filterNote})` : ""} — ${devices.length} total`,
+                                `### By Type\n${sortedEntries(byType)}`,
+                                `### By Managed State\n${sortedEntries(byManaged)}`,
+                                `### By Model\n${sortedEntries(byModel)}`,
+                                `### Devices (showing ${Math.min(50, devices.length)} of ${devices.length})\n${rows}${devices.length > 50 ? `\n_…and ${devices.length - 50} more_` : ""}`,
+                            ].join("\n\n") + truncationNote
+                        );
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     return server;
 }
 
