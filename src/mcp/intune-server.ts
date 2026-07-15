@@ -966,6 +966,131 @@ function createIntuneMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 14. intune_list_devices ──────────────────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_devices",
+            {
+                description:
+                    "List managed devices across the whole Intune fleet, optionally filtered by operating system, " +
+                    "compliance state, management state, or management agent. Pages through the full result set " +
+                    "(not just the first 999) so counts are accurate fleet-wide. Use this for fleet counts and " +
+                    "breakdowns rather than sending repeated single-device lookups. " +
+                    "IMPORTANT: /managedDevices includes devices that merely appear in Intune's device inventory " +
+                    "without being Intune-MDM-managed — e.g. devices reporting in only via Defender for Endpoint " +
+                    "(managementAgent \"msSense\") or pure ConfigMgr/SCCM management with no MDM component " +
+                    "(\"configurationManagerClient\"). Set intuneManagedOnly=true to restrict to devices actually " +
+                    "enrolled/managed via Intune MDM (including ConfigMgr co-management) for an accurate Intune fleet count.",
+                inputSchema: {
+                    operatingSystem: z
+                        .string()
+                        .optional()
+                        .describe('Filter by OS, e.g. "Windows", "macOS", "iOS", "Android"'),
+                    complianceState: z
+                        .string()
+                        .optional()
+                        .describe('Filter by compliance state, e.g. "compliant", "noncompliant", "inGracePeriod", "error"'),
+                    managementState: z
+                        .string()
+                        .optional()
+                        .describe('Filter by management state, e.g. "managed", "retirePending", "wipePending"'),
+                    managementAgent: z
+                        .string()
+                        .optional()
+                        .describe(
+                            'Filter by exact management agent, e.g. "mdm", "configurationManagerClientMdm", "msSense", "configurationManagerClient"'
+                        ),
+                    intuneManagedOnly: z
+                        .boolean()
+                        .optional()
+                        .describe(
+                            "If true, exclude devices that appear in Intune's device inventory but aren't actually " +
+                                "Intune-MDM-managed (e.g. Defender-sensor-only or ConfigMgr-only devices). Recommended " +
+                                "for accurate Intune fleet counts."
+                        ),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({
+                operatingSystem,
+                complianceState,
+                managementState,
+                managementAgent,
+                intuneManagedOnly,
+                response_format = "markdown",
+            }) => {
+                try {
+                    const data = await client.listManagedDevices({
+                        operatingSystem,
+                        complianceState,
+                        managementState,
+                        managementAgent,
+                        intuneManagedOnly,
+                    });
+
+                    const text = toText(data, response_format, () => {
+                        const devices: any[] = data.devices ?? [];
+                        const filterNote = [
+                            operatingSystem && `OS="${operatingSystem}"`,
+                            complianceState && `compliance="${complianceState}"`,
+                            managementState && `managementState="${managementState}"`,
+                            managementAgent && `managementAgent="${managementAgent}"`,
+                            intuneManagedOnly && "intuneManagedOnly=true",
+                        ]
+                            .filter(Boolean)
+                            .join(", ");
+
+                        if (devices.length === 0) {
+                            return `No managed devices found${filterNote ? ` matching ${filterNote}` : ""}.`;
+                        }
+
+                        const byOs = new Map<string, number>();
+                        const byCompliance = new Map<string, number>();
+                        const byAgent = new Map<string, number>();
+                        for (const d of devices) {
+                            const os = d.operatingSystem ?? "Unknown";
+                            const comp = d.complianceState ?? "unknown";
+                            const agent = d.managementAgent ?? "unknown";
+                            byOs.set(os, (byOs.get(os) ?? 0) + 1);
+                            byCompliance.set(comp, (byCompliance.get(comp) ?? 0) + 1);
+                            byAgent.set(agent, (byAgent.get(agent) ?? 0) + 1);
+                        }
+
+                        const sortedEntries = (m: Map<string, number>) =>
+                            [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+
+                        const rows = devices
+                            .slice(0, 50)
+                            .map(
+                                (d: any) =>
+                                    `- **${d.deviceName ?? "Unknown"}** | ${d.operatingSystem ?? "—"} ${d.osVersion ?? ""} | Compliance: ${d.complianceState ?? "—"} | Serial: ${d.serialNumber ?? "—"}`
+                            )
+                            .join("\n");
+
+                        const truncationNote = data.truncated
+                            ? `\n\n_⚠️ Hit the pagination safety cap — counts above reflect only the first ${devices.length} devices fetched, not necessarily the entire tenant._`
+                            : "";
+
+                        return (
+                            [
+                                `## Managed Devices${filterNote ? ` (${filterNote})` : ""} — ${devices.length} total`,
+                                `### By OS\n${sortedEntries(byOs)}`,
+                                `### By Compliance State\n${sortedEntries(byCompliance)}`,
+                                `### By Management Agent\n${sortedEntries(byAgent)}`,
+                                `### Devices (showing ${Math.min(50, devices.length)} of ${devices.length})\n${rows}${devices.length > 50 ? `\n_…and ${devices.length - 50} more_` : ""}`,
+                            ].join("\n\n") + truncationNote
+                        );
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     return server;
 }
 

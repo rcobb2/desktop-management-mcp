@@ -435,6 +435,108 @@ export class IntuneClient {
     }
 
     /**
+     * managementAgent values (confirmed against a live tenant) that mean the device is actually
+     * enrolled/managed via Intune MDM, as opposed to merely appearing in Intune's device inventory
+     * because of e.g. Defender for Endpoint sensor reporting (`msSense`) or ConfigMgr-only management
+     * (`configurationManagerClient` with no MDM component) — those show up in /managedDevices too but
+     * aren't Intune-managed, so a raw device count without this distinction overstates the Intune fleet.
+     */
+    private static readonly INTUNE_MANAGED_AGENTS = new Set([
+        'mdm',
+        'easmdm',
+        'intuneclient',
+        'easintuneclient',
+        'configurationmanagerclientmdm',
+        'configurationmanagerclientmdmeas',
+        'microsoft365managedmdm',
+        'intuneaosp'
+    ]);
+
+    /**
+     * List managed devices tenant-wide, optionally filtered by OS, compliance state, management
+     * state, or management agent. Follows @odata.nextLink to page through the full result set (up
+     * to a safety cap) so counts reflect the whole fleet rather than a single page of up to 999.
+     */
+    public async listManagedDevices(options?: {
+        operatingSystem?: string;
+        complianceState?: string;
+        managementState?: string;
+        managementAgent?: string;
+        intuneManagedOnly?: boolean;
+    }) {
+        this.logger.info('Listing managed devices', options ?? {});
+        await this.trackAuthAttempt();
+
+        const MAX_PAGES = 20; // 20 * 999 ≈ 20k devices — far above any real fleet size here
+        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName';
+
+        const filters: string[] = [];
+        if (options?.operatingSystem) {
+            filters.push(`operatingSystem eq '${this.escapeODataString(options.operatingSystem)}'`);
+        }
+        if (options?.complianceState) {
+            filters.push(`complianceState eq '${this.escapeODataString(options.complianceState)}'`);
+        }
+        if (options?.managementState) {
+            filters.push(`managementState eq '${this.escapeODataString(options.managementState)}'`);
+        }
+        if (options?.managementAgent) {
+            filters.push(`managementAgent eq '${this.escapeODataString(options.managementAgent)}'`);
+        }
+
+        try {
+            let request = this.client
+                .api('/deviceManagement/managedDevices')
+                .version('v1.0')
+                .select(deviceFields)
+                .top(999);
+
+            if (filters.length > 0) {
+                request = request.filter(filters.join(' and '));
+            }
+
+            const devices: any[] = [];
+            let apiStart = Date.now();
+            let response = await request.get();
+            logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', 200, Date.now() - apiStart);
+            devices.push(...(response.value || []));
+
+            let page = 1;
+            while (response['@odata.nextLink'] && page < MAX_PAGES) {
+                apiStart = Date.now();
+                response = await this.client.api(response['@odata.nextLink']).get();
+                logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices (nextLink)', 200, Date.now() - apiStart);
+                devices.push(...(response.value || []));
+                page++;
+            }
+
+            const truncated = Boolean(response['@odata.nextLink']);
+            if (truncated) {
+                this.logger.warn('listManagedDevices hit the pagination safety cap; results are truncated', {
+                    pagesFetched: page,
+                    deviceCount: devices.length
+                });
+            }
+
+            const filteredDevices = options?.intuneManagedOnly
+                ? devices.filter((d: any) => IntuneClient.INTUNE_MANAGED_AGENTS.has(String(d.managementAgent ?? '').toLowerCase()))
+                : devices;
+
+            this.logger.info('Managed devices listed', {
+                count: filteredDevices.length,
+                rawCount: devices.length,
+                intuneManagedOnly: Boolean(options?.intuneManagedOnly),
+                truncated
+            });
+            return { devices: filteredDevices, totalCount: filteredDevices.length, truncated };
+        } catch (error) {
+            this.logger.error('Error listing managed devices', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
      * Get group memberships for a device (both Azure AD groups and Intune device categories)
      */
     public async getDeviceGroupMemberships(deviceId: string, azureADDeviceId?: string) {
