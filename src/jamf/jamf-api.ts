@@ -134,14 +134,16 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Fetching mobile device by name', { deviceName: name });
         try {
-            // Using Jamf Pro API v2 (fetching all and filtering locally as v2 doesn't support filter param yet)
+            // v2's filter param is confirmed (live) to be a silent no-op, so find the matching
+            // device from the list endpoint first, then fetch its /detail record below — the list
+            // endpoint alone lacks osVersion, managed/supervised, and assigned-user fields.
             const apiStart = Date.now();
             const response = await this.client.get('/api/v2/mobile-devices', {
                 params: {
                     'page-size': 1000 // Ensure we get enough devices to find the one we need
                 }
             });
-            
+
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, apiDuration);
 
@@ -149,19 +151,36 @@ export class JamfClient {
             const allDevices = response.data.results || [];
             const foundDevice = allDevices.find((device: any) => device.name === name);
 
-            if (foundDevice) {
-                this.logger.info('Mobile device found', { deviceName: name });
-                return {
-                    totalCount: 1,
-                    results: [foundDevice]
-                };
-            } else {
+            if (!foundDevice) {
                 this.logger.warn('Mobile device not found', { deviceName: name });
                 return {
                     totalCount: 0,
                     results: []
                 };
             }
+
+            const detailStart = Date.now();
+            const detailResponse = await this.client.get(`/api/v2/mobile-devices/${foundDevice.id}/detail`);
+            logApiCall(this.logger, 'GET', `/api/v2/mobile-devices/${foundDevice.id}/detail`, detailResponse.status, Date.now() - detailStart);
+
+            // Model/modelIdentifier/supervised live under a type-specific section (ios/tvos/watchos/
+            // visionos) in the detail response, not at the top level — flatten them out here so
+            // callers get a consistent shape regardless of device type.
+            const detail = detailResponse.data;
+            const typeSection = detail.ios ?? detail.tvos ?? detail.watchos ?? detail.visionos ?? {};
+
+            this.logger.info('Mobile device found', { deviceName: name, deviceId: foundDevice.id });
+            return {
+                totalCount: 1,
+                results: [{
+                    ...detail,
+                    model: typeSection.model ?? foundDevice.model,
+                    modelIdentifier: typeSection.modelIdentifier ?? foundDevice.modelIdentifier,
+                    supervised: typeSection.supervised ?? null,
+                    osType: detail.type,
+                    locationInformation: detail.location
+                }]
+            };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching mobile device', { deviceName: name });
