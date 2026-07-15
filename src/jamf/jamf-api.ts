@@ -1,6 +1,16 @@
 import axios, { AxiosInstance } from 'axios';
 import { createLogger, logApiCall, logAuth } from '../utils/logger.js';
 
+/**
+ * Escapes a value for safe interpolation into a JAMF Pro RSQL filter string
+ * literal (e.g. `general.name=="${escapeRsqlValue(name)}"`). Without this, an
+ * unescaped `"` in caller-supplied input breaks out of the intended clause
+ * and lets RSQL boolean operators be injected into the filter.
+ */
+function escapeRsqlValue(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 export class JamfClient {
     private client: AxiosInstance;
     private token: string | null = null;
@@ -77,7 +87,7 @@ export class JamfClient {
             const apiStart = Date.now();
             const inventoryResponse = await this.client.get('/api/v3/computers-inventory', {
                 params: {
-                    filter: `general.name=="${name}"`,
+                    filter: `general.name=="${escapeRsqlValue(name)}"`,
                     'page-size': 1
                 }
             });
@@ -274,7 +284,7 @@ export class JamfClient {
             // ""         → filter for computers with no asset tag
             // "ABC123"   → filter for that specific tag
             if (assetTag !== undefined) {
-                params.filter = `general.assetTag=="${assetTag}"`;
+                params.filter = `general.assetTag=="${escapeRsqlValue(assetTag)}"`;
             }
 
             const apiStart = Date.now();
@@ -320,7 +330,6 @@ export class JamfClient {
             throw new Error("User identifier must not be empty.");
         }
 
-        const escapeRsqlValue = (value: string) => value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
         const escapedIdentifier = escapeRsqlValue(identifier);
 
         const fetchByFilter = async (filter: string) => {
@@ -753,9 +762,10 @@ export class JamfClient {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     private async resolveComputerId(nameOrSerial: string): Promise<string> {
+        const escaped = escapeRsqlValue(nameOrSerial);
         for (const filter of [
-            `hardware.serialNumber=="${nameOrSerial}"`,
-            `general.name=="${nameOrSerial}"`
+            `hardware.serialNumber=="${escaped}"`,
+            `general.name=="${escaped}"`
         ]) {
             const apiStart = Date.now();
             const response = await this.client.get('/api/v3/computers-inventory', {
@@ -776,7 +786,7 @@ export class JamfClient {
         try {
             const apiStart = Date.now();
             const inventoryResponse = await this.client.get('/api/v3/computers-inventory', {
-                params: { filter: `hardware.serialNumber=="${serial}"`, 'page-size': 1 }
+                params: { filter: `hardware.serialNumber=="${escapeRsqlValue(serial)}"`, 'page-size': 1 }
             });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', inventoryResponse.status, Date.now() - apiStart);
             const computerId = inventoryResponse.data.results?.[0]?.id;
@@ -1038,8 +1048,8 @@ export class JamfClient {
             const response = await this.client.get('/api/v3/computers-inventory', {
                 params: {
                     filter: nameOrSerial.length <= 12 && /^[A-Z0-9]+$/.test(nameOrSerial)
-                        ? `hardware.serialNumber=="${nameOrSerial}"`
-                        : `general.name=="${nameOrSerial}"`,
+                        ? `hardware.serialNumber=="${escapeRsqlValue(nameOrSerial)}"`
+                        : `general.name=="${escapeRsqlValue(nameOrSerial)}"`,
                     'page-size': 1,
                     section: ['GENERAL', 'DISK_ENCRYPTION', 'HARDWARE']
                 }

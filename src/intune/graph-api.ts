@@ -58,7 +58,7 @@ export class IntuneClient {
             const lookupResponse = await this.client
                 .api('/deviceManagement/windowsAutopilotDeviceIdentities')
                 .version('v1.0') // Explicitly use v1.0 for stability
-                .filter(`serialNumber eq '${serialNumber}'`)
+                .filter(`serialNumber eq '${this.escapeODataString(serialNumber)}'`)
                 .select('id,serialNumber') // Fetch only what we need
                 .get();
             
