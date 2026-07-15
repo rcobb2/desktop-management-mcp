@@ -27,9 +27,9 @@ Two standalone Streamable HTTP servers built on Express + `@modelcontextprotocol
 
 Both expose `GET /health` for load balancer checks and return 405 on `GET`/`DELETE /mcp` (stateless servers don't support session resumption). MCP endpoints: `http://localhost:3001/mcp` (JAMF) / `http://localhost:3002/mcp` (Intune)
 
-Both require `Authorization: Bearer <token>` on `/mcp` (not on `/health`), enforced by the shared `src/utils/auth.ts` `requireMcpAuth(options)` middleware — one of three intentionally-shared modules (alongside `src/utils/entra-jwt.ts` and `src/utils/roles.ts`), since duplicating auth/role logic risks the two servers' copies drifting out of sync. `requireMcpAuth` accepts EITHER of two independent auth modes on the same request:
-1. A static bearer token from `JAMF_MCP_AUTH_TOKEN`/`INTUNE_MCP_AUTH_TOKEN` (comma-separated to allow rotation) — unchanged from before Entra auth existed, and still the only mechanism for non-interactive automation (scripts, n8n). Grants that server's full role set (see below), matching this token's original behavior exactly.
-2. When `ENTRA_OAUTH_ENABLED=true`, an Entra-issued JWT verified against Entra's JWKS (`src/utils/entra-jwt.ts`, using `jose`) — tool visibility is then driven by the token's `roles` claim.
+Both require `Authorization: Bearer <token>` on `/mcp` (not on `/health`), enforced by the shared `src/utils/auth.ts` `requireMcpAuth(options)` middleware — one of three intentionally-shared modules (alongside `src/utils/entra-jwt.ts` and `src/utils/roles.ts`), since duplicating auth/role logic risks the two servers' copies drifting out of sync. `requireMcpAuth` supports EITHER of two independent auth modes on the same request, though only one is enabled in production as of 2026-07-15:
+1. A static bearer token from `JAMF_MCP_AUTH_TOKEN`/`INTUNE_MCP_AUTH_TOKEN` (comma-separated to allow rotation) — the original mechanism from before Entra auth existed. **Retired in production** on 2026-07-15 once Entra OAuth was confirmed working end-to-end and no non-interactive client (n8n, scripts) was found depending on it — `IAC/ansible-servers/linux/apps/desktop-management-mcp.yml` now renders both env vars empty, so prod no longer accepts these tokens even though the code path still exists. Still used by local dev (`start-jamf.sh`/`start-intune.sh` pull the real BWS secret directly, bypassing the ansible-rendered env file) since doing an interactive Entra flow locally isn't worth the hassle for that. Grants that server's full role set (see below) when present.
+2. When `ENTRA_OAUTH_ENABLED=true`, an Entra-issued JWT verified against Entra's JWKS (`src/utils/entra-jwt.ts`, using `jose`) — tool visibility is then driven by the token's `roles` claim. This is the sole auth mode in production now.
 
 Fails closed exactly as before: if neither mode is configured for a server, every `/mcp` request gets `503`.
 
@@ -68,12 +68,12 @@ Tools are registered via `server.registerTool(name, schema, handler)` with Zod s
 **JAMF** (injected by BWS from `bws-secrets.map`):
 - `JAMF_URL` — e.g. `https://yourorg.jamfcloud.com`
 - `JAMF_CLIENT_ID`, `JAMF_CLIENT_SECRET`
-- `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
+- `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation). Rendered empty in prod as of 2026-07-15 (retired in favor of Entra OAuth) — still set for local dev via `start-jamf.sh`.
 - `JAMF_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://jamf-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`)
 
 **Intune** (injected by BWS from `bws-secrets.map`):
 - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — Graph app-only client credentials for device data, unrelated to the Entra auth vars below
-- `INTUNE_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
+- `INTUNE_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation). Rendered empty in prod as of 2026-07-15 (retired in favor of Entra OAuth) — still set for local dev via `start-intune.sh`.
 - `INTUNE_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://intune-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`)
 
 **Entra ID auth** (shared by both servers, each can enable independently; injected by BWS from `bws-secrets.map`):
