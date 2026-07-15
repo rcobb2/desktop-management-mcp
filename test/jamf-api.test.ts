@@ -24,7 +24,7 @@ const TEST_COMPUTER_SERIAL = requireEnv("TEST_COMPUTER_SERIAL");
 const TEST_USER_EMAIL      = requireEnv("TEST_USER_EMAIL");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function skipWrite(name: string, fn: () => Promise<void>) {
+function skipWrite(name: string, fn: (t?: any) => Promise<void>) {
     if (WRITE_ENABLED) {
         return test(name, fn);
     }
@@ -390,6 +390,93 @@ describe("JamfClient", () => {
         skipWrite("flush pending MDM commands from test computer", async () => {
             const result = await client.flushComputerMdmCommands(TEST_COMPUTER_SERIAL, "Pending");
             assert.ok(result.success === true);
+        });
+
+        // The API client's role has Create/Update but not Delete permission for
+        // scripts, smart groups, or policies (confirmed live against the real
+        // tenant) — a test that creates a new one of these would leave it behind
+        // permanently. So unlike the package test below, these look for a
+        // pre-existing fixture (created once, manually, via the corresponding MCP
+        // tool or the JAMF Pro UI) and only exercise the update-in-place path,
+        // skipping gracefully if the named fixture doesn't exist yet.
+
+        skipWrite("upsert script updates a pre-existing fixture in place", async (t: any) => {
+            const fixtureName = process.env.TEST_SCRIPT_NAME;
+            if (!fixtureName) {
+                t.skip("set TEST_SCRIPT_NAME to a script name that already exists in JAMF Pro to exercise this test");
+                return;
+            }
+            const found = await client.getScripts(fixtureName, 0, 200);
+            const existing = found.results.find((s: any) => s.name === fixtureName);
+            if (!existing) {
+                t.skip(`no script named "${fixtureName}" exists yet — create one once via jamf_create_script`);
+                return;
+            }
+            const updated = await client.upsertScript({
+                name: fixtureName,
+                scriptContents: `#!/bin/sh\necho test-${Date.now()}\n`,
+            });
+            assert.equal(updated.action, "updated");
+            assert.equal(updated.id, String(existing.id));
+        });
+
+        skipWrite("upsert application smart group updates a pre-existing fixture in place", async (t: any) => {
+            const fixtureName = process.env.TEST_SMART_GROUP_NAME;
+            if (!fixtureName) {
+                t.skip("set TEST_SMART_GROUP_NAME to a smart group name that already exists in JAMF Pro to exercise this test");
+                return;
+            }
+            const smart = await client.getSmartComputerGroups();
+            const groups: any[] = Array.isArray(smart) ? smart : (smart as any).results ?? [];
+            const existing = groups.find((g: any) => g.name === fixtureName);
+            if (!existing) {
+                t.skip(`no smart group named "${fixtureName}" exists yet — create one once via jamf_create_smart_group`);
+                return;
+            }
+            const updated = await client.upsertApplicationSmartGroup({
+                name: fixtureName,
+                applicationTitle: "zzz-test-app.app",
+                applicationVersion: `test-${Date.now()}`,
+            });
+            assert.equal(updated.action, "updated");
+            assert.equal(updated.id, String(existing.id));
+        });
+
+        skipWrite("update policy scope toggles enabled state and restores it", async (t: any) => {
+            const fixtureName = process.env.TEST_POLICY_NAME;
+            if (!fixtureName) {
+                t.skip("set TEST_POLICY_NAME to a policy name that already exists in JAMF Pro to exercise this test");
+                return;
+            }
+            const found = await client.getPolicies(fixtureName, 0, 200);
+            const existing = found.results.find((p: any) => p.name === fixtureName);
+            if (!existing) {
+                t.skip(`no policy named "${fixtureName}" exists yet — create one once via jamf_create_policy`);
+                return;
+            }
+            const originalDetail = await client.getPolicyDetail(String(existing.id));
+            const originalEnabled: boolean = originalDetail.general.enabled;
+
+            const flipped = await client.updatePolicyScope(fixtureName, { enabled: !originalEnabled });
+            assert.equal(flipped.enabled, !originalEnabled);
+
+            const restored = await client.updatePolicyScope(fixtureName, { enabled: originalEnabled });
+            assert.equal(restored.enabled, originalEnabled);
+        });
+
+        // Package delete permission is confirmed present (unlike the three above),
+        // so this one is fully self-cleaning — no manual fixture needed, just a
+        // small file on disk and JAMF_PACKAGE_UPLOAD_DIR pointing at its directory.
+        skipWrite("upsert package uploads a fixture file then cleans up", async (t: any) => {
+            const fixturePath = process.env.TEST_PACKAGE_PATH;
+            if (!fixturePath) {
+                t.skip("set TEST_PACKAGE_PATH (and JAMF_PACKAGE_UPLOAD_DIR) to a small .pkg/.dmg file to exercise this test");
+                return;
+            }
+            const testName = `zzz-test-package-${Date.now()}`;
+            const created = await client.upsertPackage({ localFilePath: fixturePath, packageName: testName });
+            assert.equal(created.action, "created");
+            await client.deletePackage(created.id);
         });
     });
 });

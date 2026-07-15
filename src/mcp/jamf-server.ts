@@ -25,6 +25,9 @@
  *                              v2 endpoint. Optional but recommended once any such client is in use.
  *   JAMF_MCP_PUBLIC_URL        This server's externally-visible origin, e.g. https://jamf-mcp.colgate.edu
  *                              (required when ENTRA_OAUTH_ENABLED=true, used for RFC 9728 resource metadata)
+ *   JAMF_PACKAGE_UPLOAD_DIR    Directory jamf_upload_package is allowed to read files from on this
+ *                              server's own filesystem (not the MCP client's). Required for that tool —
+ *                              it refuses every call if unset, and rejects any localFilePath outside it.
  *   PORT                       HTTP port to listen on (default: 3001)
  */
 
@@ -865,8 +868,16 @@ function createJamfMcpServer(roles: string[]): McpServer {
                     const text = toText(policy, response_format, () => {
                         const gen = policy.general ?? {};
                         const scope = policy.scope ?? {};
-                        const scripts = policy.scripts?.script ?? [];
-                        const packages = policy.package_configuration?.packages?.package ?? [];
+                        // Classic API's JSON representation uses flat arrays directly
+                        // (scope.computer_groups, policy.scripts, package_configuration.packages) —
+                        // not the XML-derived `{computer_group: [...]}`/`{script: [...]}` wrapper
+                        // shapes, confirmed against a real policy with populated scope/scripts/packages.
+                        const scripts: any[] = Array.isArray(policy.scripts) ? policy.scripts : [];
+                        const packages: any[] = Array.isArray(policy.package_configuration?.packages)
+                            ? policy.package_configuration.packages
+                            : [];
+                        const computers: any[] = Array.isArray(scope.computers) ? scope.computers : [];
+                        const computerGroups: any[] = Array.isArray(scope.computer_groups) ? scope.computer_groups : [];
                         const lines = [
                             `## ${gen.name ?? `Policy ${policyId}`}`,
                             `- **ID:** ${gen.id ?? policyId}`,
@@ -876,17 +887,17 @@ function createJamfMcpServer(roles: string[]): McpServer {
                             `- **Category:** ${gen.category?.name ?? "None"}`,
                             `- **Site:** ${gen.site?.name ?? "None"}`,
                             `- **Scope — All Computers:** ${scope.all_computers ? "Yes" : "No"}`,
-                            scope.computers?.computer?.length
-                                ? `- **Scope — Computers:** ${scope.computers.computer.map((c: any) => c.name).join(", ")}`
+                            computers.length
+                                ? `- **Scope — Computers:** ${computers.map((c: any) => c.name).join(", ")}`
                                 : null,
-                            scope.computer_groups?.computer_group?.length
-                                ? `- **Scope — Groups:** ${scope.computer_groups.computer_group.map((g: any) => g.name).join(", ")}`
+                            computerGroups.length
+                                ? `- **Scope — Groups:** ${computerGroups.map((g: any) => g.name).join(", ")}`
                                 : null,
                             scripts.length
-                                ? `- **Scripts:** ${(Array.isArray(scripts) ? scripts : [scripts]).map((s: any) => s.name).join(", ")}`
+                                ? `- **Scripts:** ${scripts.map((s: any) => s.name).join(", ")}`
                                 : null,
                             packages.length
-                                ? `- **Packages:** ${(Array.isArray(packages) ? packages : [packages]).map((p: any) => p.name).join(", ")}`
+                                ? `- **Packages:** ${packages.map((p: any) => p.name).join(", ")}`
                                 : null,
                         ].filter(Boolean).join("\n");
                         return lines;
@@ -1192,6 +1203,276 @@ function createJamfMcpServer(roles: string[]): McpServer {
                         );
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 25. jamf_create_script ────────────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_script",
+            {
+                description:
+                    "Create or update a JAMF Pro script, identified by name (upsert — re-running with the same " +
+                    "name OVERWRITES that script's contents and parameters, it does not create a duplicate). " +
+                    "Parameters 4-11 are available for custom use (JAMF reserves 1-3 for mount point, computer " +
+                    "name, and username at runtime).",
+                inputSchema: {
+                    name: z.string().describe("Script name — used as the upsert key"),
+                    scriptContents: z.string().describe("The full script body (e.g. bash or zsh source)"),
+                    categoryName: z.string().optional().describe("Category name — must match an existing JAMF category (see jamf_list_categories)"),
+                    info: z.string().optional().describe("Longer description shown in JAMF Pro"),
+                    notes: z.string().optional(),
+                    priority: z.enum(["BEFORE", "AFTER"]).optional().describe("Execution priority relative to package installs"),
+                    osRequirements: z.string().optional().describe('e.g. "13.0.x" or a comma-separated list'),
+                    parameter4: z.string().optional(),
+                    parameter5: z.string().optional(),
+                    parameter6: z.string().optional(),
+                    parameter7: z.string().optional(),
+                    parameter8: z.string().optional(),
+                    parameter9: z.string().optional(),
+                    parameter10: z.string().optional(),
+                    parameter11: z.string().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                name, scriptContents, categoryName, info, notes, priority, osRequirements,
+                parameter4, parameter5, parameter6, parameter7, parameter8, parameter9, parameter10, parameter11,
+                response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertScript({
+                        name, scriptContents, categoryName, info, notes, priority, osRequirements,
+                        parameter4, parameter5, parameter6, parameter7, parameter8, parameter9, parameter10, parameter11,
+                    });
+                    const text = toText(result, response_format, () =>
+                        result.action === "created"
+                            ? `Created script **${result.name}** (ID ${result.id}).`
+                            : `Updated script **${result.name}** (ID ${result.id}).`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 26. jamf_upload_package ──────────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_upload_package",
+            {
+                description:
+                    "Upload a .pkg/.dmg installer to JAMF Pro and create (or update, if a package with the " +
+                    "same packageName already exists) its package object. " +
+                    "IMPORTANT: localFilePath must be a path on THIS MCP SERVER'S OWN FILESYSTEM, readable by " +
+                    "the server process, and located inside the directory configured by JAMF_PACKAGE_UPLOAD_DIR " +
+                    "— it is NOT a path on the MCP client's machine. Re-running with the same packageName " +
+                    "updates that package's metadata and replaces its uploaded bytes — it does not create a " +
+                    "duplicate (the yearly re-publish case, e.g. Office or MATLAB version bumps).",
+                inputSchema: {
+                    localFilePath: z.string().describe(
+                        "Absolute path to the .pkg/.dmg file on the MCP server's local filesystem, inside JAMF_PACKAGE_UPLOAD_DIR"
+                    ),
+                    packageName: z.string().describe("The package's display name in JAMF Pro (used as the upsert key)"),
+                    categoryName: z.string().optional().describe("Category name — must match an existing JAMF category (see jamf_list_categories)"),
+                    priority: z.number().int().min(1).max(20).optional().describe("Install priority (default: 10)"),
+                    fillUserTemplate: z.boolean().optional(),
+                    rebootRequired: z.boolean().optional(),
+                    osInstall: z.boolean().optional().describe("True if this package is a full OS installer"),
+                    suppressUpdates: z.boolean().optional(),
+                    suppressFromDock: z.boolean().optional(),
+                    suppressEula: z.boolean().optional(),
+                    suppressRegistration: z.boolean().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                localFilePath, packageName, categoryName, priority, fillUserTemplate, rebootRequired,
+                osInstall, suppressUpdates, suppressFromDock, suppressEula, suppressRegistration,
+                response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertPackage({
+                        localFilePath, packageName, categoryName, priority,
+                        fillUserTemplate, rebootRequired, osInstall,
+                        suppressUpdates, suppressFromDock, suppressEula, suppressRegistration,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `${result.action === "created" ? "Created" : "Updated"} package **${result.packageName}** (ID ${result.id}, file "${result.fileName}") and uploaded its bytes successfully.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 27. jamf_create_smart_group ──────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_smart_group",
+            {
+                description:
+                    "Create or update an 'Application - detection' smart computer group in JAMF Pro, matching " +
+                    "on exact Application Title + Application Version (upsert by name — rerunning for a version " +
+                    "bump, e.g. re-publishing after MATLAB 2025b becomes 2026a, updates the existing group's " +
+                    "criteria in place rather than creating a duplicate). NOTE: if you immediately reference a " +
+                    "just-created group by name in jamf_create_policy or jamf_update_policy, JAMF's internal " +
+                    "indexing can lag a few seconds and return a transient 409 — retry once if that happens.",
+                inputSchema: {
+                    name: z.string().describe("Smart group name — used as the upsert key"),
+                    applicationTitle: z.string().describe('Exact application bundle name as JAMF inventories it, e.g. "MATLAB.app"'),
+                    applicationVersion: z.string().describe('Exact version string to match, e.g. "25.2"'),
+                    siteId: z.string().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, applicationTitle, applicationVersion, siteId, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertApplicationSmartGroup({ name, applicationTitle, applicationVersion, siteId });
+                    const text = toText(result, response_format, () =>
+                        result.action === "created"
+                            ? `Created smart group **${result.name}** (ID ${result.id}) matching ${applicationTitle} == ${applicationVersion}.`
+                            : `Updated smart group **${result.name}** (ID ${result.id}) to match ${applicationTitle} == ${applicationVersion}.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 28. jamf_create_policy ────────────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_policy",
+            {
+                description:
+                    "Create a new JAMF Pro policy scoped to one or more smart/static computer groups by name. " +
+                    "Scripts and packages are both optional and independent — a script-only policy (e.g. a " +
+                    "maintenance/remediation policy with no package) is fully supported. Does NOT support " +
+                    "individual-computer, building, or department scoping/limitations, or configuration profiles " +
+                    "— use smart/static computer groups for targeting. This creates a NEW policy every call; it " +
+                    "does not check for an existing policy of the same name (unlike jamf_create_script/jamf_upload_package).",
+                inputSchema: {
+                    name: z.string().describe("Policy display name"),
+                    enabled: z.boolean().default(true),
+                    triggerCheckin: z.boolean().optional(),
+                    triggerEnrollmentComplete: z.boolean().optional(),
+                    triggerLogin: z.boolean().optional(),
+                    triggerStartup: z.boolean().optional(),
+                    triggerOther: z.string().optional().describe('Custom event trigger name (for `jamf policy -trigger <name>`)'),
+                    frequency: z
+                        .enum(["Once per computer", "Once per user per computer", "Once per day", "Once per week", "Once per month", "Ongoing"])
+                        .default("Once per computer"),
+                    categoryName: z.string().optional(),
+                    targetGroupNames: z.array(z.string()).default([]).describe("Smart/static computer group names to scope this policy to"),
+                    exclusionGroupNames: z.array(z.string()).default([]).describe("Smart/static computer group names to exclude from scope"),
+                    scripts: z
+                        .array(z.object({
+                            name: z.string(),
+                            priority: z.enum(["Before", "After"]).default("After"),
+                            parameter4: z.string().optional(),
+                        }))
+                        .default([])
+                        .describe("Scripts to run, by name — must already exist (see jamf_create_script)"),
+                    packages: z
+                        .array(z.object({
+                            name: z.string(),
+                            action: z.enum(["Install", "Cache", "Install Cached"]).default("Install"),
+                        }))
+                        .default([])
+                        .describe("Packages to deploy, by name — must already exist (see jamf_upload_package)"),
+                    selfService: z
+                        .object({
+                            useForSelfService: z.boolean(),
+                            displayName: z.string().optional(),
+                            installButtonText: z.string().optional(),
+                            description: z.string().optional(),
+                        })
+                        .optional(),
+                    maintenanceRecon: z.boolean().default(false).describe("Update computer inventory (recon) when this policy runs"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                name, enabled, triggerCheckin, triggerEnrollmentComplete, triggerLogin, triggerStartup, triggerOther,
+                frequency, categoryName, targetGroupNames, exclusionGroupNames, scripts, packages, selfService,
+                maintenanceRecon, response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.createPolicy({
+                        name, enabled, triggerCheckin, triggerEnrollmentComplete, triggerLogin, triggerStartup, triggerOther,
+                        frequency, categoryName, targetGroupNames, exclusionGroupNames, scripts, packages, selfService,
+                        maintenanceRecon,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created policy **${result.name}** (ID ${result.id}).`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 29. jamf_update_policy ────────────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_update_policy",
+            {
+                description:
+                    "Enable/disable an existing JAMF Pro policy and/or widen or narrow its scope by adding/removing " +
+                    "target or exclusion computer groups (smart or static, by name). Safely merges with the " +
+                    "policy's existing scope — reads the full current policy, merges only the requested changes, " +
+                    "and writes the whole thing back. Does not touch triggers, scripts, packages, or Self Service " +
+                    "settings — use this only for the enable/disable + scope-widening workflow (e.g. staged rollout). " +
+                    "Because this can meaningfully widen deployment or disable an active fix, double-check the " +
+                    "group names before calling.",
+                inputSchema: {
+                    policy: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
+                    enabled: z.boolean().optional().describe("Set to enable/disable the policy"),
+                    addTargetGroupNames: z.array(z.string()).default([]),
+                    removeTargetGroupNames: z.array(z.string()).default([]),
+                    addExclusionGroupNames: z.array(z.string()).default([]),
+                    removeExclusionGroupNames: z.array(z.string()).default([]),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                policy, enabled, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
+                response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.updatePolicyScope(policy, {
+                        enabled, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
+                    });
+                    const text = toText(result, response_format, () => [
+                        `## Policy **${result.name}** updated`,
+                        `- **Enabled:** ${result.enabled ? "Yes" : "No"}`,
+                        `- **Target groups:** ${result.targetGroups.join(", ") || "none"}`,
+                        `- **Exclusion groups:** ${result.exclusionGroups.join(", ") || "none"}`,
+                    ].join("\n"));
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

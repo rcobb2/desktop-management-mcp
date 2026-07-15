@@ -43,7 +43,7 @@ See `bws-secrets.map` for the secret names to create in your BWS project.
 1. **Static bearer token** — `JAMF_MCP_AUTH_TOKEN` / `INTUNE_MCP_AUTH_TOKEN` (comma-separated to allow rotating without downtime). This is the only mechanism available to non-interactive automation (scripts, n8n), and grants that server's full tool set — every tool below, including the destructive ones. Treat this token as equivalent to full admin access to the corresponding backend.
 2. **Entra ID OAuth** (`ENTRA_OAUTH_ENABLED=true`) — a JWT issued by Microsoft Entra ID, verified against Entra's JWKS. Tool visibility is driven by the token's `roles` claim (`Jamf.Read`, `Jamf.Write`, `Intune.Read` — see `src/utils/roles.ts`): a tool a caller's role doesn't grant is never registered on that request's server instance, so it's not just hidden, it's uncallable. This lets real staff authenticate as themselves instead of sharing one all-or-nothing token.
 
-**`jamf_send_mdm_command` is flagged `destructiveHint: true`** and supports `EraseDevice` (irreversible) among other commands; `jamf_update_computer`, `jamf_assign_computers_to_prestage`, and `jamf_flush_mdm_commands` are also write/mutating tools, gated behind the `Jamf.Write` role under Entra auth (or the static token, which grants both read and write). Anyone holding a valid `JAMF_MCP_AUTH_TOKEN` can call all of them — the token itself is the access boundary for the automation path.
+**`jamf_send_mdm_command` is flagged `destructiveHint: true`** and supports `EraseDevice` (irreversible) among other commands; it and the other nine write/mutating JAMF tools (computer/prestage/inventory-preload updates, MDM flush, plus the script/package/smart-group/policy create-and-update tools) are gated behind the `Jamf.Write` role under Entra auth (or the static token, which grants both read and write). Anyone holding a valid `JAMF_MCP_AUTH_TOKEN` can call all of them — the token itself is the access boundary for the automation path.
 
 In production (podman02), network exposure is layered on top of this: internal-DNS-only hostnames, plus a Caddy IP allowlist. `/mcp`'s bearer-token requirement is the one layer that's actual authentication rather than network-level exposure control, and the one that still holds if the other two are ever misconfigured — see `CLAUDE.md` for the full deployment/defense-in-depth writeup.
 
@@ -65,6 +65,7 @@ Injected by `bws run` from your BWS project (see `bws-secrets.map`):
 - `JAMF_CLIENT_ID`, `JAMF_CLIENT_SECRET`
 - `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 - `JAMF_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://jamf-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`, used to build RFC 9728 resource metadata)
+- `JAMF_PACKAGE_UPLOAD_DIR` — directory `jamf_upload_package` may read files from on this server's own filesystem. Required for that tool; it refuses every call if unset.
 
 **Microsoft Intune:**
 - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — Graph app-only client credentials for device data; unrelated to the Entra auth vars below
@@ -199,7 +200,7 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 
 ### JAMF Pro Tools
 
-`jamf_send_mdm_command` is the one tool flagged `destructiveHint: true` (supports `EraseDevice`, irreversible on Apple Silicon without the erasure passcode). It and the other three write tools below require the `Jamf.Write` role under Entra auth.
+`jamf_send_mdm_command` is the one tool flagged `destructiveHint: true` (supports `EraseDevice`, irreversible on Apple Silicon without the erasure passcode). It and the other write tools below require the `Jamf.Write` role under Entra auth. `jamf_create_script`/`jamf_upload_package`/`jamf_create_smart_group` are upserts by name (re-running updates the existing object in place); `jamf_create_policy` always creates a new policy; `jamf_update_policy` handles enable/disable + scope widening for an existing one. See `CLAUDE.md` for the Classic-API-requires-XML detail and the known Delete-permission gap (Scripts/Policies/Smart Groups can be created/updated but not deleted by this API client — package deletion does work).
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -208,6 +209,7 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 | `jamf_get_computer_by_serial` | Computer details by serial number | `serial` |
 | `jamf_get_computers_by_user` | Macs by username / name / email | `userIdentifier` |
 | `jamf_get_mobile_device` | Mobile device details by name | `deviceName` |
+| `jamf_list_mobile_devices` | Fleet-wide mobile device list/breakdown (type, managed, supervised, model) | `type?`, `managed?`, `supervised?` |
 | `jamf_list_smart_groups` | List smart groups | `type` (`"computer"` or `"mobile_device"`) |
 | `jamf_get_smart_group_members` | Members of a smart group | `groupId` |
 | `jamf_list_static_groups` | Static computer groups | — |
@@ -228,6 +230,11 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 | `jamf_send_mdm_command` | Send an MDM command (`EraseDevice`, `RestartDevice`, `UnlockUserAccount`, etc.) | `computerNameOrSerial`, `command`, `unlockUsername?`, `erasurePasscode?` |
 | `jamf_update_computer` | Update computer inventory fields | `computerNameOrSerial`, `username?`, `realName?`, `emailAddress?`, `department?`, `building?`, `room?`, `assetTag?` |
 | `jamf_flush_mdm_commands` | Flush pending/failed MDM commands | `computerNameOrSerial`, `status?` |
+| `jamf_create_script` | Create/update a script (upsert by name) | `name`, `scriptContents`, `categoryName?`, `info?`, `notes?`, `priority?`, `osRequirements?`, `parameter4?`...`parameter11?` |
+| `jamf_upload_package` | Upload a .pkg/.dmg and create/update its package object (upsert by name) | `localFilePath` (server-side path, inside `JAMF_PACKAGE_UPLOAD_DIR`), `packageName`, `categoryName?`, `priority?`, plus install-behavior flags |
+| `jamf_create_smart_group` | Create/update an Application Title+Version detection smart group (upsert by name) | `name`, `applicationTitle`, `applicationVersion`, `siteId?` |
+| `jamf_create_policy` | Create a policy scoped to smart/static groups; script-only policies supported | `name`, `enabled?`, trigger/frequency fields, `categoryName?`, `targetGroupNames?`, `exclusionGroupNames?`, `scripts?`, `packages?`, `selfService?`, `maintenanceRecon?` |
+| `jamf_update_policy` | Enable/disable + widen/narrow an existing policy's scope | `policy`, `enabled?`, `addTargetGroupNames?`, `removeTargetGroupNames?`, `addExclusionGroupNames?`, `removeExclusionGroupNames?` |
 
 ### Microsoft Intune Tools
 
@@ -237,6 +244,7 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 | `intune_get_device_by_name` | Managed device by name | `deviceName` |
 | `intune_get_device_by_serial` | Managed device by serial number | `serialNumber` |
 | `intune_get_devices_by_user` | All devices for a user | `userIdentifier` |
+| `intune_list_devices` | Fleet-wide device list/breakdown (OS, compliance, management agent) — `intuneManagedOnly` excludes Defender-sensor-only/ConfigMgr-only devices | `operatingSystem?`, `complianceState?`, `managementState?`, `managementAgent?`, `intuneManagedOnly?` |
 | `intune_get_device_groups` | Device group memberships | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_get_device_apps` | Detected & assigned apps | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_list_configuration_policies` | Configuration policies (classic + settings catalog) | `policyName?`, `platform?` |
@@ -258,7 +266,7 @@ bws run --access-token "$BWS_ACCESS_TOKEN" -- \
   npm test
 ```
 
-Add `JAMF_TEST_WRITE=1` to enable destructive write tests (MDM commands, inventory updates) against live JAMF Pro.
+Add `JAMF_TEST_WRITE=1` to enable destructive write tests (MDM commands, inventory updates) against live JAMF Pro. The script/smart-group/policy upsert tests additionally need a pre-existing, manually-created fixture object named via `TEST_SCRIPT_NAME`/`TEST_SMART_GROUP_NAME`/`TEST_POLICY_NAME` (each optional — the test skips if unset or if no object with that name exists yet, since this API client can create/update but not delete those object types). The package upsert test is fully self-cleaning via `TEST_PACKAGE_PATH` (also optional) pointing at a small `.pkg`/`.dmg` inside `JAMF_PACKAGE_UPLOAD_DIR`.
 
 `npm run test:unit` runs just the auth/roles unit tests (`test/auth.test.ts`) — no live credentials or network access needed, since they exercise `requireMcpAuth`'s fallback/fail-closed logic and the `roles.ts` helpers against fakes.
 

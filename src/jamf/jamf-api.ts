@@ -11,6 +11,66 @@ function escapeRsqlValue(value: string): string {
     return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+/**
+ * Escapes a value for safe use as XML element text content.
+ */
+function escapeXml(value: unknown): string {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+// Jamf's Classic API rejects JSON bodies on policy/computer-group POST/PUT with a
+// 415 (confirmed live — only GETs on these endpoints accept the Accept:
+// application/json trick; writes require real XML), unlike /JSSResource/computers
+// which does accept a JSON body on PUT. Container keys whose value is a JS array
+// need each item wrapped in the *singular* form of the container tag (e.g.
+// <computer_groups><computer_group>...) — this maps the container keys this
+// codebase actually emits to their singular tag name; anything else falls back to
+// stripping a trailing "s".
+const XML_PLURAL_TO_SINGULAR: Record<string, string> = {
+    computer_groups: 'computer_group',
+    computers: 'computer',
+    buildings: 'building',
+    departments: 'department',
+    scripts: 'script',
+    packages: 'package',
+    criteria: 'criterion',
+    jss_users: 'user',
+    jss_user_groups: 'user_group',
+};
+
+/**
+ * Recursively serializes a plain object into XML element bodies (no wrapping root
+ * tag — callers add that). Empty arrays and null/undefined values are omitted
+ * entirely rather than emitted as empty tags — confirmed live that Jamf accepts a
+ * policy/computer-group create with empty scope collections simply left out.
+ */
+function serializeXmlObjectBody(obj: any): string {
+    if (obj === null || obj === undefined) return '';
+    if (typeof obj !== 'object') return escapeXml(obj);
+    return Object.entries(obj)
+        .filter(([, v]) => v !== undefined && v !== null)
+        .map(([key, value]) => {
+            if (Array.isArray(value)) {
+                if (value.length === 0) return '';
+                const singular = XML_PLURAL_TO_SINGULAR[key] ?? key.replace(/s$/, '');
+                const items = value.map((item) => `<${singular}>${serializeXmlObjectBody(item)}</${singular}>`).join('');
+                return `<${key}>${items}</${key}>`;
+            }
+            if (typeof value === 'object') return `<${key}>${serializeXmlObjectBody(value)}</${key}>`;
+            return `<${key}>${escapeXml(value)}</${key}>`;
+        })
+        .join('');
+}
+
+function buildXmlDocument(rootTag: string, body: any): string {
+    return `<?xml version="1.0" encoding="UTF-8"?><${rootTag}>${serializeXmlObjectBody(body)}</${rootTag}>`;
+}
+
 export class JamfClient {
     private client: AxiosInstance;
     private token: string | null = null;
@@ -286,14 +346,30 @@ export class JamfClient {
     public async getSmartComputerGroups() {
         await this.ensureAuthenticated();
         this.logger.info('Fetching smart computer groups');
+        const PAGE_SIZE = 200;
+        const MAX_PAGES = 20; // 20 * 200 = 4k groups — far above any real tenant size here
         try {
-            // Using Jamf Pro API v2
-            const apiStart = Date.now();
-            const response = await this.client.get('/api/v2/computer-groups/smart-groups');
-            const apiDuration = Date.now() - apiStart;
-            logApiCall(this.logger, 'GET', '/api/v2/computer-groups/smart-groups', response.status, apiDuration);
-            this.logger.info('Smart computer groups retrieved successfully');
-            return response.data;
+            const results: any[] = [];
+            let page = 0;
+            let totalCount = 0;
+            while (page < MAX_PAGES) {
+                const apiStart = Date.now();
+                const response = await this.client.get('/api/v2/computer-groups/smart-groups', {
+                    params: { page, 'page-size': PAGE_SIZE }
+                });
+                logApiCall(this.logger, 'GET', '/api/v2/computer-groups/smart-groups', response.status, Date.now() - apiStart);
+                const pageResults: any[] = response.data.results ?? [];
+                totalCount = response.data.totalCount ?? totalCount;
+                results.push(...pageResults);
+                // Confirmed live: this endpoint's default page returns only the first
+                // page-size worth of groups with no indication more exist unless you
+                // check totalCount — a tenant with >100 smart groups silently truncated
+                // name-based lookups (e.g. resolveComputerGroupIdByName) before this fix.
+                if (pageResults.length === 0 || results.length >= totalCount) break;
+                page++;
+            }
+            this.logger.info('Smart computer groups retrieved successfully', { count: results.length, totalCount });
+            return { totalCount, results };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching smart computer groups');
@@ -535,20 +611,22 @@ export class JamfClient {
             const response = await this.client.get('/api/v1/scripts', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/scripts', response.status, apiDuration);
-            
-            // Client-side filtering by name if provided (case-insensitive substring match)
-            let scripts = response.data.scripts || [];
+
+            // Client-side filtering by name if provided (case-insensitive substring match).
+            // The real v1 response's array is under `results`, not `scripts` — reading the
+            // latter silently produced an always-empty filtered list (confirmed live).
+            let scripts = response.data.results || [];
             if (name) {
                 const nameLower = name.toLowerCase();
-                scripts = scripts.filter((script: any) => 
+                scripts = scripts.filter((script: any) =>
                     script.name && script.name.toLowerCase().includes(nameLower)
                 );
             }
-            
-            this.logger.info('Scripts retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: scripts.length, totalInPage: response.data.scripts?.length || 0 });
+
+            this.logger.info('Scripts retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: scripts.length, totalInPage: response.data.results?.length || 0 });
             return {
                 ...response.data,
-                scripts: scripts
+                results: scripts
             };
         } catch (error) {
             if (axios.isAxiosError(error)) {
@@ -578,20 +656,22 @@ export class JamfClient {
             const response = await this.client.get('/api/v1/packages', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/packages', response.status, apiDuration);
-            
-            // Client-side filtering by name if provided (case-insensitive substring match)
-            let packages = response.data.packages || [];
+
+            // Client-side filtering by name if provided (case-insensitive substring match).
+            // The real v1 response's array is under `results`, not `packages` — reading the
+            // latter silently produced an always-empty filtered list (confirmed live).
+            let packages = response.data.results || [];
             if (name) {
                 const nameLower = name.toLowerCase();
-                packages = packages.filter((pkg: any) => 
-                    pkg.name && pkg.name.toLowerCase().includes(nameLower)
+                packages = packages.filter((pkg: any) =>
+                    pkg.packageName && pkg.packageName.toLowerCase().includes(nameLower)
                 );
             }
-            
-            this.logger.info('Packages retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: packages.length, totalInPage: response.data.packages?.length || 0 });
+
+            this.logger.info('Packages retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: packages.length, totalInPage: response.data.results?.length || 0 });
             return {
                 ...response.data,
-                packages: packages
+                results: packages
             };
         } catch (error) {
             if (axios.isAxiosError(error)) {
@@ -607,6 +687,359 @@ export class JamfClient {
             this.logger.error("Error fetching packages", { error: (error as Error).message, stack: (error as Error).stack });
             throw error;
         }
+    }
+
+    public async getScriptById(id: string) {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/api/v1/scripts/${id}`);
+            logApiCall(this.logger, 'GET', `/api/v1/scripts/${id}`, response.status, Date.now() - apiStart);
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Scripts' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Script with ID ${id} not found.`);
+            }
+            this.logger.error('Error fetching script by id', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async findScriptByName(name: string): Promise<any | null> {
+        const data = await this.getScripts(name, 0, 200);
+        const scripts: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        const match = scripts.find((s) => s.name?.toLowerCase() === lower);
+        if (!match) return null;
+        // The list endpoint's items already include the full record (confirmed live),
+        // but re-fetch by id for a stable, single source of truth to merge updates into.
+        return this.getScriptById(String(match.id));
+    }
+
+    private async createScript(fields: Record<string, any>): Promise<string> {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.post('/api/v1/scripts', fields);
+            logApiCall(this.logger, 'POST', '/api/v1/scripts', response.status, Date.now() - apiStart);
+            return String(response.data.id);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Scripts' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating script', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async updateScriptById(id: string, fields: Record<string, any>, existing: any): Promise<void> {
+        await this.ensureAuthenticated();
+        const body = { ...existing, ...fields };
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.put(`/api/v1/scripts/${id}`, body);
+            logApiCall(this.logger, 'PUT', `/api/v1/scripts/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Scripts' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating script', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Upsert by name: creates a new script if none exists with this name, otherwise
+    // merges the given fields into the existing script and PUTs the whole thing
+    // back — re-running with the same name is how a script gets updated in place
+    // rather than duplicated (e.g. a yearly package's install script revision).
+    public async upsertScript(fields: {
+        name: string;
+        scriptContents: string;
+        categoryName?: string;
+        info?: string;
+        notes?: string;
+        priority?: 'BEFORE' | 'AFTER';
+        osRequirements?: string;
+        parameter4?: string; parameter5?: string; parameter6?: string; parameter7?: string;
+        parameter8?: string; parameter9?: string; parameter10?: string; parameter11?: string;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting script', { name: fields.name });
+
+        const { categoryName, ...rest } = fields;
+        const body: Record<string, any> = { ...rest };
+        if (categoryName) body.categoryId = await this.resolveCategoryId(categoryName);
+
+        const existing = await this.findScriptByName(fields.name);
+        if (!existing) {
+            const id = await this.createScript(body);
+            this.logger.info('Script created', { name: fields.name, id });
+            return { action: 'created' as const, id, name: fields.name };
+        }
+        await this.updateScriptById(String(existing.id), body, existing);
+        this.logger.info('Script updated', { name: fields.name, id: existing.id });
+        return { action: 'updated' as const, id: String(existing.id), name: fields.name };
+    }
+
+    private async findPackageByName(packageName: string): Promise<any | null> {
+        const data = await this.getPackages(packageName, 0, 200);
+        const packages: any[] = data.results ?? [];
+        const lower = packageName.trim().toLowerCase();
+        return packages.find((p) => p.packageName?.toLowerCase() === lower) ?? null;
+    }
+
+    // Only these fields are user-writable on POST/PUT /api/v1/packages — the read
+    // response (confirmed live) also includes server-computed fields (size,
+    // hashType, hashValue, md5, sha256, sha3512, cloudTransferStatus, indexed,
+    // osInstallerVersion, manifest, format) that must NOT be echoed back on write.
+    private pickWritablePackageFields(pkg: any): Record<string, any> {
+        const keys = [
+            'packageName', 'fileName', 'categoryId', 'priority', 'info', 'notes',
+            'osRequirements', 'fillUserTemplate', 'fillExistingUsers', 'swu',
+            'rebootRequired', 'selfHealNotify', 'selfHealingAction', 'osInstall',
+            'serialNumber', 'parentPackageId', 'basePath', 'suppressUpdates',
+            'ignoreConflicts', 'suppressFromDock', 'suppressEula', 'suppressRegistration',
+            'installLanguage', 'manifestFileName',
+        ];
+        return Object.fromEntries(keys.filter((k) => pkg[k] !== undefined).map((k) => [k, pkg[k]]));
+    }
+
+    private async createPackageMetadata(fields: Record<string, any>): Promise<string> {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.post('/api/v1/packages', fields);
+            logApiCall(this.logger, 'POST', '/api/v1/packages', response.status, Date.now() - apiStart);
+            return String(response.data.id);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Packages' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating package metadata', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async updatePackageMetadata(id: string, fields: Record<string, any>, existing: any): Promise<void> {
+        await this.ensureAuthenticated();
+        const body = { ...this.pickWritablePackageFields(existing), ...fields };
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.put(`/api/v1/packages/${id}`, body);
+            logApiCall(this.logger, 'PUT', `/api/v1/packages/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Packages' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating package metadata', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Streams the file off disk without loading it fully into memory (installers
+    // can be hundreds of MB to multiple GB) using node:fs's openAsBlob, and native
+    // fetch/FormData rather than axios — axios's Node adapter doesn't cleanly
+    // multipart-encode a standard FormData without the extra `form-data` package,
+    // which isn't a dependency here.
+    private async uploadPackageFile(id: string, localFilePath: string): Promise<any> {
+        await this.ensureAuthenticated();
+        const { openAsBlob } = await import('node:fs');
+        const path = await import('node:path');
+        const fileBlob = await openAsBlob(localFilePath);
+        const form = new FormData();
+        form.append('file', fileBlob, path.basename(localFilePath));
+
+        const apiStart = Date.now();
+        const response = await fetch(`${this.jamfUrl}/api/v1/packages/${id}/upload`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${this.token}` },
+            body: form,
+        });
+        logApiCall(this.logger, 'POST', `/api/v1/packages/${id}/upload`, response.status, Date.now() - apiStart);
+        if (response.status === 403) {
+            throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Packages' permissions in JAMF Pro.`);
+        }
+        if (!response.ok) {
+            const text = await response.text().catch(() => '');
+            throw new Error(`Package upload failed (${response.status}): ${text}`);
+        }
+        return response.json().catch(() => ({}));
+    }
+
+    // Upsert by packageName: creates a new package object if none exists with this
+    // name, otherwise updates its metadata in place — then always (re-)uploads the
+    // file, so re-running against an existing name replaces both the metadata and
+    // the bytes (the yearly Office/MATLAB/Adobe re-publish case).
+    public async upsertPackage(params: {
+        localFilePath: string;
+        packageName: string;
+        categoryName?: string;
+        priority?: number;
+        fillUserTemplate?: boolean;
+        rebootRequired?: boolean;
+        osInstall?: boolean;
+        suppressUpdates?: boolean;
+        suppressFromDock?: boolean;
+        suppressEula?: boolean;
+        suppressRegistration?: boolean;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting package', { packageName: params.packageName, localFilePath: params.localFilePath });
+
+        const uploadDir = process.env.JAMF_PACKAGE_UPLOAD_DIR;
+        if (!uploadDir) {
+            throw new Error(
+                "JAMF_PACKAGE_UPLOAD_DIR is not set — refusing to read any local file for package upload. " +
+                "Set this env var to the directory package files are staged in before using jamf_upload_package."
+            );
+        }
+        const path = await import('node:path');
+        const resolvedUploadDir = path.resolve(uploadDir);
+        const resolvedFilePath = path.resolve(params.localFilePath);
+        if (resolvedFilePath !== resolvedUploadDir && !resolvedFilePath.startsWith(resolvedUploadDir + path.sep)) {
+            throw new Error(
+                `Refusing to read file outside the allowed upload directory. "${params.localFilePath}" is not inside JAMF_PACKAGE_UPLOAD_DIR ("${uploadDir}").`
+            );
+        }
+
+        const fsPromises = await import('node:fs/promises');
+        const stat = await fsPromises.stat(resolvedFilePath).catch(() => null);
+        if (!stat || !stat.isFile()) {
+            throw new Error(`Local file not found or not a regular file: "${params.localFilePath}"`);
+        }
+
+        const fileName = path.basename(resolvedFilePath);
+        const categoryId = params.categoryName ? await this.resolveCategoryId(params.categoryName) : '-1';
+        const metadata: Record<string, any> = {
+            packageName: params.packageName,
+            fileName,
+            categoryId,
+            priority: params.priority ?? 10,
+            fillUserTemplate: params.fillUserTemplate ?? false,
+            rebootRequired: params.rebootRequired ?? false,
+            osInstall: params.osInstall ?? false,
+            suppressUpdates: params.suppressUpdates ?? false,
+            suppressFromDock: params.suppressFromDock ?? false,
+            suppressEula: params.suppressEula ?? false,
+            suppressRegistration: params.suppressRegistration ?? false,
+        };
+
+        const existing = await this.findPackageByName(params.packageName);
+        let id: string;
+        let action: 'created' | 'updated';
+        if (!existing) {
+            id = await this.createPackageMetadata(metadata);
+            action = 'created';
+        } else {
+            id = String(existing.id);
+            await this.updatePackageMetadata(id, metadata, existing);
+            action = 'updated';
+        }
+
+        const uploadResult = await this.uploadPackageFile(id, resolvedFilePath);
+        this.logger.info('Package upserted and uploaded', { id, packageName: params.packageName, action });
+        return { action, id, packageName: params.packageName, fileName, uploadResult };
+    }
+
+    // Test-hygiene only — no corresponding MCP tool. Confirmed live that the API
+    // client's role has Delete Packages permission (unlike scripts/policies/smart
+    // groups, where it does not), so this is the one object type in this batch that
+    // a test can safely create-then-clean-up.
+    public async deletePackage(id: string): Promise<void> {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.delete(`/api/v1/packages/${id}`);
+            logApiCall(this.logger, 'DELETE', `/api/v1/packages/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Delete Packages' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error deleting package', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Only ever checks getSmartComputerGroups() (not static groups) — a match found
+    // there is smart by construction, so there's no separate isSmart check needed.
+    private async findComputerGroupByNameExact(name: string): Promise<any | null> {
+        const smart = await this.getSmartComputerGroups();
+        const smartGroups: any[] = Array.isArray(smart) ? smart : (smart as any).results ?? [];
+        const lower = name.trim().toLowerCase();
+        return smartGroups.find((g) => g.name?.toLowerCase() === lower) ?? null;
+    }
+
+    private async createSmartGroup(fields: Record<string, any>): Promise<string> {
+        await this.ensureAuthenticated();
+        try {
+            const xml = buildXmlDocument('computer_group', fields);
+            const apiStart = Date.now();
+            const response = await this.client.post('/JSSResource/computergroups/id/0', xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'POST', '/JSSResource/computergroups/id/0', response.status, Date.now() - apiStart);
+            const match = String(response.data).match(/<id>(\d+)<\/id>/);
+            if (!match) throw new Error('Smart group created but no ID could be determined from the response.');
+            return match[1];
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Smart Computer Groups' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating smart group', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async updateSmartGroupById(id: string, fields: Record<string, any>): Promise<void> {
+        await this.ensureAuthenticated();
+        try {
+            const xml = buildXmlDocument('computer_group', fields);
+            const apiStart = Date.now();
+            const response = await this.client.put(`/JSSResource/computergroups/id/${id}`, xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `/JSSResource/computergroups/id/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Smart Computer Groups' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating smart group', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Upsert by name: two-criterion "Application Title is X AND Application
+    // Version is Y" smart group — the common "detection" pattern. Re-running for a
+    // version bump (e.g. MATLAB 2025b -> 2026a) updates the existing group's
+    // criteria in place rather than creating a duplicate.
+    public async upsertApplicationSmartGroup(params: {
+        name: string;
+        applicationTitle: string;
+        applicationVersion: string;
+        siteId?: string;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting application smart group', { name: params.name });
+
+        const criteria = [
+            { name: 'Application Title', priority: 0, and_or: 'and', search_type: 'is', value: params.applicationTitle, opening_paren: false, closing_paren: false },
+            { name: 'Application Version', priority: 1, and_or: 'and', search_type: 'is', value: params.applicationVersion, opening_paren: false, closing_paren: false },
+        ];
+        const fields: Record<string, any> = { name: params.name, is_smart: true, criteria };
+        if (params.siteId) fields.site = { id: params.siteId };
+
+        const existing = await this.findComputerGroupByNameExact(params.name);
+        if (!existing) {
+            const id = await this.createSmartGroup(fields);
+            this.logger.info('Smart group created', { name: params.name, id });
+            return { action: 'created' as const, id, name: params.name };
+        }
+        await this.updateSmartGroupById(String(existing.id), fields);
+        this.logger.info('Smart group updated', { name: params.name, id: existing.id });
+        return { action: 'updated' as const, id: String(existing.id), name: params.name };
     }
 
     public async getInventoryPreload(page?: number, pageSize?: number) {
@@ -889,6 +1322,48 @@ export class JamfClient {
         throw new Error(`Computer not found: "${nameOrSerial}"`);
     }
 
+    private async resolveCategoryId(name: string): Promise<string> {
+        const data = await this.getCategories(0, 200);
+        const categories: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        const match = categories.find((c) => c.name?.toLowerCase() === lower)
+            ?? categories.find((c) => c.name?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`Category not found: "${name}"`);
+        return String(match.id);
+    }
+
+    // Policy scoping can target either a smart or static computer group — Classic
+    // API's scope.computer_groups doesn't distinguish the two structurally, so this
+    // searches both lists.
+    private async resolveComputerGroupIdByName(name: string): Promise<{ id: string; name: string }> {
+        const [smart, staticData] = await Promise.all([
+            this.getSmartComputerGroups(),
+            this.getStaticComputerGroups(),
+        ]);
+        const smartGroups: any[] = Array.isArray(smart) ? smart : (smart as any).results ?? [];
+        const staticGroups: any[] = (staticData as any).computerGroups ?? [];
+        const all = [...smartGroups, ...staticGroups];
+        const lower = name.trim().toLowerCase();
+        const match = all.find((g) => g.name?.toLowerCase() === lower)
+            ?? all.find((g) => g.name?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`Computer group not found: "${name}"`);
+        return { id: String(match.id), name: match.name };
+    }
+
+    private async resolvePolicyId(nameOrId: string): Promise<{ id: string; name: string }> {
+        if (/^\d+$/.test(nameOrId)) {
+            const detail = await this.getPolicyDetail(nameOrId);
+            return { id: nameOrId, name: detail.general?.name ?? nameOrId };
+        }
+        const data = await this.getPolicies(nameOrId, 0, 200);
+        const results: any[] = data.results ?? [];
+        const lower = nameOrId.toLowerCase();
+        const match = results.find((p) => p.name?.toLowerCase() === lower)
+            ?? results.find((p) => p.name?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`Policy not found: "${nameOrId}"`);
+        return { id: String(match.id), name: match.name };
+    }
+
     // ── New public methods ───────────────────────────────────────────────────
 
     public async getComputerBySerial(serial: string) {
@@ -1041,6 +1516,183 @@ export class JamfClient {
                 throw new Error(`Policy with ID ${policyId} not found.`);
             }
             this.logger.error('Error fetching policy detail', { policyId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Creates a new policy scoped to smart/static computer groups by name. Does NOT
+    // support individual-computer/building/department/limitations scoping or
+    // configuration profiles — smart/static group scoping only. Script-only policies
+    // (no packages) are fully supported by simply omitting `packages`.
+    public async createPolicy(params: {
+        name: string;
+        enabled?: boolean;
+        triggerCheckin?: boolean;
+        triggerEnrollmentComplete?: boolean;
+        triggerLogin?: boolean;
+        triggerStartup?: boolean;
+        triggerOther?: string;
+        frequency?: string;
+        categoryName?: string;
+        targetGroupNames?: string[];
+        exclusionGroupNames?: string[];
+        scripts?: { name: string; priority?: 'Before' | 'After'; parameter4?: string }[];
+        packages?: { name: string; action?: 'Install' | 'Cache' | 'Install Cached' }[];
+        selfService?: { useForSelfService: boolean; displayName?: string; installButtonText?: string; description?: string };
+        maintenanceRecon?: boolean;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Creating policy', { name: params.name });
+        try {
+            const [targetGroups, exclusionGroups, categoryId, scripts, packages] = await Promise.all([
+                Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
+                Promise.all((params.scripts ?? []).map(async (s) => {
+                    const found = await this.findScriptByName(s.name);
+                    if (!found) throw new Error(`Script not found: "${s.name}"`);
+                    return { id: String(found.id), name: found.name, priority: s.priority ?? 'After', parameter4: s.parameter4 };
+                })),
+                Promise.all((params.packages ?? []).map(async (p) => {
+                    const found = await this.findPackageByName(p.name);
+                    if (!found) throw new Error(`Package not found: "${p.name}"`);
+                    return { id: String(found.id), name: found.packageName, action: p.action ?? 'Install' };
+                })),
+            ]);
+
+            const policy: Record<string, any> = {
+                general: {
+                    name: params.name,
+                    enabled: params.enabled ?? true,
+                    trigger_checkin: params.triggerCheckin ?? false,
+                    trigger_enrollment_complete: params.triggerEnrollmentComplete ?? false,
+                    trigger_login: params.triggerLogin ?? false,
+                    trigger_startup: params.triggerStartup ?? false,
+                    trigger_other: params.triggerOther ?? '',
+                    frequency: params.frequency ?? 'Once per computer',
+                    category: categoryId ? { id: categoryId } : undefined,
+                },
+                scope: {
+                    all_computers: false,
+                    computer_groups: targetGroups.map((g) => ({ id: g.id, name: g.name })),
+                    exclusions: exclusionGroups.length
+                        ? { computer_groups: exclusionGroups.map((g) => ({ id: g.id, name: g.name })) }
+                        : undefined,
+                },
+                self_service: params.selfService
+                    ? {
+                          use_for_self_service: params.selfService.useForSelfService,
+                          self_service_display_name: params.selfService.displayName,
+                          install_button_text: params.selfService.installButtonText,
+                          self_service_description: params.selfService.description,
+                      }
+                    : undefined,
+                package_configuration: packages.length ? { packages } : undefined,
+                scripts: scripts.length ? scripts : undefined,
+                maintenance: { recon: params.maintenanceRecon ?? false },
+            };
+
+            const xml = buildXmlDocument('policy', policy);
+            const apiStart = Date.now();
+            const response = await this.client.post('/JSSResource/policies/id/0', xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'POST', '/JSSResource/policies/id/0', response.status, Date.now() - apiStart);
+
+            const match = String(response.data).match(/<id>(\d+)<\/id>/);
+            if (!match) throw new Error('Policy created but no ID could be determined from the response.');
+
+            this.logger.info('Policy created', { name: params.name, id: match[1] });
+            return { id: match[1], name: params.name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Policies' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating policy', { name: params.name, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Enable/disable and/or widen/narrow the scope of an EXISTING policy. Reads the
+    // full current policy, merges only the requested changes into its scope, and
+    // PUTs the whole merged policy back — defensive read-modify-write regardless of
+    // whether Classic API PUT partially merges or fully replaces `scope` specifically
+    // (unconfirmed either way; sending the full object back is safe under both).
+    public async updatePolicyScope(nameOrId: string, changes: {
+        enabled?: boolean;
+        addTargetGroupNames?: string[];
+        removeTargetGroupNames?: string[];
+        addExclusionGroupNames?: string[];
+        removeExclusionGroupNames?: string[];
+    }) {
+        await this.ensureAuthenticated();
+        const { id, name } = await this.resolvePolicyId(nameOrId);
+        this.logger.info('Updating policy scope', { id, name, changes });
+        try {
+            const current = await this.getPolicyDetail(id);
+
+            const [addTargets, removeTargets, addExclusions, removeExclusions] = await Promise.all([
+                Promise.all((changes.addTargetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                Promise.all((changes.removeTargetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                Promise.all((changes.addExclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                Promise.all((changes.removeExclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+            ]);
+
+            const mergeGroups = (existing: any[], toAdd: { id: string; name: string }[], toRemove: { id: string; name: string }[]) => {
+                const removeIds = new Set(toRemove.map((g) => g.id));
+                const kept = existing.filter((g: any) => !removeIds.has(String(g.id)));
+                const existingIds = new Set(kept.map((g: any) => String(g.id)));
+                const added = toAdd.filter((g) => !existingIds.has(g.id));
+                return [...kept, ...added.map((g) => ({ id: g.id, name: g.name }))];
+            };
+
+            const existingTargets: any[] = Array.isArray(current.scope?.computer_groups) ? current.scope.computer_groups : [];
+            const existingExclusions: any[] = Array.isArray(current.scope?.exclusions?.computer_groups)
+                ? current.scope.exclusions.computer_groups
+                : [];
+
+            const mergedTargets = mergeGroups(existingTargets, addTargets, removeTargets);
+            const mergedExclusions = mergeGroups(existingExclusions, addExclusions, removeExclusions);
+
+            // Confirmed live: Classic API PUT on policies partial-merges, same as
+            // updateComputerRecord — and critically, sending the FULL current policy
+            // object back (as originally designed here) is actively unsafe, not just
+            // unnecessary: some sections Jamf returns on GET (e.g. `printers`) trigger
+            // a 409 Conflict ("Problem with printer") when echoed back verbatim. So
+            // this sends only the fields being changed; everything else (scripts,
+            // packages, self_service, triggers, etc.) is left untouched by Jamf.
+            const partialPolicy: Record<string, any> = {
+                scope: {
+                    all_computers: false,
+                    computer_groups: mergedTargets,
+                    exclusions: { computer_groups: mergedExclusions },
+                },
+            };
+            if (changes.enabled !== undefined) {
+                partialPolicy.general = { enabled: changes.enabled };
+            }
+
+            const xml = buildXmlDocument('policy', partialPolicy);
+            const apiStart = Date.now();
+            const response = await this.client.put(`/JSSResource/policies/id/${id}`, xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id}`, response.status, Date.now() - apiStart);
+
+            this.logger.info('Policy scope updated', { id, name });
+            return {
+                success: true,
+                id,
+                name,
+                enabled: changes.enabled !== undefined ? changes.enabled : current.general.enabled,
+                targetGroups: mergedTargets.map((g: any) => g.name),
+                exclusionGroups: mergedExclusions.map((g: any) => g.name),
+            };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Policies' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating policy scope', { id, error: (error as Error).message });
             throw error;
         }
     }
