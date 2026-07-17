@@ -12,10 +12,10 @@
  *   AZURE_CLIENT_ID            App registration client ID
  *   AZURE_CLIENT_SECRET        App registration client secret
  *   INTUNE_MCP_AUTH_TOKEN      Bearer token(s) required on /mcp requests (comma-separated to allow
- *                              rotation). Callers authenticated this way get full Intune.Read access,
- *                              matching this token's behavior before Entra auth existed.
+ *                              rotation). Callers authenticated this way get full Intune.Read + Intune.Write
+ *                              access, matching this token's behavior before Entra auth existed.
  *   ENTRA_OAUTH_ENABLED        "true" to additionally accept Entra-issued bearer tokens on /mcp, with
- *                              tool visibility driven by the token's `roles` claim (Intune.Read).
+ *                              tool visibility driven by the token's `roles` claim (Intune.Read/Intune.Write).
  *   ENTRA_TENANT_ID            Entra tenant GUID (required when ENTRA_OAUTH_ENABLED=true)
  *   ENTRA_RESOURCE_APP_ID_URI  Application ID URI of the "Desktop Management MCP" resource app,
  *                              e.g. api://desktop-mgmt-mcp (required when ENTRA_OAUTH_ENABLED=true)
@@ -37,7 +37,7 @@ import { z } from "zod";
 import { IntuneClient } from "../intune/graph-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
-import { hasRole, INTUNE_READ, INTUNE_ALL_ROLES } from "../utils/roles.js";
+import { hasRole, assertRole, INTUNE_READ, INTUNE_WRITE, INTUNE_ALL_ROLES } from "../utils/roles.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -966,6 +966,44 @@ function createIntuneMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 13b. intune_get_group_members ────────────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_group_members",
+            {
+                description:
+                    "List the members of an Entra ID group by name or GUID. Use this to confirm whether an app " +
+                    "or configuration policy assignment group actually resolves to real members before or after " +
+                    "assigning it — the Intune-side analogue of jamf_get_smart_group_members. Returns each " +
+                    "member's display name, type (user/device/group), and (for devices) OS.",
+                inputSchema: {
+                    groupNameOrId: z.string().describe("Entra ID group display name or GUID"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ groupNameOrId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getGroupMembers(groupNameOrId);
+                    if (!data.group) return notFound(`group "${groupNameOrId}"`);
+
+                    const text = toText(data, response_format, () => {
+                        if (data.members.length === 0) return `Group **${data.group!.displayName}** has no members.`;
+                        const rows = data.members
+                            .map((m: any) => `- **${m.displayName ?? "Unknown"}** (${m.type})${m.userPrincipalName ? ` — ${m.userPrincipalName}` : ""}${m.operatingSystem ? ` — ${m.operatingSystem}` : ""}`)
+                            .join("\n");
+                        const truncNote = data.truncated ? "\n\n_Results truncated at the pagination safety cap._" : "";
+                        return `## Group **${data.group!.displayName}** Members (${data.members.length})\n\n${rows}${truncNote}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 14. intune_list_devices ──────────────────────────────────────────────
     if (hasRole(roles, INTUNE_READ)) {
         server.registerTool(
@@ -1083,6 +1121,113 @@ function createIntuneMcpServer(roles: string[]): McpServer {
                         );
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 15. intune_create_win32_app ──────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_win32_app",
+            {
+                description:
+                    "Publish a Win32 app to Intune: creates a new app object, uploads and commits the .intunewin " +
+                    "content (handling the Azure Storage chunked block upload and SAS URI polling internally), " +
+                    "and marks it ready to assign. Always creates a NEW app object — this does not upsert by " +
+                    "displayName; updating an existing app's installer means adding a new content version, a " +
+                    "materially different operation. Use intune_assign_app_to_groups afterward to actually deploy " +
+                    "it. `intunewinFileBase64` must be the raw .intunewin file produced by the Win32 Content Prep " +
+                    "Tool, base64-encoded — practical for typical app sizes, but the whole decoded package is " +
+                    "held in memory (no streaming), so very large installers may need a different path. `rules` " +
+                    "must be Microsoft Graph win32LobAppRule objects (detection AND requirement rules in one " +
+                    "array, each tagged with its own `ruleType` and `@odata.type`) — e.g. a file-existence " +
+                    "detection rule: " +
+                    '`{"@odata.type": "#microsoft.graph.win32LobAppFileSystemRule", "ruleType": "detection", ' +
+                    '"operationType": "exists", "path": "C:\\\\Program Files\\\\App", "fileOrFolderName": "app.exe"}`. ' +
+                    "At least one detection rule (ruleType: \"detection\") is required by Intune.",
+                inputSchema: {
+                    displayName: z.string().describe("App display name shown in Intune/Company Portal"),
+                    description: z.string().optional(),
+                    publisher: z.string().describe("Publisher name shown in Intune/Company Portal"),
+                    installCommandLine: z.string().describe('e.g. "msiexec /i \\"App.msi\\" /qn"'),
+                    uninstallCommandLine: z.string().describe('e.g. "msiexec /x \\"{GUID}\\" /qn"'),
+                    applicableArchitectures: z.enum(["x86", "x64", "none"]).optional().describe("Default: x64"),
+                    minimumSupportedWindowsRelease: z.string().optional().describe('e.g. "Windows10_1607", "Windows11_23H2" — default: "Windows10_1607"'),
+                    runAsAccount: z.enum(["system", "user"]).optional().describe("Default: system"),
+                    deviceRestartBehavior: z.enum(["basedOnReturnCode", "allow", "suppress", "force"]).optional().describe("Default: basedOnReturnCode"),
+                    returnCodes: z
+                        .array(z.object({ returnCode: z.number(), type: z.string() }))
+                        .optional()
+                        .describe("Defaults to the standard MSI success/reboot/retry code set if omitted"),
+                    rules: z
+                        .array(z.record(z.any()))
+                        .min(1)
+                        .describe("Microsoft Graph win32LobAppRule objects — see tool description for the required shape"),
+                    intunewinFileBase64: z.string().describe("Base64-encoded .intunewin file contents"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                displayName, description, publisher, installCommandLine, uninstallCommandLine,
+                applicableArchitectures, minimumSupportedWindowsRelease, runAsAccount, deviceRestartBehavior,
+                returnCodes, rules, intunewinFileBase64, response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createWin32App({
+                        displayName, description, publisher, installCommandLine, uninstallCommandLine,
+                        applicableArchitectures, minimumSupportedWindowsRelease, runAsAccount, deviceRestartBehavior,
+                        returnCodes, rules, intunewinFileBase64,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created and published Win32 app **${result.displayName}** (ID ${result.appId}, content version ${result.contentVersionId}). ` +
+                        `Use intune_assign_app_to_groups to deploy it to a group.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 16. intune_assign_app_to_groups ──────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_app_to_groups",
+            {
+                description:
+                    "Assign an Intune app (Win32 or otherwise) to one or more Entra ID groups. IMPORTANT: this " +
+                    "REPLACES the app's entire assignment set — it is not additive, matching Microsoft Graph's " +
+                    "own /assign semantics. To widen or narrow an existing rollout, pass the full desired set of " +
+                    "groups/intents each time, not just the ones being added. Use intune_get_group_members first " +
+                    "to confirm a target group actually resolves to real members.",
+                inputSchema: {
+                    appId: z.string().describe("Intune app ID (GUID)"),
+                    assignments: z
+                        .array(z.object({
+                            groupId: z.string().describe("Entra ID group GUID — use intune_get_group_members to resolve a name first"),
+                            intent: z.enum(["required", "available", "uninstall"]),
+                        }))
+                        .min(1)
+                        .describe("The full desired assignment set — replaces whatever is currently assigned"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ appId, assignments, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.assignAppToGroups(appId, assignments);
+                    const text = toText(result, response_format, () =>
+                        `Assigned app ${result.appId} to ${result.assignments.length} group(s):\n` +
+                        result.assignments.map((a: any) => `- ${a.groupId} (${a.intent})`).join("\n")
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

@@ -346,6 +346,45 @@ function createJamfMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 6b. jamf_get_smart_group ──────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_smart_group",
+            {
+                description:
+                    "Get the full definition of a JAMF Pro smart computer group, including its criteria " +
+                    "(the boolean logic — field, operator, value, and/or, grouping parens — that defines " +
+                    "membership). jamf_list_smart_groups only returns name/ID/member count; use this when you " +
+                    "need to see or confirm how a group is actually built. Use jamf_list_smart_groups first to " +
+                    "find a group ID.",
+                inputSchema: {
+                    groupId: z.string().describe("The JAMF Pro ID of the smart computer group"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ groupId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getSmartGroupDetail(groupId);
+
+                    const text = toText(data, response_format, () => {
+                        const criteria: any[] = data.criteria ?? [];
+                        const rows = criteria.length
+                            ? criteria
+                                  .map((c: any) => `- ${c.and_or ?? ""} ${c.name} ${c.search_type} "${c.value}"`.trim())
+                                  .join("\n")
+                            : "No criteria defined.";
+                        return `## Smart Group **${data.name}** (ID ${groupId})\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 7. jamf_list_static_groups ───────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(
@@ -373,6 +412,139 @@ function createJamfMcpServer(roles: string[]): McpServer {
                         return `## Static Computer Groups (${groups.length})\n\n${rows}`;
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 7b. jamf_list_user_groups ────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_user_groups",
+            {
+                description:
+                    "List all JAMF Pro user groups (smart and static). Unlike computer groups, Jamf has no " +
+                    "modern-API surface for user groups — this goes through the Classic API. Returns group ID, " +
+                    "name, and whether it's smart or static. Use jamf_get_user_group for a group's criteria or " +
+                    "member list.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getUserGroups();
+                    const groups: any[] = data.results ?? [];
+
+                    const text = toText(data, response_format, () => {
+                        if (groups.length === 0) return "No user groups found.";
+                        const rows = groups
+                            .map((g: any) => `- **${g.name}** (ID: ${g.id}) — ${g.is_smart ? "Smart" : "Static"}`)
+                            .join("\n");
+                        return `## User Groups (${groups.length})\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 7c. jamf_get_user_group ──────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_user_group",
+            {
+                description:
+                    "Get the full definition of a JAMF Pro user group, including its criteria (if smart) or " +
+                    "member list (if static). jamf_list_user_groups only returns name/ID/smart-vs-static; use " +
+                    "this to inspect how a group is actually built or confirm current membership — e.g. the " +
+                    "'Directory Service Group shows 0 members' class of investigation. Use jamf_list_user_groups " +
+                    "first to find a group ID.",
+                inputSchema: {
+                    groupId: z.string().describe("The JAMF Pro ID of the user group"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ groupId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getUserGroupDetail(groupId);
+
+                    const text = toText(data, response_format, () => {
+                        const header = `## User Group **${data.name}** (ID ${groupId}) — ${data.is_smart ? "Smart" : "Static"}`;
+                        if (data.is_smart) {
+                            const criteria: any[] = data.criteria ?? [];
+                            const rows = criteria.length
+                                ? criteria.map((c: any) => `- ${c.and_or ?? ""} ${c.name} ${c.search_type} "${c.value}"`.trim()).join("\n")
+                                : "No criteria defined.";
+                            return `${header}\n\n${rows}`;
+                        }
+                        const users: any[] = data.users ?? [];
+                        const rows = users.length
+                            ? users.map((u: any) => `- **${u.name}** (ID: ${u.id})`).join("\n")
+                            : "No members.";
+                        return `${header}\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 7d. jamf_create_user_group ───────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_user_group",
+            {
+                description:
+                    "Create or update a JAMF Pro user group (upsert by name, like jamf_create_smart_group_v2). " +
+                    "Pass exactly one of `criteria` (for a smart group — any Jamf Classic API criterion, e.g. " +
+                    "'Directory Service Group', 'Full Name', 'Email Address') or `memberUsernames` (for a static " +
+                    "group — an explicit member list). memberUsernames must already exist as Jamf Pro User " +
+                    "objects; this does not search or import from the directory service — a username with no " +
+                    "matching Jamf User errors out rather than creating one.",
+                inputSchema: {
+                    name: z.string().describe("User group name — used as the upsert key"),
+                    criteria: z
+                        .array(z.object({
+                            name: z.string().describe('Criterion field name, e.g. "Directory Service Group", "Full Name", "Email Address"'),
+                            priority: z.number().optional().describe("Row order (defaults to array index)"),
+                            and_or: z.enum(["and", "or"]).default("and"),
+                            search_type: z.string().describe('Operator, e.g. "is", "is not", "like", "has"'),
+                            value: z.string(),
+                            opening_paren: z.boolean().optional(),
+                            closing_paren: z.boolean().optional(),
+                        }))
+                        .optional()
+                        .describe("Criteria for a smart user group — pass this OR memberUsernames, not both"),
+                    memberUsernames: z
+                        .array(z.string())
+                        .optional()
+                        .describe("Explicit member usernames for a static user group — pass this OR criteria, not both"),
+                    siteId: z.string().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, criteria, memberUsernames, siteId, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertUserGroup({ name, criteria, memberUsernames, siteId });
+                    const text = toText(result, response_format, () =>
+                        result.action === "created"
+                            ? `Created ${result.isSmart ? "smart" : "static"} user group **${result.name}** (ID ${result.id}).`
+                            : `Updated ${result.isSmart ? "smart" : "static"} user group **${result.name}** (ID ${result.id}).`
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);
@@ -1272,16 +1444,26 @@ function createJamfMcpServer(roles: string[]): McpServer {
             {
                 description:
                     "Upload a .pkg/.dmg installer to JAMF Pro and create (or update, if a package with the " +
-                    "same packageName already exists) its package object. " +
-                    "IMPORTANT: localFilePath must be a path on THIS MCP SERVER'S OWN FILESYSTEM, readable by " +
-                    "the server process, and located inside the directory configured by JAMF_PACKAGE_UPLOAD_DIR " +
-                    "— it is NOT a path on the MCP client's machine. Re-running with the same packageName " +
+                    "same packageName already exists) its package object. Re-running with the same packageName " +
                     "updates that package's metadata and replaces its uploaded bytes — it does not create a " +
-                    "duplicate (the yearly re-publish case, e.g. Office or MATLAB version bumps).",
+                    "duplicate (the yearly re-publish case, e.g. Office or MATLAB version bumps). " +
+                    "Pass exactly ONE of localFilePath or fileContentBase64: " +
+                    "localFilePath must be a path on THIS MCP SERVER'S OWN FILESYSTEM (not the MCP client's " +
+                    "machine), inside the directory configured by JAMF_PACKAGE_UPLOAD_DIR, and streams the file " +
+                    "off disk — the only sane option for large installers. fileContentBase64 (with fileName) " +
+                    "lets the file live on the MCP client's machine instead — practical for smaller packages, " +
+                    "but the whole decoded file is buffered in memory with no streaming, so it's a poor fit for " +
+                    "multi-GB installers; use localFilePath for those.",
                 inputSchema: {
-                    localFilePath: z.string().describe(
-                        "Absolute path to the .pkg/.dmg file on the MCP server's local filesystem, inside JAMF_PACKAGE_UPLOAD_DIR"
+                    localFilePath: z.string().optional().describe(
+                        "Absolute path to the .pkg/.dmg file on the MCP server's local filesystem, inside JAMF_PACKAGE_UPLOAD_DIR. " +
+                        "Pass this OR fileContentBase64, not both."
                     ),
+                    fileContentBase64: z.string().optional().describe(
+                        "Base64-encoded file bytes, for uploading from the MCP client's machine instead of the server's filesystem. " +
+                        "Pass this OR localFilePath, not both. Requires fileName."
+                    ),
+                    fileName: z.string().optional().describe("File name (with extension) — required when using fileContentBase64"),
                     packageName: z.string().describe("The package's display name in JAMF Pro (used as the upsert key)"),
                     categoryName: z.string().optional().describe("Category name — must match an existing JAMF category (see jamf_list_categories)"),
                     priority: z.number().int().min(1).max(20).optional().describe("Install priority (default: 10)"),
@@ -1297,14 +1479,14 @@ function createJamfMcpServer(roles: string[]): McpServer {
                 annotations: { readOnlyHint: false, openWorldHint: true },
             },
             async ({
-                localFilePath, packageName, categoryName, priority, fillUserTemplate, rebootRequired,
+                localFilePath, fileContentBase64, fileName, packageName, categoryName, priority, fillUserTemplate, rebootRequired,
                 osInstall, suppressUpdates, suppressFromDock, suppressEula, suppressRegistration,
                 response_format = "markdown",
             }) => {
                 try {
                     assertRole(roles, JAMF_WRITE);
                     const result = await client.upsertPackage({
-                        localFilePath, packageName, categoryName, priority,
+                        localFilePath, fileContentBase64, fileName, packageName, categoryName, priority,
                         fillUserTemplate, rebootRequired, osInstall,
                         suppressUpdates, suppressFromDock, suppressEula, suppressRegistration,
                     });
@@ -1357,18 +1539,71 @@ function createJamfMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 27b. jamf_create_smart_group_v2 ──────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_smart_group_v2",
+            {
+                description:
+                    "Create or update a smart computer group in JAMF Pro with an arbitrary criteria list " +
+                    "(upsert by name, like jamf_create_smart_group). Unlike jamf_create_smart_group — which only " +
+                    "supports the 'Application Title + Version' detection pattern — this accepts any criteria " +
+                    "Jamf's Classic API supports: extension attributes, 'Directory Service Group', 'Department', " +
+                    "'Last Check-in', hardware fields, etc. Criteria are ANDed/ORed in the order given, matching " +
+                    "how they'd be built in the Jamf Pro UI's smart group criteria table. NOTE: if you immediately " +
+                    "reference a just-created group by name in jamf_create_policy or jamf_update_policy, JAMF's " +
+                    "internal indexing can lag a few seconds and return a transient 409 — retry once if that happens.",
+                inputSchema: {
+                    name: z.string().describe("Smart group name — used as the upsert key"),
+                    criteria: z
+                        .array(z.object({
+                            name: z.string().describe('Criterion field name, e.g. "Application Title", "Department", "Directory Service Group", or an extension attribute name'),
+                            priority: z.number().optional().describe("Row order (defaults to array index)"),
+                            and_or: z.enum(["and", "or"]).default("and"),
+                            search_type: z.string().describe('Operator, e.g. "is", "is not", "like", "has", "greater than"'),
+                            value: z.string(),
+                            opening_paren: z.boolean().optional(),
+                            closing_paren: z.boolean().optional(),
+                        }))
+                        .min(1)
+                        .describe("Ordered list of criteria defining group membership"),
+                    siteId: z.string().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, criteria, siteId, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertSmartGroup({ name, criteria, siteId });
+                    const text = toText(result, response_format, () =>
+                        result.action === "created"
+                            ? `Created smart group **${result.name}** (ID ${result.id}) with ${criteria.length} criteria.`
+                            : `Updated smart group **${result.name}** (ID ${result.id}) with ${criteria.length} criteria.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 28. jamf_create_policy ────────────────────────────────────────────────
     if (hasRole(roles, JAMF_WRITE)) {
         server.registerTool(
             "jamf_create_policy",
             {
                 description:
-                    "Create a new JAMF Pro policy scoped to one or more smart/static computer groups by name. " +
-                    "Scripts and packages are both optional and independent — a script-only policy (e.g. a " +
-                    "maintenance/remediation policy with no package) is fully supported. Does NOT support " +
-                    "individual-computer, building, or department scoping/limitations, or configuration profiles " +
-                    "— use smart/static computer groups for targeting. This creates a NEW policy every call; it " +
-                    "does not check for an existing policy of the same name (unlike jamf_create_script/jamf_upload_package).",
+                    "Create or update a JAMF Pro policy scoped to one or more smart/static computer groups by name " +
+                    "(upsert by name — rerunning with the same policy name updates the existing policy in place " +
+                    "rather than creating a duplicate, matching jamf_create_script/jamf_upload_package). The update " +
+                    "path replaces general/scope/self_service/packages/scripts/maintenance with what's passed here " +
+                    "— any of those left unset revert to this call's defaults, so pass the full desired policy " +
+                    "config each time rather than assuming prior values persist. Scripts and packages are both " +
+                    "optional and independent — a script-only policy (e.g. a maintenance/remediation policy with no " +
+                    "package) is fully supported. Does NOT support individual-computer, building, or department " +
+                    "scoping/limitations, or configuration profiles — use smart/static computer groups for targeting.",
                 inputSchema: {
                     name: z.string().describe("Policy display name"),
                     enabled: z.boolean().default(true),
@@ -1418,13 +1653,15 @@ function createJamfMcpServer(roles: string[]): McpServer {
             }) => {
                 try {
                     assertRole(roles, JAMF_WRITE);
-                    const result = await client.createPolicy({
+                    const result = await client.upsertPolicy({
                         name, enabled, triggerCheckin, triggerEnrollmentComplete, triggerLogin, triggerStartup, triggerOther,
                         frequency, categoryName, targetGroupNames, exclusionGroupNames, scripts, packages, selfService,
                         maintenanceRecon,
                     });
                     const text = toText(result, response_format, () =>
-                        `Created policy **${result.name}** (ID ${result.id}).`
+                        result.action === "created"
+                            ? `Created policy **${result.name}** (ID ${result.id}).`
+                            : `Updated policy **${result.name}** (ID ${result.id}) in place.`
                     );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
@@ -1473,6 +1710,188 @@ function createJamfMcpServer(roles: string[]): McpServer {
                         `- **Target groups:** ${result.targetGroups.join(", ") || "none"}`,
                         `- **Exclusion groups:** ${result.exclusionGroups.join(", ") || "none"}`,
                     ].join("\n"));
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 30. jamf_list_ldap_servers ───────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_ldap_servers",
+            {
+                description:
+                    "List LDAP servers configured in JAMF Pro (Settings > System > LDAP Servers). Use the " +
+                    "returned ID with jamf_search_directory_user/jamf_search_directory_group, or omit serverId " +
+                    "on those tools to search all configured servers.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getLdapServers();
+                    const servers: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (servers.length === 0) return "No LDAP servers configured.";
+                        const rows = servers.map((s: any) => `- **${s.name}** (ID: ${s.id})`).join("\n");
+                        return `## LDAP Servers (${servers.length})\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 31. jamf_search_directory_user ───────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_search_directory_user",
+            {
+                description:
+                    "Search a configured LDAP server for a directory user by username. Returns the raw match — " +
+                    "field names (e.g. username/realname/email_address) depend on how that server's attribute " +
+                    "mappings are configured in Jamf Pro, so treat the raw result as authoritative. This searches " +
+                    "the directory service directly, NOT existing Jamf Pro User objects (use jamf_list_computers " +
+                    "or a Jamf User lookup for that) — use jamf_import_directory_user to create a Jamf Pro User " +
+                    "from a directory match.",
+                inputSchema: {
+                    username: z.string().describe("Directory username to search for"),
+                    serverId: z.string().describe("LDAP server ID — use jamf_list_ldap_servers to find one"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ username, serverId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.searchLdapUsers(serverId, username);
+                    const text = toText(data, response_format, () => {
+                        if (data.results.length === 0) return `No directory match for "${username}" on LDAP server ${serverId}.`;
+                        return `## Directory match for "${username}"\n\n\`\`\`json\n${JSON.stringify(data.results, null, 2)}\n\`\`\``;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 32. jamf_search_directory_group ──────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_search_directory_group",
+            {
+                description:
+                    "Search a configured LDAP server for a directory group by name, or (with username) check " +
+                    "whether a specific user is a member of that group. Returns the raw match — field names " +
+                    "depend on that server's attribute mappings in Jamf Pro.",
+                inputSchema: {
+                    groupName: z.string().describe("Directory group name to search for"),
+                    username: z.string().optional().describe("If given, checks this user's membership in the group instead of just searching for the group"),
+                    serverId: z.string().describe("LDAP server ID — use jamf_list_ldap_servers to find one"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ groupName, username, serverId, response_format = "markdown" }) => {
+                try {
+                    const data = username
+                        ? await client.checkLdapGroupMembership(serverId, groupName, username)
+                        : await client.searchLdapGroups(serverId, groupName);
+                    const text = toText(data, response_format, () => {
+                        if (data.results.length === 0) {
+                            return username
+                                ? `"${username}" is not a member of "${groupName}" on LDAP server ${serverId} (or the group doesn't exist).`
+                                : `No directory match for group "${groupName}" on LDAP server ${serverId}.`;
+                        }
+                        const header = username ? `## Membership check: "${username}" in "${groupName}"` : `## Directory match for group "${groupName}"`;
+                        return `${header}\n\n\`\`\`json\n${JSON.stringify(data.results, null, 2)}\n\`\`\``;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 33. jamf_import_directory_user ───────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_import_directory_user",
+            {
+                description:
+                    "Import a directory account as a Jamf Pro User object — the actual fix for a 'Directory " +
+                    "Service Group shows 0 members' issue (smart user groups match against Jamf Pro User objects, " +
+                    "not raw directory accounts). Idempotent: if a Jamf User with this username already exists, " +
+                    "returns it rather than creating a duplicate. Searches all configured LDAP servers for a " +
+                    "match unless serverId is given. fullName/email/position always override whatever the " +
+                    "directory match parsed to — pass them explicitly if the LDAP attribute mapping doesn't " +
+                    "produce the right values, or to import a user with no directory match at all (fullName " +
+                    "required in that case). The response always includes the raw ldapMatch so you can verify " +
+                    "what was imported.",
+                inputSchema: {
+                    username: z.string().describe("Directory/Jamf username"),
+                    serverId: z.string().optional().describe("LDAP server ID to search — omit to search all configured servers"),
+                    fullName: z.string().optional().describe("Override display name (required if no directory match exists)"),
+                    email: z.string().optional().describe("Override email address"),
+                    position: z.string().optional().describe("Override job title/position"),
+                    siteId: z.string().optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ username, serverId, fullName, email, position, siteId, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.importDirectoryUser({ username, serverId, fullName, email, position, siteId });
+                    const text = toText(result, response_format, () =>
+                        result.action === "exists"
+                            ? `Jamf User **${result.name}** (ID ${result.id}) already exists — no import needed.`
+                            : `Imported **${result.name}** (ID ${result.id}) as a Jamf Pro User${result.matchedServerId ? ` from LDAP server ${result.matchedServerId}` : " (no directory match — created from overrides)"}.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 34. jamf_test_directory_lookup ───────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_test_directory_lookup",
+            {
+                description:
+                    "Passthrough for the Settings > Global > Cloud Identity Providers > Search test screen — " +
+                    "confirms whether a group (and optionally a specific user's membership in it) resolves " +
+                    "correctly against a Cloud Identity Provider (e.g. Entra ID/Azure AD sync), returning the " +
+                    "same match-by-name/match-by-UUID result shown in the UI. This is the Cloud Identity Provider " +
+                    "equivalent of jamf_search_directory_group, which is for classic LDAP servers instead. If " +
+                    "idpId is omitted and exactly one Cloud Identity Provider is configured, it's used " +
+                    "automatically; otherwise pass idpId to disambiguate.",
+                inputSchema: {
+                    groupName: z.string().describe("Directory group name to test"),
+                    username: z.string().optional().describe("If given, tests this user's membership in the group instead of just resolving the group"),
+                    idpId: z.string().optional().describe("Cloud Identity Provider ID — required only if more than one is configured"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ groupName, username, idpId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.testCloudIdpLookup({ idpId, username, groupName });
+                    const text = toText(data, response_format, () =>
+                        `## Cloud Identity Provider test lookup (IdP ${data.idpId})\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

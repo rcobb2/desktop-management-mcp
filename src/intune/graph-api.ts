@@ -2,6 +2,96 @@ import { Client } from "@microsoft/microsoft-graph-client";
 import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials";
 import { ClientSecretCredential } from "@azure/identity";
 import { createLogger, logApiCall } from '../utils/logger.js';
+import yauzl from 'yauzl';
+
+// ─── .intunewin package parsing ─────────────────────────────────────────────
+// A .intunewin file (produced by Microsoft's Win32 Content Prep Tool) is a ZIP
+// containing Metadata/Detection.xml (encryption parameters + the unencrypted
+// setup file's metadata, as simple flat XML elements — confirmed against
+// several independent writeups of the format) and a Contents/ directory with
+// exactly one file: the actual installer payload, AES-256-CBC encrypted with
+// an HMAC-SHA256 MAC, using the key material recorded in Detection.xml.
+
+interface IntunewinEncryptionInfo {
+    encryptionKey: string;
+    macKey: string;
+    initializationVector: string;
+    mac: string;
+    profileIdentifier: string;
+    fileDigest: string;
+    fileDigestAlgorithm: string;
+}
+
+interface ParsedIntunewinPackage {
+    setupFileName: string;
+    unencryptedContentSize: number;
+    encryptionInfo: IntunewinEncryptionInfo;
+    encryptedContent: Buffer;
+}
+
+function extractDetectionXmlTag(xml: string, tag: string): string {
+    const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    if (!match) throw new Error(`.intunewin package's Detection.xml is missing required element <${tag}> — is this a valid Win32 Content Prep Tool package?`);
+    return match[1].trim();
+}
+
+function readIntunewinZipEntries(buffer: Buffer): Promise<{ detectionXml?: Buffer; content?: Buffer }> {
+    return new Promise((resolve, reject) => {
+        yauzl.fromBuffer(buffer, { lazyEntries: true }, (err, zipfile) => {
+            if (err || !zipfile) return reject(err ?? new Error('Failed to open .intunewin as a zip archive'));
+            const result: { detectionXml?: Buffer; content?: Buffer } = {};
+            zipfile.on('error', reject);
+            zipfile.readEntry();
+            zipfile.on('entry', (entry) => {
+                const isDir = /\/$/.test(entry.fileName);
+                const isDetection = /Metadata\/Detection\.xml$/i.test(entry.fileName);
+                const isContent = /^Contents\//i.test(entry.fileName) && !isDir;
+                if (isDir || (!isDetection && !isContent)) {
+                    zipfile.readEntry();
+                    return;
+                }
+                zipfile.openReadStream(entry, (err2, stream) => {
+                    if (err2 || !stream) return reject(err2 ?? new Error(`Failed to read zip entry ${entry.fileName}`));
+                    const chunks: Buffer[] = [];
+                    stream.on('data', (c) => chunks.push(c));
+                    stream.on('end', () => {
+                        const data = Buffer.concat(chunks);
+                        if (isDetection) result.detectionXml = data;
+                        if (isContent) result.content = data;
+                        zipfile.readEntry();
+                    });
+                    stream.on('error', reject);
+                });
+            });
+            zipfile.on('end', () => resolve(result));
+        });
+    });
+}
+
+async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPackage> {
+    const entries = await readIntunewinZipEntries(buffer);
+    if (!entries.detectionXml) {
+        throw new Error('.intunewin package is missing Metadata/Detection.xml — is this a valid Win32 Content Prep Tool package?');
+    }
+    if (!entries.content) {
+        throw new Error('.intunewin package is missing its Contents/ payload.');
+    }
+    const xml = entries.detectionXml.toString('utf8');
+    return {
+        setupFileName: extractDetectionXmlTag(xml, 'SetupFile'),
+        unencryptedContentSize: parseInt(extractDetectionXmlTag(xml, 'UnencryptedContentSize'), 10),
+        encryptionInfo: {
+            encryptionKey: extractDetectionXmlTag(xml, 'EncryptionKey'),
+            macKey: extractDetectionXmlTag(xml, 'MacKey'),
+            initializationVector: extractDetectionXmlTag(xml, 'InitializationVector'),
+            mac: extractDetectionXmlTag(xml, 'Mac'),
+            profileIdentifier: extractDetectionXmlTag(xml, 'ProfileIdentifier'),
+            fileDigest: extractDetectionXmlTag(xml, 'FileDigest'),
+            fileDigestAlgorithm: extractDetectionXmlTag(xml, 'FileDigestAlgorithm'),
+        },
+        encryptedContent: entries.content,
+    };
+}
 
 export class IntuneClient {
     private client: Client;
@@ -532,6 +622,120 @@ export class IntuneClient {
         } catch (error) {
             this.logger.error('Error listing managed devices', { error: (error as Error).message, stack: (error as Error).stack });
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Resolve a group name to its Entra ID GUID via a displayName filter (exact match
+     * preferred, first partial match as fallback) — mirrors resolveAppByName/
+     * resolvePolicyByName's name-resolution convention in intune-server.ts. A value
+     * that already looks like a GUID is returned as-is without a lookup.
+     */
+    private async resolveGroupId(groupNameOrId: string): Promise<{ id: string; displayName: string } | null> {
+        const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (GUID_RE.test(groupNameOrId)) {
+            const apiStart = Date.now();
+            const group = await this.client
+                .api(`/groups/${groupNameOrId}`)
+                .version('v1.0')
+                .select('id,displayName')
+                .get();
+            logApiCall(this.logger, 'GET', `/groups/${groupNameOrId}`, 200, Date.now() - apiStart);
+            return { id: group.id, displayName: group.displayName };
+        }
+
+        const apiStart = Date.now();
+        const response = await this.client
+            .api('/groups')
+            .version('v1.0')
+            .filter(`displayName eq '${this.escapeODataString(groupNameOrId)}'`)
+            .select('id,displayName')
+            .get();
+        logApiCall(this.logger, 'GET', '/groups', 200, Date.now() - apiStart);
+
+        let matches: any[] = response.value || [];
+        if (matches.length === 0) {
+            const searchStart = Date.now();
+            const searchResponse = await this.client
+                .api('/groups')
+                .version('v1.0')
+                .filter(`startswith(displayName,'${this.escapeODataString(groupNameOrId)}')`)
+                .select('id,displayName')
+                .get();
+            logApiCall(this.logger, 'GET', '/groups (startswith)', 200, Date.now() - searchStart);
+            matches = searchResponse.value || [];
+        }
+        if (matches.length === 0) return null;
+
+        const lower = groupNameOrId.toLowerCase();
+        const exact = matches.find((g: any) => String(g.displayName ?? '').toLowerCase() === lower);
+        const match = exact ?? matches[0];
+        return { id: match.id, displayName: match.displayName };
+    }
+
+    /**
+     * List the members of an Entra ID group by name or GUID — the Intune-side
+     * analogue of confirming whether an assignment group actually resolves to real
+     * members before/after assigning an app or policy to it. Follows @odata.nextLink
+     * the same way listManagedDevices does, up to a safety cap.
+     */
+    public async getGroupMembers(groupNameOrId: string) {
+        this.logger.info('Fetching group members', { groupNameOrId });
+        await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            return { group: null, members: [], totalCount: 0, truncated: false };
+        }
+
+        const MAX_PAGES = 20; // 20 * 999 ≈ 20k members — far above any real group size here
+        const memberFields = 'id,displayName,userPrincipalName,mail,deviceId,operatingSystem';
+
+        try {
+            let apiStart = Date.now();
+            let response = await this.client
+                .api(`/groups/${group.id}/members`)
+                .version('v1.0')
+                .select(memberFields)
+                .top(999)
+                .get();
+            logApiCall(this.logger, 'GET', `/groups/${group.id}/members`, 200, Date.now() - apiStart);
+
+            const members: any[] = [...(response.value || [])];
+            let page = 1;
+            while (response['@odata.nextLink'] && page < MAX_PAGES) {
+                apiStart = Date.now();
+                response = await this.client.api(response['@odata.nextLink']).get();
+                logApiCall(this.logger, 'GET', `/groups/${group.id}/members (nextLink)`, 200, Date.now() - apiStart);
+                members.push(...(response.value || []));
+                page++;
+            }
+
+            const truncated = Boolean(response['@odata.nextLink']);
+            if (truncated) {
+                this.logger.warn('getGroupMembers hit the pagination safety cap; results are truncated', {
+                    groupId: group.id,
+                    pagesFetched: page,
+                    memberCount: members.length
+                });
+            }
+
+            const typedMembers = members.map((m: any) => ({
+                id: m.id,
+                displayName: m.displayName,
+                type: String(m['@odata.type'] || '').split('.').pop() || 'unknown',
+                userPrincipalName: m.userPrincipalName,
+                mail: m.mail,
+                deviceId: m.deviceId,
+                operatingSystem: m.operatingSystem,
+            }));
+
+            this.logger.info('Group members listed', { groupId: group.id, count: typedMembers.length, truncated });
+            return { group, members: typedMembers, totalCount: typedMembers.length, truncated };
+        } catch (error) {
+            this.logger.error('Error listing group members', { groupId: group.id, error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', `/groups/${group.id}/members`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1759,6 +1963,215 @@ export class IntuneClient {
                 error: (error as Error).message,
                 stack: (error as Error).stack
             });
+            throw error;
+        }
+    }
+
+    // ── Win32 app publishing ──────────────────────────────────────────────────
+    // Confirmed against Microsoft Learn's win32LobApp resource docs (v1.0) for the
+    // app object schema, and against multiple independent community writeups
+    // (rozemuller.com in particular) for the content-upload sequence, which isn't
+    // fully documented as a single Microsoft Learn walkthrough. `rules` mixes
+    // detection and requirement rules in one array (each tagged with its own
+    // `ruleType`/`@odata.type`) — there is no separate detectionRules/
+    // requirementRules property, despite that being a common assumption from
+    // older blog posts.
+
+    // Chunk size matches the Win32 Content Prep Tool's own default — not a Graph
+    // API requirement, just the value every reference implementation uses.
+    private static readonly AZURE_BLOCK_CHUNK_SIZE = 6 * 1024 * 1024;
+
+    private async uploadEncryptedContentToAzure(azureStorageUri: string, content: Buffer): Promise<void> {
+        const blockIds: string[] = [];
+        let offset = 0;
+        let blockNumber = 0;
+        while (offset < content.length) {
+            const chunk = content.subarray(offset, Math.min(offset + IntuneClient.AZURE_BLOCK_CHUNK_SIZE, content.length));
+            const blockId = Buffer.from(String(blockNumber).padStart(6, '0')).toString('base64');
+            blockIds.push(blockId);
+            const apiStart = Date.now();
+            const response = await fetch(`${azureStorageUri}&comp=block&blockid=${encodeURIComponent(blockId)}`, {
+                method: 'PUT',
+                headers: { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/octet-stream' },
+                body: new Uint8Array(chunk),
+            });
+            logApiCall(this.logger, 'PUT', 'azureStorageUri (block)', response.status, Date.now() - apiStart);
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                throw new Error(`Azure block upload failed at offset ${offset} (${response.status}): ${text}`);
+            }
+            offset += IntuneClient.AZURE_BLOCK_CHUNK_SIZE;
+            blockNumber++;
+        }
+
+        const blockListXml = `<?xml version="1.0" encoding="utf-8"?><BlockList>${blockIds.map((id) => `<Latest>${id}</Latest>`).join('')}</BlockList>`;
+        const apiStart = Date.now();
+        const commitResponse = await fetch(`${azureStorageUri}&comp=blocklist`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+            body: blockListXml,
+        });
+        logApiCall(this.logger, 'PUT', 'azureStorageUri (blocklist)', commitResponse.status, Date.now() - apiStart);
+        if (!commitResponse.ok) {
+            const text = await commitResponse.text().catch(() => '');
+            throw new Error(`Azure block list commit failed (${commitResponse.status}): ${text}`);
+        }
+    }
+
+    private async pollContentFile(appId: string, versionId: string, fileId: string, until: (file: any) => boolean, timeoutMs = 120_000): Promise<any> {
+        const start = Date.now();
+        while (true) {
+            const apiStart = Date.now();
+            const file = await this.client
+                .api(`/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions/${versionId}/files/${fileId}`)
+                .version('beta')
+                .get();
+            logApiCall(this.logger, 'GET', `contentVersions/${versionId}/files/${fileId}`, 200, Date.now() - apiStart);
+            if (until(file)) return file;
+            if (file.uploadState && String(file.uploadState).toLowerCase().includes('fail')) {
+                throw new Error(`Content file upload failed with state "${file.uploadState}".`);
+            }
+            if (Date.now() - start > timeoutMs) {
+                throw new Error(`Timed out waiting on content file state (last uploadState: "${file.uploadState}").`);
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+        }
+    }
+
+    // Creates a new Win32 app object, uploads and commits its .intunewin content,
+    // and marks the resulting content version as committed on the app — the full
+    // publish pipeline that otherwise means dropping out of MCP entirely and
+    // hand-rolling Graph calls + Azure Storage chunked upload + SAS URI polling.
+    // Always creates a NEW app object (no upsert-by-displayName — updating an
+    // existing app's content means adding a new content version, a materially
+    // different operation from creating one, so it isn't folded in here).
+    // `intunewinFileBase64` is the raw .intunewin file's bytes, base64-encoded —
+    // the same file the Win32 Content Prep Tool produces, unmodified.
+    public async createWin32App(params: {
+        displayName: string;
+        description?: string;
+        publisher: string;
+        installCommandLine: string;
+        uninstallCommandLine: string;
+        applicableArchitectures?: 'x86' | 'x64' | 'none';
+        minimumSupportedWindowsRelease?: string;
+        runAsAccount?: 'system' | 'user';
+        deviceRestartBehavior?: 'basedOnReturnCode' | 'allow' | 'suppress' | 'force';
+        returnCodes?: { returnCode: number; type: string }[];
+        rules: any[];
+        intunewinFileBase64: string;
+    }) {
+        this.logger.info('Creating Win32 app', { displayName: params.displayName });
+        await this.trackAuthAttempt();
+
+        const packageBuffer = Buffer.from(params.intunewinFileBase64, 'base64');
+        const pkg = await parseIntunewinPackage(packageBuffer);
+
+        const appBody: Record<string, any> = {
+            '@odata.type': '#microsoft.graph.win32LobApp',
+            displayName: params.displayName,
+            description: params.description ?? params.displayName,
+            publisher: params.publisher,
+            fileName: `${params.displayName}.intunewin`,
+            setupFilePath: pkg.setupFileName,
+            installCommandLine: params.installCommandLine,
+            uninstallCommandLine: params.uninstallCommandLine,
+            applicableArchitectures: params.applicableArchitectures ?? 'x64',
+            minimumSupportedWindowsRelease: params.minimumSupportedWindowsRelease ?? 'Windows10_1607',
+            installExperience: {
+                '@odata.type': '#microsoft.graph.win32LobAppInstallExperience',
+                runAsAccount: params.runAsAccount ?? 'system',
+                deviceRestartBehavior: params.deviceRestartBehavior ?? 'basedOnReturnCode',
+            },
+            returnCodes: params.returnCodes ?? [
+                { '@odata.type': '#microsoft.graph.win32LobAppReturnCode', returnCode: 0, type: 'success' },
+                { '@odata.type': '#microsoft.graph.win32LobAppReturnCode', returnCode: 1707, type: 'success' },
+                { '@odata.type': '#microsoft.graph.win32LobAppReturnCode', returnCode: 3010, type: 'softReboot' },
+                { '@odata.type': '#microsoft.graph.win32LobAppReturnCode', returnCode: 1641, type: 'hardReboot' },
+                { '@odata.type': '#microsoft.graph.win32LobAppReturnCode', returnCode: 1618, type: 'retry' },
+            ],
+            rules: params.rules,
+        };
+
+        let apiStart = Date.now();
+        const app = await this.client.api('/deviceAppManagement/mobileApps').version('beta').post(appBody);
+        logApiCall(this.logger, 'POST', '/deviceAppManagement/mobileApps', 201, Date.now() - apiStart);
+        const appId = app.id;
+
+        try {
+            apiStart = Date.now();
+            const contentVersion = await this.client
+                .api(`/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions`)
+                .version('beta')
+                .post({});
+            logApiCall(this.logger, 'POST', `mobileApps/${appId}/.../contentVersions`, 201, Date.now() - apiStart);
+            const versionId = contentVersion.id;
+
+            apiStart = Date.now();
+            const contentFile = await this.client
+                .api(`/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions/${versionId}/files`)
+                .version('beta')
+                .post({
+                    '@odata.type': '#microsoft.graph.mobileAppContentFile',
+                    name: pkg.setupFileName,
+                    size: pkg.unencryptedContentSize,
+                    sizeEncrypted: pkg.encryptedContent.length,
+                    isDependency: false,
+                });
+            logApiCall(this.logger, 'POST', `contentVersions/${versionId}/files`, 201, Date.now() - apiStart);
+            const fileId = contentFile.id;
+
+            const fileWithUri = await this.pollContentFile(appId, versionId, fileId, (f) => Boolean(f.azureStorageUri));
+            await this.uploadEncryptedContentToAzure(fileWithUri.azureStorageUri, pkg.encryptedContent);
+
+            apiStart = Date.now();
+            await this.client
+                .api(`/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions/${versionId}/files/${fileId}/commit`)
+                .version('beta')
+                .post({ fileEncryptionInfo: pkg.encryptionInfo });
+            logApiCall(this.logger, 'POST', `contentVersions/${versionId}/files/${fileId}/commit`, 200, Date.now() - apiStart);
+
+            await this.pollContentFile(appId, versionId, fileId, (f) => f.isCommitted === true);
+
+            apiStart = Date.now();
+            await this.client
+                .api(`/deviceAppManagement/mobileApps/${appId}`)
+                .version('beta')
+                .patch({ '@odata.type': '#microsoft.graph.win32LobApp', committedContentVersion: versionId });
+            logApiCall(this.logger, 'PATCH', `mobileApps/${appId}`, 204, Date.now() - apiStart);
+
+            this.logger.info('Win32 app created and content committed', { appId, displayName: params.displayName, versionId });
+            return { appId, displayName: params.displayName, contentVersionId: versionId, setupFileName: pkg.setupFileName };
+        } catch (error) {
+            this.logger.error('Win32 app content upload failed after app object was created — app exists but content is not committed', {
+                appId, displayName: params.displayName, error: (error as Error).message,
+            });
+            throw error;
+        }
+    }
+
+    // Assigns an existing app (Win32 or otherwise) to one or more Entra ID groups.
+    // This replaces the app's ENTIRE assignment set with the groups given here —
+    // matching Graph's own /assign semantics (it is not additive) — so callers
+    // widening/narrowing an existing app's rollout must pass the full desired set,
+    // not just the group(s) being added.
+    public async assignAppToGroups(appId: string, assignments: { groupId: string; intent: 'required' | 'available' | 'uninstall' }[]) {
+        this.logger.info('Assigning app to groups', { appId, assignments });
+        await this.trackAuthAttempt();
+        try {
+            const body = {
+                mobileAppAssignments: assignments.map((a) => ({
+                    '@odata.type': '#microsoft.graph.mobileAppAssignment',
+                    intent: a.intent,
+                    target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId: a.groupId },
+                })),
+            };
+            const apiStart = Date.now();
+            await this.client.api(`/deviceAppManagement/mobileApps/${appId}/assign`).version('v1.0').post(body);
+            logApiCall(this.logger, 'POST', `mobileApps/${appId}/assign`, 204, Date.now() - apiStart);
+            return { appId, assignments };
+        } catch (error) {
+            this.logger.error('Error assigning app to groups', { appId, error: (error as Error).message });
             throw error;
         }
     }

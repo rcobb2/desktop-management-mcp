@@ -8,9 +8,10 @@
 export const JAMF_READ = "Jamf.Read";
 export const JAMF_WRITE = "Jamf.Write";
 export const INTUNE_READ = "Intune.Read";
+export const INTUNE_WRITE = "Intune.Write";
 
 export const JAMF_ALL_ROLES = [JAMF_READ, JAMF_WRITE];
-export const INTUNE_ALL_ROLES = [INTUNE_READ];
+export const INTUNE_ALL_ROLES = [INTUNE_READ, INTUNE_WRITE];
 
 export type AuthMode = "static-token" | "entra";
 

@@ -45,9 +45,18 @@ const XML_PLURAL_TO_SINGULAR: Record<string, string> = {
 
 /**
  * Recursively serializes a plain object into XML element bodies (no wrapping root
- * tag — callers add that). Empty arrays and null/undefined values are omitted
- * entirely rather than emitted as empty tags — confirmed live that Jamf accepts a
- * policy/computer-group create with empty scope collections simply left out.
+ * tag — callers add that). Null/undefined values are omitted entirely — a caller
+ * that wants a field left untouched by a partial-update PUT passes `undefined`
+ * (see e.g. upsertPolicy's `exclusions: exclusionGroups.length ? {...} : undefined`).
+ *
+ * Every array-backed element always gets an explicit `<size>` as its first child,
+ * including `<size>0</size>` for an empty array. Confirmed live: Jamf's Classic API
+ * silently no-ops a PUT that changes a list-typed field (e.g. `packages`, computer
+ * group `criteria`, `scope`'s `computer_groups`/`exclusions`) unless `<size>` is
+ * present — it returns 201 but a follow-up GET shows the field unchanged. Without
+ * always emitting `<size>`, an explicit empty array (e.g. clearing a policy's scope
+ * exclusions down to zero) would hit exactly this no-op, indistinguishable from the
+ * field being merely absent.
  */
 function serializeXmlObjectBody(obj: any): string {
     if (obj === null || obj === undefined) return '';
@@ -56,10 +65,9 @@ function serializeXmlObjectBody(obj: any): string {
         .filter(([, v]) => v !== undefined && v !== null)
         .map(([key, value]) => {
             if (Array.isArray(value)) {
-                if (value.length === 0) return '';
                 const singular = XML_PLURAL_TO_SINGULAR[key] ?? key.replace(/s$/, '');
                 const items = value.map((item) => `<${singular}>${serializeXmlObjectBody(item)}</${singular}>`).join('');
-                return `<${key}>${items}</${key}>`;
+                return `<${key}><size>${value.length}</size>${items}</${key}>`;
             }
             if (typeof value === 'object') return `<${key}>${serializeXmlObjectBody(value)}</${key}>`;
             return `<${key}>${escapeXml(value)}</${key}>`;
@@ -869,12 +877,49 @@ export class JamfClient {
         return response.json().catch(() => ({}));
     }
 
+    // Same upload endpoint as uploadPackageFile, but from an in-memory Buffer —
+    // for the fileContentBase64 path, where there's no on-disk file to stream.
+    private async uploadPackageFileBuffer(id: string, fileBuffer: Buffer, fileName: string): Promise<any> {
+        await this.ensureAuthenticated();
+        const form = new FormData();
+        form.append('file', new Blob([new Uint8Array(fileBuffer)]), fileName);
+
+        const apiStart = Date.now();
+        const response = await fetch(`${this.jamfUrl}/api/v1/packages/${id}/upload`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${this.token}` },
+            body: form,
+        });
+        logApiCall(this.logger, 'POST', `/api/v1/packages/${id}/upload`, response.status, Date.now() - apiStart);
+        if (response.status === 403) {
+            throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Packages' permissions in JAMF Pro.`);
+        }
+        if (!response.ok) {
+            const text = await response.text().catch(() => '');
+            throw new Error(`Package upload failed (${response.status}): ${text}`);
+        }
+        return response.json().catch(() => ({}));
+    }
+
     // Upsert by packageName: creates a new package object if none exists with this
     // name, otherwise updates its metadata in place — then always (re-)uploads the
     // file, so re-running against an existing name replaces both the metadata and
     // the bytes (the yearly Office/MATLAB/Adobe re-publish case).
+    //
+    // Accepts the file two ways — exactly one must be given:
+    //  - `localFilePath`: a path inside JAMF_PACKAGE_UPLOAD_DIR on THIS SERVER's
+    //    own filesystem (the original mechanism — still the only sane option for
+    //    large installers, since it streams off disk without buffering).
+    //  - `fileContentBase64` + `fileName`: bytes supplied directly by the MCP
+    //    client, for when the file lives on the client's machine instead of the
+    //    server's. Practical for the package sizes typical scripts/small
+    //    installers run to; base64's ~33% size overhead plus buffering the whole
+    //    decoded file in memory (no streaming path exists for this branch) makes
+    //    it a poor fit for multi-GB installers — use localFilePath for those.
     public async upsertPackage(params: {
-        localFilePath: string;
+        localFilePath?: string;
+        fileContentBase64?: string;
+        fileName?: string;
         packageName: string;
         categoryName?: string;
         priority?: number;
@@ -887,31 +932,48 @@ export class JamfClient {
         suppressRegistration?: boolean;
     }) {
         await this.ensureAuthenticated();
-        this.logger.info('Upserting package', { packageName: params.packageName, localFilePath: params.localFilePath });
+        this.logger.info('Upserting package', { packageName: params.packageName, localFilePath: params.localFilePath, viaBase64: Boolean(params.fileContentBase64) });
 
-        const uploadDir = process.env.JAMF_PACKAGE_UPLOAD_DIR;
-        if (!uploadDir) {
-            throw new Error(
-                "JAMF_PACKAGE_UPLOAD_DIR is not set — refusing to read any local file for package upload. " +
-                "Set this env var to the directory package files are staged in before using jamf_upload_package."
-            );
+        if (Boolean(params.localFilePath) === Boolean(params.fileContentBase64)) {
+            throw new Error("Pass exactly one of `localFilePath` (server-side path) or `fileContentBase64` (client-supplied bytes), not both/neither.");
         }
+
+        let resolvedFilePath: string | undefined;
+        let fileName: string;
+        let fileBuffer: Buffer | undefined;
         const path = await import('node:path');
-        const resolvedUploadDir = path.resolve(uploadDir);
-        const resolvedFilePath = path.resolve(params.localFilePath);
-        if (resolvedFilePath !== resolvedUploadDir && !resolvedFilePath.startsWith(resolvedUploadDir + path.sep)) {
-            throw new Error(
-                `Refusing to read file outside the allowed upload directory. "${params.localFilePath}" is not inside JAMF_PACKAGE_UPLOAD_DIR ("${uploadDir}").`
-            );
+
+        if (params.localFilePath) {
+            const uploadDir = process.env.JAMF_PACKAGE_UPLOAD_DIR;
+            if (!uploadDir) {
+                throw new Error(
+                    "JAMF_PACKAGE_UPLOAD_DIR is not set — refusing to read any local file for package upload. " +
+                    "Set this env var to the directory package files are staged in, or pass fileContentBase64 " +
+                    "instead if the file lives on the MCP client's machine rather than this server's."
+                );
+            }
+            const resolvedUploadDir = path.resolve(uploadDir);
+            resolvedFilePath = path.resolve(params.localFilePath);
+            if (resolvedFilePath !== resolvedUploadDir && !resolvedFilePath.startsWith(resolvedUploadDir + path.sep)) {
+                throw new Error(
+                    `Refusing to read file outside the allowed upload directory. "${params.localFilePath}" is not inside JAMF_PACKAGE_UPLOAD_DIR ("${uploadDir}").`
+                );
+            }
+
+            const fsPromises = await import('node:fs/promises');
+            const stat = await fsPromises.stat(resolvedFilePath).catch(() => null);
+            if (!stat || !stat.isFile()) {
+                throw new Error(`Local file not found or not a regular file: "${params.localFilePath}"`);
+            }
+            fileName = path.basename(resolvedFilePath);
+        } else {
+            if (!params.fileName) {
+                throw new Error("`fileName` is required when uploading via fileContentBase64 (there's no local path to derive it from).");
+            }
+            fileName = params.fileName;
+            fileBuffer = Buffer.from(params.fileContentBase64!, 'base64');
         }
 
-        const fsPromises = await import('node:fs/promises');
-        const stat = await fsPromises.stat(resolvedFilePath).catch(() => null);
-        if (!stat || !stat.isFile()) {
-            throw new Error(`Local file not found or not a regular file: "${params.localFilePath}"`);
-        }
-
-        const fileName = path.basename(resolvedFilePath);
         const categoryId = params.categoryName ? await this.resolveCategoryId(params.categoryName) : '-1';
         const metadata: Record<string, any> = {
             packageName: params.packageName,
@@ -939,7 +1001,9 @@ export class JamfClient {
             action = 'updated';
         }
 
-        const uploadResult = await this.uploadPackageFile(id, resolvedFilePath);
+        const uploadResult = fileBuffer
+            ? await this.uploadPackageFileBuffer(id, fileBuffer, fileName)
+            : await this.uploadPackageFile(id, resolvedFilePath!);
         this.logger.info('Package upserted and uploaded', { id, packageName: params.packageName, action });
         return { action, id, packageName: params.packageName, fileName, uploadResult };
     }
@@ -959,6 +1023,33 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Delete Packages' permissions in JAMF Pro.`);
             }
             this.logger.error('Error deleting package', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // The list endpoint (getSmartComputerGroups, /api/v2/computer-groups/smart-groups)
+    // only returns id/name/membershipCount — no criteria. This is the only way to
+    // read a smart group's actual criteria/boolean logic, mirroring getPolicyDetail's
+    // single-object GET against the same Classic API family.
+    public async getSmartGroupDetail(groupId: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching smart group detail', { groupId });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/JSSResource/computergroups/id/${groupId}`, {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', `/JSSResource/computergroups/id/${groupId}`, response.status, Date.now() - apiStart);
+            this.logger.info('Smart group detail retrieved', { groupId });
+            return response.data.computer_group ?? response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Computer Groups' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Computer group with ID ${groupId} not found.`);
+            }
+            this.logger.error('Error fetching smart group detail', { groupId, error: (error as Error).message });
             throw error;
         }
     }
@@ -1040,6 +1131,227 @@ export class JamfClient {
         await this.updateSmartGroupById(String(existing.id), fields);
         this.logger.info('Smart group updated', { name: params.name, id: existing.id });
         return { action: 'updated' as const, id: String(existing.id), name: params.name };
+    }
+
+    // Upsert by name with an arbitrary criteria list — the generic sibling of
+    // upsertApplicationSmartGroup (which is just this with a hardcoded 2-criterion
+    // app-detection shape). Lets a caller build any smart group Jamf's Classic API
+    // supports: extension attributes, Directory Service Group, Department, Last
+    // Check-in, hardware fields, etc. Reuses the same createSmartGroup/
+    // updateSmartGroupById/findComputerGroupByNameExact plumbing.
+    public async upsertSmartGroup(params: {
+        name: string;
+        criteria: {
+            name: string;
+            priority?: number;
+            and_or?: 'and' | 'or';
+            search_type: string;
+            value: string;
+            opening_paren?: boolean;
+            closing_paren?: boolean;
+        }[];
+        siteId?: string;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting smart group', { name: params.name, criteriaCount: params.criteria.length });
+
+        const criteria = params.criteria.map((c, i) => ({
+            name: c.name,
+            priority: c.priority ?? i,
+            and_or: c.and_or ?? 'and',
+            search_type: c.search_type,
+            value: c.value,
+            opening_paren: c.opening_paren ?? false,
+            closing_paren: c.closing_paren ?? false,
+        }));
+        const fields: Record<string, any> = { name: params.name, is_smart: true, criteria };
+        if (params.siteId) fields.site = { id: params.siteId };
+
+        const existing = await this.findComputerGroupByNameExact(params.name);
+        if (!existing) {
+            const id = await this.createSmartGroup(fields);
+            this.logger.info('Smart group created', { name: params.name, id });
+            return { action: 'created' as const, id, name: params.name };
+        }
+        await this.updateSmartGroupById(String(existing.id), fields);
+        this.logger.info('Smart group updated', { name: params.name, id: existing.id });
+        return { action: 'updated' as const, id: String(existing.id), name: params.name };
+    }
+
+    // No modern (v1/v2) Jamf Pro API surface exists for user groups — confirmed
+    // against current developer.jamf.com docs: the only CRUD is Classic API
+    // (/JSSResource/usergroups), same family as policies and computer groups
+    // elsewhere in this file. The one modern-API endpoint that touches user groups
+    // (POST /v1/smart-user-groups/{id}/recalculate) is a narrow recalculate-and-list
+    // action, not a CRUD resource, so it isn't a substitute for list/get/create here.
+    public async getUserGroups() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching user groups');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/JSSResource/usergroups', {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', '/JSSResource/usergroups', response.status, Date.now() - apiStart);
+            const results: any[] = response.data.user_groups ?? [];
+            this.logger.info('User groups retrieved', { count: results.length });
+            return { totalCount: results.length, results };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read User Groups' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching user groups', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async getUserGroupDetail(groupId: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching user group detail', { groupId });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/JSSResource/usergroups/id/${groupId}`, {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', `/JSSResource/usergroups/id/${groupId}`, response.status, Date.now() - apiStart);
+            return response.data.user_group ?? response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read User Groups' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`User group with ID ${groupId} not found.`);
+            }
+            this.logger.error('Error fetching user group detail', { groupId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async findUserGroupByName(name: string): Promise<any | null> {
+        const data = await this.getUserGroups();
+        const lower = name.trim().toLowerCase();
+        return data.results.find((g: any) => g.name?.toLowerCase() === lower) ?? null;
+    }
+
+    // Jamf User objects (not directory accounts — see the separate, unimplemented
+    // directory-search/import gap) already exist as a plain Classic API resource;
+    // this only resolves an existing one's ID for static user group membership, it
+    // does not create/import anyone.
+    private async resolveJamfUserIdByUsername(username: string): Promise<{ id: string; name: string } | null> {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/JSSResource/users/name/${encodeURIComponent(username)}`, {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', `/JSSResource/users/name/${username}`, response.status, Date.now() - apiStart);
+            const user = response.data.user ?? response.data;
+            return { id: String(user.id), name: user.name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) return null;
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Users' permissions in JAMF Pro.`);
+            }
+            throw error;
+        }
+    }
+
+    private async createUserGroup(fields: Record<string, any>): Promise<string> {
+        await this.ensureAuthenticated();
+        try {
+            const xml = buildXmlDocument('user_group', fields);
+            const apiStart = Date.now();
+            const response = await this.client.post('/JSSResource/usergroups/id/0', xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'POST', '/JSSResource/usergroups/id/0', response.status, Date.now() - apiStart);
+            const match = String(response.data).match(/<id>(\d+)<\/id>/);
+            if (!match) throw new Error('User group created but no ID could be determined from the response.');
+            return match[1];
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create User Groups' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating user group', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async updateUserGroupById(id: string, fields: Record<string, any>): Promise<void> {
+        await this.ensureAuthenticated();
+        try {
+            const xml = buildXmlDocument('user_group', fields);
+            const apiStart = Date.now();
+            const response = await this.client.put(`/JSSResource/usergroups/id/${id}`, xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `/JSSResource/usergroups/id/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update User Groups' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating user group', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Upsert by name for either a smart user group (criteria-driven, e.g. "Directory
+    // Service Group like X") or a static one (explicit member list by username) —
+    // exactly one of `criteria`/`memberUsernames` should be passed; which one
+    // determines is_smart. Mirrors upsertSmartGroup's computer-group shape and
+    // create-vs-update branching.
+    public async upsertUserGroup(params: {
+        name: string;
+        criteria?: {
+            name: string;
+            priority?: number;
+            and_or?: 'and' | 'or';
+            search_type: string;
+            value: string;
+            opening_paren?: boolean;
+            closing_paren?: boolean;
+        }[];
+        memberUsernames?: string[];
+        siteId?: string;
+    }) {
+        await this.ensureAuthenticated();
+        const isSmart = Boolean(params.criteria?.length);
+        if (isSmart === Boolean(params.memberUsernames?.length)) {
+            throw new Error("Pass exactly one of `criteria` (smart group) or `memberUsernames` (static group), not both/neither.");
+        }
+        this.logger.info('Upserting user group', { name: params.name, isSmart });
+
+        const fields: Record<string, any> = { name: params.name, is_smart: isSmart };
+        if (params.siteId) fields.site = { id: params.siteId };
+
+        if (isSmart) {
+            fields.criteria = params.criteria!.map((c, i) => ({
+                name: c.name,
+                priority: c.priority ?? i,
+                and_or: c.and_or ?? 'and',
+                search_type: c.search_type,
+                value: c.value,
+                opening_paren: c.opening_paren ?? false,
+                closing_paren: c.closing_paren ?? false,
+            }));
+        } else {
+            const resolved = await Promise.all((params.memberUsernames ?? []).map(async (username) => {
+                const found = await this.resolveJamfUserIdByUsername(username);
+                if (!found) throw new Error(`Jamf User not found: "${username}" — import/create the user in JAMF Pro first.`);
+                return found;
+            }));
+            fields.users = resolved.map((u) => ({ id: u.id, name: u.name }));
+        }
+
+        const existing = await this.findUserGroupByName(params.name);
+        if (!existing) {
+            const id = await this.createUserGroup(fields);
+            this.logger.info('User group created', { name: params.name, id });
+            return { action: 'created' as const, id, name: params.name, isSmart };
+        }
+        await this.updateUserGroupById(String(existing.id), fields);
+        this.logger.info('User group updated', { name: params.name, id: existing.id });
+        return { action: 'updated' as const, id: String(existing.id), name: params.name, isSmart };
     }
 
     public async getInventoryPreload(page?: number, pageSize?: number) {
@@ -1520,11 +1832,27 @@ export class JamfClient {
         }
     }
 
-    // Creates a new policy scoped to smart/static computer groups by name. Does NOT
-    // support individual-computer/building/department/limitations scoping or
-    // configuration profiles — smart/static group scoping only. Script-only policies
-    // (no packages) are fully supported by simply omitting `packages`.
-    public async createPolicy(params: {
+    // Exact-name match only (like findScriptByName) — getPolicies already supports a
+    // substring `name` filter for listing, but upsert needs an exact match so a
+    // differently-named policy sharing a substring doesn't get silently overwritten.
+    private async findPolicyByName(name: string): Promise<any | null> {
+        const data = await this.getPolicies(name, 0, 200);
+        const policies: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        return policies.find((p) => p.name?.toLowerCase() === lower) ?? null;
+    }
+
+    // Upsert by name: creates a new policy if none exists with this name, otherwise
+    // rebuilds the same known-safe section set (general/scope/self_service/
+    // package_configuration/scripts/maintenance) and PUTs it in place of the existing
+    // policy — mirroring upsertScript/upsertPackage/upsertApplicationSmartGroup so a
+    // retried or re-run "create the deployment policy" request updates in place
+    // rather than producing a duplicate. Deliberately does NOT echo back the existing
+    // policy's full object first (unlike a naive read-merge-write) — same reasoning
+    // as updatePolicyScope: Jamf returns sections on GET (e.g. `printers`) that 409
+    // when resubmitted verbatim, so only the sections this method itself constructs
+    // are ever sent.
+    public async upsertPolicy(params: {
         name: string;
         enabled?: boolean;
         triggerCheckin?: boolean;
@@ -1542,8 +1870,9 @@ export class JamfClient {
         maintenanceRecon?: boolean;
     }) {
         await this.ensureAuthenticated();
-        this.logger.info('Creating policy', { name: params.name });
+        this.logger.info('Upserting policy', { name: params.name });
         try {
+            const existing = await this.findPolicyByName(params.name);
             const [targetGroups, exclusionGroups, categoryId, scripts, packages] = await Promise.all([
                 Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
                 Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
@@ -1592,23 +1921,41 @@ export class JamfClient {
                 maintenance: { recon: params.maintenanceRecon ?? false },
             };
 
-            const xml = buildXmlDocument('policy', policy);
-            const apiStart = Date.now();
-            const response = await this.client.post('/JSSResource/policies/id/0', xml, {
-                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-            });
-            logApiCall(this.logger, 'POST', '/JSSResource/policies/id/0', response.status, Date.now() - apiStart);
+            if (!existing) {
+                const xml = buildXmlDocument('policy', policy);
+                const apiStart = Date.now();
+                const response = await this.client.post('/JSSResource/policies/id/0', xml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'POST', '/JSSResource/policies/id/0', response.status, Date.now() - apiStart);
+                const match = String(response.data).match(/<id>(\d+)<\/id>/);
+                if (!match) throw new Error('Policy created but no ID could be determined from the response.');
+                this.logger.info('Policy created', { name: params.name, id: match[1] });
+                return { action: 'created' as const, id: match[1], name: params.name };
+            }
 
-            const match = String(response.data).match(/<id>(\d+)<\/id>/);
-            if (!match) throw new Error('Policy created but no ID could be determined from the response.');
-
-            this.logger.info('Policy created', { name: params.name, id: match[1] });
-            return { id: match[1], name: params.name };
+            // Confirmed live (Jamf Pro 11.29.1): a single PUT combining certain
+            // top-level sections (e.g. package_configuration + scope) returns 201 but
+            // silently drops BOTH changes — a follow-up GET shows neither applied.
+            // Sending one top-level section per sequential PUT is the only combination
+            // confirmed to reliably apply every section; slower, but correct.
+            const id = String(existing.id);
+            const sections = Object.entries(policy).filter(([, v]) => v !== undefined);
+            for (const [key, value] of sections) {
+                const sectionXml = buildXmlDocument('policy', { [key]: value });
+                const apiStart = Date.now();
+                const response = await this.client.put(`/JSSResource/policies/id/${id}`, sectionXml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (${key})`, response.status, Date.now() - apiStart);
+            }
+            this.logger.info('Policy updated', { name: params.name, id, sections: sections.map(([k]) => k) });
+            return { action: 'updated' as const, id, name: params.name };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
-                throw new Error(`Permission denied (403). The API client may be missing 'Create Policies' permissions in JAMF Pro.`);
+                throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Policies' permissions in JAMF Pro.`);
             }
-            this.logger.error('Error creating policy', { name: params.name, error: (error as Error).message });
+            this.logger.error('Error upserting policy', { name: params.name, error: (error as Error).message });
             throw error;
         }
     }
@@ -1672,12 +2019,18 @@ export class JamfClient {
                 partialPolicy.general = { enabled: changes.enabled };
             }
 
-            const xml = buildXmlDocument('policy', partialPolicy);
-            const apiStart = Date.now();
-            const response = await this.client.put(`/JSSResource/policies/id/${id}`, xml, {
-                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-            });
-            logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id}`, response.status, Date.now() - apiStart);
+            // Confirmed live (Jamf Pro 11.29.1): combining certain top-level sections
+            // (e.g. package_configuration + scope) in one PUT returns 201 but silently
+            // drops both — send `scope` and `general` as separate sequential PUTs
+            // rather than one combined payload, matching upsertPolicy's workaround.
+            for (const [key, value] of Object.entries(partialPolicy)) {
+                const sectionXml = buildXmlDocument('policy', { [key]: value });
+                const apiStart = Date.now();
+                const response = await this.client.put(`/JSSResource/policies/id/${id}`, sectionXml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (${key})`, response.status, Date.now() - apiStart);
+            }
 
             this.logger.info('Policy scope updated', { id, name });
             return {
@@ -1738,6 +2091,252 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Patch Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching patch policies', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // ── LDAP directory search/import ──────────────────────────────────────────
+    // All Classic API — confirmed against developer.jamf.com there is no modern
+    // (v1/v2) equivalent for LDAP server search. Response field names for
+    // /user and /group searches (e.g. `username`, `realname`, `email_address`)
+    // vary by how the LDAP server's attribute mappings are configured in Jamf
+    // Pro, so callers should treat the raw match as authoritative over any
+    // assumed field name.
+    public async getLdapServers() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching LDAP servers');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/JSSResource/ldapservers', {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', '/JSSResource/ldapservers', response.status, Date.now() - apiStart);
+            const results: any[] = response.data.ldap_servers ?? [];
+            return { totalCount: results.length, results };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read LDAP Servers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching LDAP servers', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async searchLdapUsers(serverId: string, username: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Searching LDAP users', { serverId, username });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(
+                `/JSSResource/ldapservers/id/${serverId}/user/${encodeURIComponent(username)}`,
+                { headers: { Accept: 'application/json' } }
+            );
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/user/${username}`, response.status, Date.now() - apiStart);
+            return { results: response.data.ldap_users ?? [] };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read LDAP Servers' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`LDAP server with ID ${serverId} not found.`);
+            }
+            this.logger.error('Error searching LDAP users', { serverId, username, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async searchLdapGroups(serverId: string, groupName: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Searching LDAP groups', { serverId, groupName });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(
+                `/JSSResource/ldapservers/id/${serverId}/group/${encodeURIComponent(groupName)}`,
+                { headers: { Accept: 'application/json' } }
+            );
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/group/${groupName}`, response.status, Date.now() - apiStart);
+            return { results: response.data.ldap_groups ?? [] };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read LDAP Servers' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`LDAP server with ID ${serverId} not found.`);
+            }
+            this.logger.error('Error searching LDAP groups', { serverId, groupName, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async checkLdapGroupMembership(serverId: string, groupName: string, username: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Checking LDAP group membership', { serverId, groupName, username });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(
+                `/JSSResource/ldapservers/id/${serverId}/group/${encodeURIComponent(groupName)}/user/${encodeURIComponent(username)}`,
+                { headers: { Accept: 'application/json' } }
+            );
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/group/${groupName}/user/${username}`, response.status, Date.now() - apiStart);
+            return { results: response.data.ldap_users ?? [] };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read LDAP Servers' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`LDAP server with ID ${serverId} not found.`);
+            }
+            this.logger.error('Error checking LDAP group membership', { serverId, groupName, username, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async createUser(fields: Record<string, any>): Promise<string> {
+        await this.ensureAuthenticated();
+        try {
+            const xml = buildXmlDocument('user', fields);
+            const apiStart = Date.now();
+            const response = await this.client.post('/JSSResource/users/id/0', xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'POST', '/JSSResource/users/id/0', response.status, Date.now() - apiStart);
+            const match = String(response.data).match(/<id>(\d+)<\/id>/);
+            if (!match) throw new Error('User created but no ID could be determined from the response.');
+            return match[1];
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create Users' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating Jamf user', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Searches LDAP server(s) for `username` and, on a match, creates a Jamf Pro
+    // User object seeded from the directory record — the actual fix for a
+    // "Directory Service Group shows 0 members" issue (a smart user group whose
+    // criteria matches against directory-linked Jamf Users, not raw directory
+    // accounts). Idempotent: if a Jamf User with this username already exists,
+    // returns it rather than erroring or duplicating. `fullName`/`email`/`position`
+    // overrides always win over whatever the LDAP match parsed to, since LDAP
+    // attribute-to-field mapping is configured per-server and this codebase can't
+    // assume the mapping in advance — the raw `ldapMatch` is always returned too
+    // so a caller can verify before trusting the imported record.
+    public async importDirectoryUser(params: {
+        username: string;
+        serverId?: string;
+        fullName?: string;
+        email?: string;
+        position?: string;
+        siteId?: string;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Importing directory user', { username: params.username, serverId: params.serverId });
+
+        const existingUser = await this.resolveJamfUserIdByUsername(params.username);
+        if (existingUser) {
+            this.logger.info('Directory user already exists as a Jamf User', { username: params.username, id: existingUser.id });
+            return { action: 'exists' as const, id: existingUser.id, name: existingUser.name, matchedServerId: undefined, ldapMatch: null };
+        }
+
+        const servers = params.serverId
+            ? [{ id: params.serverId }]
+            : (await this.getLdapServers()).results;
+
+        let ldapMatch: any = null;
+        let matchedServerId: string | undefined;
+        for (const server of servers) {
+            try {
+                const data = await this.searchLdapUsers(String(server.id), params.username);
+                if (data.results.length > 0) {
+                    ldapMatch = data.results[0];
+                    matchedServerId = String(server.id);
+                    break;
+                }
+            } catch (err) {
+                this.logger.warn('LDAP user search failed for one server, trying next', { serverId: server.id, error: (err as Error).message });
+            }
+        }
+
+        if (!ldapMatch && !params.fullName) {
+            throw new Error(
+                `No directory match found for "${params.username}" in any configured LDAP server, and no fullName override ` +
+                `was given to import blind. Use jamf_search_directory_user to check spelling/server first, or pass fullName ` +
+                `explicitly to create the Jamf User without a directory match.`
+            );
+        }
+
+        const fields: Record<string, any> = {
+            name: params.username,
+            full_name: params.fullName ?? ldapMatch?.realname ?? ldapMatch?.full_name ?? params.username,
+            email_address: params.email ?? ldapMatch?.email_address ?? undefined,
+            position: params.position ?? ldapMatch?.position ?? undefined,
+        };
+        if (params.siteId) fields.site = { id: params.siteId };
+
+        const id = await this.createUser(fields);
+        this.logger.info('Directory user imported', { username: params.username, id, matchedServerId });
+        return { action: 'imported' as const, id, name: params.username, matchedServerId, ldapMatch };
+    }
+
+    // ── Cloud Identity Provider test lookups ──────────────────────────────────
+    // Modern (v1) API — this is the callable equivalent of the Settings > Global
+    // > Cloud Identity Providers > Search test screen in the Jamf Pro UI.
+    public async getCloudIdentityProviders() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching Cloud Identity Providers');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/api/v1/cloud-idp', {
+                params: { 'page-size': 200 }
+            });
+            logApiCall(this.logger, 'GET', '/api/v1/cloud-idp', response.status, Date.now() - apiStart);
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read User' (Cloud Identity Provider) permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching Cloud Identity Providers', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async testCloudIdpLookup(params: { idpId?: string; username?: string; groupName: string }) {
+        await this.ensureAuthenticated();
+        let idpId = params.idpId;
+        if (!idpId) {
+            const idps: any[] = (await this.getCloudIdentityProviders()).results ?? [];
+            const active = idps.filter((p: any) => p.enabled !== false);
+            if (active.length !== 1) {
+                throw new Error(
+                    active.length === 0
+                        ? 'No Cloud Identity Provider is configured/enabled.'
+                        : `Multiple Cloud Identity Providers are configured — pass idpId to disambiguate (${active.map((p: any) => `${p.id}: ${p.displayName ?? p.providerName}`).join(', ')}).`
+                );
+            }
+            idpId = String(active[0].id);
+        }
+
+        this.logger.info('Testing Cloud Identity Provider lookup', { idpId, username: params.username, groupName: params.groupName });
+        try {
+            const apiStart = Date.now();
+            const path = params.username
+                ? `/api/v1/cloud-idp/${idpId}/test-user-membership`
+                : `/api/v1/cloud-idp/${idpId}/test-group`;
+            const body = params.username
+                ? { username: params.username, groupname: params.groupName }
+                : { groupname: params.groupName };
+            const response = await this.client.post(path, body);
+            logApiCall(this.logger, 'POST', path, response.status, Date.now() - apiStart);
+            return { idpId, ...response.data };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Cloud Identity Provider ${idpId} does not exist or is not active.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read User' (Cloud Identity Provider) permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error testing Cloud Identity Provider lookup', { idpId, error: (error as Error).message });
             throw error;
         }
     }
