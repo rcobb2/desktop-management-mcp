@@ -1598,11 +1598,15 @@ function createJamfMcpServer(roles: string[]): McpServer {
                     "Create or update a JAMF Pro policy scoped to one or more smart/static computer groups by name " +
                     "(upsert by name — rerunning with the same policy name updates the existing policy in place " +
                     "rather than creating a duplicate, matching jamf_create_script/jamf_upload_package). The update " +
-                    "path replaces general/scope/self_service/packages/scripts/maintenance with what's passed here " +
-                    "— any of those left unset revert to this call's defaults, so pass the full desired policy " +
-                    "config each time rather than assuming prior values persist. Scripts and packages are both " +
-                    "optional and independent — a script-only policy (e.g. a maintenance/remediation policy with no " +
-                    "package) is fully supported. Does NOT support individual-computer, building, or department " +
+                    "path replaces general/scope/self_service/packages/scripts/maintenance/disk_encryption/" +
+                    "user_interaction with what's passed here — any of those left unset revert to this call's " +
+                    "defaults, so pass the full desired policy config each time rather than assuming prior values " +
+                    "persist. Scripts and packages are both optional and independent — a script-only policy (e.g. a " +
+                    "maintenance/remediation policy with no package) is fully supported. diskEncryption's `apply` " +
+                    "and `remediate` actions represent distinct intents (enable FileVault on an unencrypted Mac, " +
+                    "vs. re-issue/escrow a key on an already-encrypted one) — confirmed live that combining fields " +
+                    "from both in one policy silently no-ops the whole section, so use two separate policies if you " +
+                    "need both behaviors. Does NOT support individual-computer, building, or department " +
                     "scoping/limitations, or configuration profiles — use smart/static computer groups for targeting.",
                 inputSchema: {
                     name: z.string().describe("Policy display name"),
@@ -1612,8 +1616,12 @@ function createJamfMcpServer(roles: string[]): McpServer {
                     triggerLogin: z.boolean().optional(),
                     triggerStartup: z.boolean().optional(),
                     triggerOther: z.string().optional().describe('Custom event trigger name (for `jamf policy -trigger <name>`)'),
+                    // Confirmed live (Jamf Pro 11.29.1) against an existing policy's own
+                    // GET response — the real enum strings are "Once every day/week/month",
+                    // not "Once per day/week/month" (a pre-existing mismatch in this schema
+                    // found while investigating why frequency changes weren't sticking).
                     frequency: z
-                        .enum(["Once per computer", "Once per user per computer", "Once per day", "Once per week", "Once per month", "Ongoing"])
+                        .enum(["Once per computer", "Once per user per computer", "Once per user", "Once every day", "Once every week", "Once every month", "Ongoing"])
                         .default("Once per computer"),
                     categoryName: z.string().optional(),
                     targetGroupNames: z.array(z.string()).default([]).describe("Smart/static computer group names to scope this policy to"),
@@ -1642,6 +1650,35 @@ function createJamfMcpServer(roles: string[]): McpServer {
                         })
                         .optional(),
                     maintenanceRecon: z.boolean().default(false).describe("Update computer inventory (recon) when this policy runs"),
+                    diskEncryption: z
+                        .discriminatedUnion("action", [
+                            z.object({
+                                action: z.literal("apply"),
+                                configurationName: z.string().describe("Disk Encryption Configuration name — see jamf_list_disk_encryption_configurations"),
+                                authRestart: z.boolean().optional().describe("Require an authenticated restart to complete encryption (default: false)"),
+                            }),
+                            z.object({
+                                action: z.literal("remediate"),
+                                remediateKeyType: z.enum(["Individual", "Institutional"]).describe("Which recovery key type to re-issue/escrow"),
+                                configurationName: z.string().optional().describe("Disk Encryption Configuration name — only relevant when remediateKeyType is Institutional"),
+                            }),
+                        ])
+                        .optional()
+                        .describe(
+                            "FileVault behavior for this policy. `apply` enables FileVault on an unencrypted Mac; " +
+                            "`remediate` re-issues/escrows a recovery key on an already-encrypted one — these are " +
+                            "mutually exclusive intents, use separate policies if you need both."
+                        ),
+                    userInteraction: z
+                        .object({
+                            messageStart: z.string().optional().describe("Message shown to the user before the policy runs"),
+                            allowUserToDefer: z.boolean().optional().describe("Allow the user to postpone running this policy"),
+                            allowDeferralUntilUtc: z.string().optional().describe("ISO 8601 UTC deadline after which deferral is no longer allowed"),
+                            allowDeferralMinutes: z.number().int().min(0).optional().describe("Minutes the user may defer by, each time they defer"),
+                            messageFinish: z.string().optional().describe("Message shown to the user after the policy completes"),
+                        })
+                        .optional()
+                        .describe("End-user notification/deferral settings for this policy"),
                     response_format: ResponseFormatSchema,
                 },
                 annotations: { readOnlyHint: false, openWorldHint: true },
@@ -1649,14 +1686,14 @@ function createJamfMcpServer(roles: string[]): McpServer {
             async ({
                 name, enabled, triggerCheckin, triggerEnrollmentComplete, triggerLogin, triggerStartup, triggerOther,
                 frequency, categoryName, targetGroupNames, exclusionGroupNames, scripts, packages, selfService,
-                maintenanceRecon, response_format = "markdown",
+                maintenanceRecon, diskEncryption, userInteraction, response_format = "markdown",
             }) => {
                 try {
                     assertRole(roles, JAMF_WRITE);
                     const result = await client.upsertPolicy({
                         name, enabled, triggerCheckin, triggerEnrollmentComplete, triggerLogin, triggerStartup, triggerOther,
                         frequency, categoryName, targetGroupNames, exclusionGroupNames, scripts, packages, selfService,
-                        maintenanceRecon,
+                        maintenanceRecon, diskEncryption, userInteraction,
                     });
                     const text = toText(result, response_format, () =>
                         result.action === "created"
@@ -1677,16 +1714,33 @@ function createJamfMcpServer(roles: string[]): McpServer {
             "jamf_update_policy",
             {
                 description:
-                    "Enable/disable an existing JAMF Pro policy and/or widen or narrow its scope by adding/removing " +
-                    "target or exclusion computer groups (smart or static, by name). Safely merges with the " +
-                    "policy's existing scope — reads the full current policy, merges only the requested changes, " +
-                    "and writes the whole thing back. Does not touch triggers, scripts, packages, or Self Service " +
-                    "settings — use this only for the enable/disable + scope-widening workflow (e.g. staged rollout). " +
-                    "Because this can meaningfully widen deployment or disable an active fix, double-check the " +
-                    "group names before calling.",
+                    "Enable/disable an existing JAMF Pro policy, change its execution frequency, and/or widen or " +
+                    "narrow its scope by adding/removing target or exclusion computer groups (smart or static, by " +
+                    "name). Safely merges with the policy's existing scope — reads the full current policy, merges " +
+                    "only the requested changes, and writes the whole thing back. Does not touch triggers, scripts, " +
+                    "packages, or Self Service settings — use this only for the enable/disable + frequency + " +
+                    "scope-widening workflow (e.g. staged rollout). Because this can meaningfully widen deployment " +
+                    "or disable an active fix, double-check the group names before calling.",
                 inputSchema: {
                     policy: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
-                    enabled: z.boolean().optional().describe("Set to enable/disable the policy"),
+                    enabled: z.boolean().optional().describe(
+                        "Set to enable/disable the policy. WARNING: confirmed live (Jamf Pro 11.29.1) — reads of a " +
+                        "just-changed `enabled` value can be genuinely non-monotonic (a read can show the new " +
+                        "value, then revert to the old one, before finally settling) for up to a minute or more. " +
+                        "This tool waits and re-checks before responding, but for anything operationally important " +
+                        "(disabling an active fix, or re-enabling one), independently re-verify with jamf_get_policy " +
+                        "after a minute rather than trusting this call's response alone — check `enabledChangeFailed`."
+                    ),
+                    frequency: z
+                        .enum(["Once per computer", "Once per user per computer", "Once per user", "Once every day", "Once every week", "Once every month", "Ongoing"])
+                        .optional()
+                        .describe(
+                            "Change the policy's execution frequency. WARNING: confirmed live (Jamf Pro 11.29.1) — " +
+                            "this has the same non-monotonic read-lag behavior as `enabled` above (can take up to a " +
+                            "minute or more to settle). The response's `frequencyChangeFailed` field and markdown " +
+                            "output reflect the actual post-write value after this tool's own wait/re-check, not " +
+                            "just what you asked for — check it rather than assuming success."
+                        ),
                     addTargetGroupNames: z.array(z.string()).default([]),
                     removeTargetGroupNames: z.array(z.string()).default([]),
                     addExclusionGroupNames: z.array(z.string()).default([]),
@@ -1696,17 +1750,18 @@ function createJamfMcpServer(roles: string[]): McpServer {
                 annotations: { readOnlyHint: false, openWorldHint: true },
             },
             async ({
-                policy, enabled, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
+                policy, enabled, frequency, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
                 response_format = "markdown",
             }) => {
                 try {
                     assertRole(roles, JAMF_WRITE);
                     const result = await client.updatePolicyScope(policy, {
-                        enabled, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
+                        enabled, frequency, addTargetGroupNames, removeTargetGroupNames, addExclusionGroupNames, removeExclusionGroupNames,
                     });
                     const text = toText(result, response_format, () => [
                         `## Policy **${result.name}** updated`,
-                        `- **Enabled:** ${result.enabled ? "Yes" : "No"}`,
+                        `- **Enabled:** ${result.enabled ? "Yes" : "No"}${result.enabledChangeFailed ? " ⚠️ (requested change to " + enabled + " did NOT apply after waiting — re-verify with jamf_get_policy before trusting this)" : ""}`,
+                        `- **Frequency:** ${result.frequency ?? "—"}${result.frequencyChangeFailed ? " ⚠️ (requested change to \"" + frequency + "\" did NOT apply after waiting — re-verify with jamf_get_policy before trusting this)" : ""}`,
                         `- **Target groups:** ${result.targetGroups.join(", ") || "none"}`,
                         `- **Exclusion groups:** ${result.exclusionGroups.join(", ") || "none"}`,
                     ].join("\n"));
@@ -1891,6 +1946,317 @@ function createJamfMcpServer(roles: string[]): McpServer {
                     const data = await client.testCloudIdpLookup({ idpId, username, groupName });
                     const text = toText(data, response_format, () =>
                         `## Cloud Identity Provider test lookup (IdP ${data.idpId})\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 35. jamf_whoami ───────────────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_whoami",
+            {
+                description:
+                    "Report the current JAMF API client's identity and privilege list (wraps GET /api/v1/auth). " +
+                    "Use this to diagnose a bare 401/403 from another tool — it distinguishes 'client authenticated " +
+                    "fine but its role lacks this one privilege' from 'bad token', without having to hand-construct " +
+                    "the /api/v1/auth call yourself.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data: any = await client.getAuthDetails();
+                    const text = toText(data, response_format, () => {
+                        // Confirmed live (Jamf Pro 11.29.1): the response nests
+                        // everything under `account`, with privileges grouped by
+                        // site ID under `account.privilegesBySite` (not a flat
+                        // `privileges` array) — e.g. {"-1": ["Read Computers", ...]}.
+                        const account = data.account ?? {};
+                        const privilegesBySite: Record<string, string[]> = account.privilegesBySite ?? {};
+                        const lines = [
+                            `## JAMF API Client Identity`,
+                            `- **Account:** ${account.username ?? "—"}`,
+                            `- **Access Level:** ${account.accessLevel ?? "—"}`,
+                            `- **Privilege Set:** ${account.privilegeSet ?? "—"}`,
+                            `- **Current Site:** ${account.currentSiteId ?? "—"}`,
+                        ];
+                        for (const [siteId, privileges] of Object.entries(privilegesBySite)) {
+                            lines.push(`- **Privileges (site ${siteId}, ${privileges.length}):**`);
+                            privileges.forEach((p) => lines.push(`  - ${p}`));
+                        }
+                        return lines.join("\n");
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 36. jamf_list_disk_encryption_configurations ─────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_disk_encryption_configurations",
+            {
+                description:
+                    "List Disk Encryption Configuration objects in JAMF Pro (Settings > Computer Management > " +
+                    "Disk Encryption). These define the recovery-key type (Individual/Institutional) and escrow " +
+                    "behavior that a policy's disk_encryption section references by ID — a distinct object type " +
+                    "from a computer's own FileVault status (see jamf_get_filevault_status).",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getDiskEncryptionConfigurations();
+                    const configs: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (configs.length === 0) return "No Disk Encryption Configurations found.";
+                        const rows = configs.map((c: any) => `- **${c.name}** (ID: ${c.id})`).join("\n");
+                        return `## Disk Encryption Configurations (${configs.length})\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 36b. jamf_create_disk_encryption_configuration ───────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_disk_encryption_configuration",
+            {
+                description:
+                    "Create or update a JAMF Pro Disk Encryption Configuration, identified by name (upsert — " +
+                    "re-running with the same name updates the existing configuration in place, matching " +
+                    "jamf_create_script/jamf_create_smart_group). Scoped to key_type=Individual only — an " +
+                    "Institutional configuration additionally needs an uploaded recovery-key certificate, which " +
+                    "this tool does not support; create those manually in the JAMF Pro UI instead. Reference the " +
+                    "result by name in jamf_create_policy's diskEncryption parameter.",
+                inputSchema: {
+                    name: z.string().describe("Configuration name — used as the upsert key"),
+                    fileVaultEnabledUsers: z
+                        .enum(["Management Account", "Current or Next User", "Management Account And Current or Next User"])
+                        .optional()
+                        .describe('Which account(s) can unlock the encrypted disk (default: "Current or Next User")'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, fileVaultEnabledUsers, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertDiskEncryptionConfiguration({ name, fileVaultEnabledUsers });
+                    const text = toText(result, response_format, () =>
+                        result.action === "created"
+                            ? `Created Disk Encryption Configuration **${result.name}** (ID ${result.id}).`
+                            : `Updated Disk Encryption Configuration **${result.name}** (ID ${result.id}).`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 37. jamf_list_app_installer_titles ───────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_app_installer_titles",
+            {
+                description:
+                    "List titles available in the JAMF App Catalog (Settings > App Installers) — the curated " +
+                    "installer packages (e.g. Chrome, Zoom, Slack) deployable via jamf_create_app_installer_deployment. " +
+                    "Distinct from jamf_list_packages, which lists manually-uploaded packages instead.",
+                inputSchema: {
+                    page: z.number().int().min(0).default(0).describe("Page number (0-indexed)"),
+                    pageSize: z.number().int().min(1).max(999).default(200).describe("Results per page (default: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ page = 0, pageSize = 200, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getAppInstallerTitles(page, pageSize);
+                    const titles: any[] = (data as any).results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (titles.length === 0) return "No app installer titles found.";
+                        const rows = titles
+                            .map((t: any) => `- **${t.titleName}** (ID: ${t.id}) | Publisher: ${t.publisher ?? "—"} | Version: ${t.version ?? "—"}`)
+                            .join("\n");
+                        return `## App Installer Titles (${(data as any).totalCount ?? titles.length} total)\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 38. jamf_get_app_installer_deployment ────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_app_installer_deployment",
+            {
+                description:
+                    "Get a single App Installer deployment by name or numeric ID, or omit both to list all " +
+                    "configured deployments. Use jamf_list_app_installer_titles first to find an appTitleId for " +
+                    "jamf_create_app_installer_deployment.",
+                inputSchema: {
+                    deployment: z.string().optional().describe("Deployment name or numeric ID — omit to list all deployments"),
+                    page: z.number().int().min(0).default(0).describe("Page number when listing all (0-indexed)"),
+                    pageSize: z.number().int().min(1).max(999).default(200).describe("Results per page when listing all (default: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ deployment, page = 0, pageSize = 200, response_format = "markdown" }) => {
+                try {
+                    if (!deployment) {
+                        const data = await client.listAppInstallerDeployments(page, pageSize);
+                        const deployments: any[] = (data as any).results ?? [];
+                        const text = toText(data, response_format, () => {
+                            if (deployments.length === 0) return "No app installer deployments found.";
+                            // Confirmed live: the list endpoint's shape differs from the
+                            // single-deployment detail endpoint — smartGroup/category/app
+                            // are expanded nested objects here (not flat *Id fields), and
+                            // it additionally includes a computerStatuses breakdown.
+                            const rows = deployments
+                                .map((d: any) => {
+                                    const cs = d.computerStatuses ?? {};
+                                    return `- **${d.name}** (ID: ${d.id}) | Enabled: ${d.enabled ? "Yes" : "No"} | Group: ${d.smartGroup?.name ?? "—"} | Installed: ${cs.installed ?? 0}, In Progress: ${cs.inProgress ?? 0}, Failed: ${cs.failed ?? 0}`;
+                                })
+                                .join("\n");
+                            return `## App Installer Deployments (${(data as any).totalCount ?? deployments.length} total)\n\n${rows}`;
+                        });
+                        return { content: [{ type: "text", text }] };
+                    }
+
+                    const id = /^\d+$/.test(deployment)
+                        ? deployment
+                        : String(((await client.listAppInstallerDeployments(0, 999)) as any).results?.find(
+                              (d: any) => d.name?.toLowerCase() === deployment.toLowerCase()
+                          )?.id ?? "");
+                    if (!id) return notFound(`app installer deployment "${deployment}"`);
+
+                    const data: any = await client.getAppInstallerDeploymentDetail(id);
+                    const text = toText(data, response_format, () => [
+                        `## App Installer Deployment — ${data.name}`,
+                        `- **ID:** ${data.id}`,
+                        `- **Enabled:** ${data.enabled ? "Yes" : "No"}`,
+                        `- **App Title ID:** ${data.appTitleId ?? "—"}`,
+                        `- **Smart Group ID:** ${data.smartGroupId ?? "—"}`,
+                        `- **Category ID:** ${data.categoryId ?? "—"}`,
+                        `- **Site ID:** ${data.siteId ?? "—"}`,
+                        `- **Deployment Type:** ${data.deploymentType ?? "—"}`,
+                        `- **Update Behavior:** ${data.updateBehavior ?? "—"}`,
+                        `- **Notification Interval (hrs):** ${data.notificationSettings?.notificationInterval ?? "—"}`,
+                        `- **Deadline (days):** ${data.notificationSettings?.deadline ?? "—"}`,
+                        `- **Latest Available Version:** ${data.latestAvailableVersion ?? "—"}`,
+                        `- **Selected Version:** ${data.selectedVersion || "(auto-update to latest)"}`,
+                    ].join("\n"));
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 39. jamf_create_app_installer_deployment ─────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_app_installer_deployment",
+            {
+                description:
+                    "Create a new App Installer deployment — an ongoing Jamf-managed install/update subscription " +
+                    "for a catalog title (see jamf_list_app_installer_titles), scoped to a smart computer group. " +
+                    "NOT an upsert: deployment names aren't unique keys in Jamf, so re-running this always creates " +
+                    "another deployment — use jamf_update_app_installer_deployment to change an existing one instead.",
+                inputSchema: {
+                    name: z.string().describe("Deployment display name"),
+                    appTitleName: z.string().describe('Catalog title name, e.g. "Google Chrome" — see jamf_list_app_installer_titles'),
+                    smartGroupName: z.string().describe("Smart computer group name to scope this deployment to"),
+                    enabled: z.boolean().optional().describe("Default: true"),
+                    categoryName: z.string().optional().describe("Category name — must match an existing JAMF category"),
+                    siteId: z.string().optional().describe('Site ID, or "-1" for all sites (default)'),
+                    deploymentType: z.enum(["INSTALL_AUTOMATICALLY", "SELF_SERVICE"]).optional().describe("Default: INSTALL_AUTOMATICALLY"),
+                    updateBehavior: z.enum(["AUTOMATIC", "MANUAL"]).optional().describe("Default: AUTOMATIC"),
+                    notificationInterval: z.number().int().min(1).optional().describe("Hours between end-user update notifications (default: 24)"),
+                    deadline: z.number().int().min(0).optional().describe("Days before update is enforced (default: 7)"),
+                    installPredefinedConfigProfiles: z.boolean().optional().describe("Default: false"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                name, appTitleName, smartGroupName, enabled, categoryName, siteId, deploymentType, updateBehavior,
+                notificationInterval, deadline, installPredefinedConfigProfiles, response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.createAppInstallerDeployment({
+                        name, appTitleName, smartGroupName, enabled, categoryName, siteId, deploymentType,
+                        updateBehavior, notificationInterval, deadline, installPredefinedConfigProfiles,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created app installer deployment **${result.name}** (ID ${result.id}).`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 40. jamf_update_app_installer_deployment ─────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_update_app_installer_deployment",
+            {
+                description:
+                    "Update an existing App Installer deployment by name or numeric ID — enable/disable, " +
+                    "re-scope to a different smart group, or change category/deployment-type/update-behavior/" +
+                    "notification settings. Only the fields you pass are changed; everything else is left as-is.",
+                inputSchema: {
+                    deployment: z.string().describe("Deployment name or numeric ID — use jamf_get_app_installer_deployment to find one"),
+                    enabled: z.boolean().optional(),
+                    smartGroupName: z.string().optional().describe("New smart computer group name to scope this deployment to"),
+                    categoryName: z.string().optional(),
+                    deploymentType: z.enum(["INSTALL_AUTOMATICALLY", "SELF_SERVICE"]).optional(),
+                    updateBehavior: z.enum(["AUTOMATIC", "MANUAL"]).optional(),
+                    notificationInterval: z.number().int().min(1).optional(),
+                    deadline: z.number().int().min(0).optional(),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                deployment, enabled, smartGroupName, categoryName, deploymentType, updateBehavior,
+                notificationInterval, deadline, response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.updateAppInstallerDeployment(deployment, {
+                        enabled, smartGroupName, categoryName, deploymentType, updateBehavior, notificationInterval, deadline,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Updated app installer deployment **${result.name}** (ID ${result.id}).`
                     );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {

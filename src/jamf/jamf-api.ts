@@ -1644,6 +1644,16 @@ export class JamfClient {
         return String(match.id);
     }
 
+    private async resolveDiskEncryptionConfigIdByName(name: string): Promise<string> {
+        const data = await this.getDiskEncryptionConfigurations();
+        const configs: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        const match = configs.find((c) => c.name?.toLowerCase() === lower)
+            ?? configs.find((c) => c.name?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`Disk Encryption Configuration not found: "${name}"`);
+        return String(match.id);
+    }
+
     // Policy scoping can target either a smart or static computer group — Classic
     // API's scope.computer_groups doesn't distinguish the two structurally, so this
     // searches both lists.
@@ -1868,12 +1878,27 @@ export class JamfClient {
         packages?: { name: string; action?: 'Install' | 'Cache' | 'Install Cached' }[];
         selfService?: { useForSelfService: boolean; displayName?: string; installButtonText?: string; description?: string };
         maintenanceRecon?: boolean;
+        // Confirmed live gotcha (MCP_TOOL_GAPS.md #6): `apply` and `remediate` are
+        // mutually exclusive intents — `apply` enables FileVault on an unencrypted
+        // Mac, `remediate` re-issues/escrows a key on an already-encrypted one.
+        // Combining fields from both in one policy silently drops the whole section.
+        // Model these as two distinct shapes so a caller can't accidentally mix them.
+        diskEncryption?:
+            | { action: 'apply'; configurationName: string; authRestart?: boolean }
+            | { action: 'remediate'; remediateKeyType: 'Individual' | 'Institutional'; configurationName?: string };
+        userInteraction?: {
+            messageStart?: string;
+            allowUserToDefer?: boolean;
+            allowDeferralUntilUtc?: string;
+            allowDeferralMinutes?: number;
+            messageFinish?: string;
+        };
     }) {
         await this.ensureAuthenticated();
         this.logger.info('Upserting policy', { name: params.name });
         try {
             const existing = await this.findPolicyByName(params.name);
-            const [targetGroups, exclusionGroups, categoryId, scripts, packages] = await Promise.all([
+            const [targetGroups, exclusionGroups, categoryId, scripts, packages, diskEncryptionConfigId] = await Promise.all([
                 Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
                 Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
                 params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
@@ -1887,6 +1912,9 @@ export class JamfClient {
                     if (!found) throw new Error(`Package not found: "${p.name}"`);
                     return { id: String(found.id), name: found.packageName, action: p.action ?? 'Install' };
                 })),
+                params.diskEncryption?.configurationName
+                    ? this.resolveDiskEncryptionConfigIdByName(params.diskEncryption.configurationName)
+                    : Promise.resolve(undefined),
             ]);
 
             const policy: Record<string, any> = {
@@ -1919,6 +1947,47 @@ export class JamfClient {
                 package_configuration: packages.length ? { packages } : undefined,
                 scripts: scripts.length ? scripts : undefined,
                 maintenance: { recon: params.maintenanceRecon ?? false },
+                // Confirmed live (Jamf Pro 11.29.1): both sections' field names/values
+                // were verified against a real policy (apply + remediate actions, and a
+                // user_interaction update) via a follow-up GET. Note the field name is
+                // `allow_users_to_defer` (plural) — Jamf silently ignores an unrecognized
+                // singular `allow_user_to_defer` rather than erroring, so a naive test
+                // could pass while doing nothing; caught this only by decoding a real 409
+                // ("When 'allow_users_to_defer' is false, ... cannot be configured").
+                // `allow_deferral_minutes` must be a multiple of 1440 (Jamf only exposes
+                // whole days in its own UI) — a non-multiple also 409s, not a silent no-op.
+                // Also observed: reads for a just-written disk_encryption/user_interaction
+                // section can be genuinely NON-MONOTONIC for up to ~60s after the write —
+                // a GET at +5s showed the new value, +10s through +20s reverted to the OLD
+                // value, then it settled on the new value from +10s onward on a retry populated
+                // by wait, and never reverted (60s+ steady) — consistent with multiple
+                // Jamf app-server nodes with independently-expiring caches behind a load
+                // balancer, not a simple linear propagation delay. A single quick
+                // follow-up GET cannot be trusted either way; wait a full minute (not
+                // just "a few seconds") before concluding a disk_encryption/
+                // user_interaction change didn't apply.
+                disk_encryption: params.diskEncryption
+                    ? params.diskEncryption.action === 'apply'
+                        ? {
+                              action: 'apply',
+                              disk_encryption_configuration_id: diskEncryptionConfigId,
+                              auth_restart: params.diskEncryption.authRestart ?? false,
+                          }
+                        : {
+                              action: 'remediate',
+                              remediate_key_type: params.diskEncryption.remediateKeyType,
+                              remediate_disk_encryption_configuration_id: diskEncryptionConfigId,
+                          }
+                    : undefined,
+                user_interaction: params.userInteraction
+                    ? {
+                          message_start: params.userInteraction.messageStart ?? '',
+                          allow_users_to_defer: params.userInteraction.allowUserToDefer ?? false,
+                          allow_deferral_until_utc: params.userInteraction.allowDeferralUntilUtc ?? '',
+                          allow_deferral_minutes: params.userInteraction.allowDeferralMinutes ?? 0,
+                          message_finish: params.userInteraction.messageFinish ?? '',
+                      }
+                    : undefined,
             };
 
             if (!existing) {
@@ -1967,6 +2036,7 @@ export class JamfClient {
     // (unconfirmed either way; sending the full object back is safe under both).
     public async updatePolicyScope(nameOrId: string, changes: {
         enabled?: boolean;
+        frequency?: string;
         addTargetGroupNames?: string[];
         removeTargetGroupNames?: string[];
         addExclusionGroupNames?: string[];
@@ -2015,8 +2085,11 @@ export class JamfClient {
                     exclusions: { computer_groups: mergedExclusions },
                 },
             };
-            if (changes.enabled !== undefined) {
-                partialPolicy.general = { enabled: changes.enabled };
+            if (changes.enabled !== undefined || changes.frequency !== undefined) {
+                partialPolicy.general = {
+                    ...(changes.enabled !== undefined ? { enabled: changes.enabled } : {}),
+                    ...(changes.frequency !== undefined ? { frequency: changes.frequency } : {}),
+                };
             }
 
             // Confirmed live (Jamf Pro 11.29.1): combining certain top-level sections
@@ -2032,12 +2105,45 @@ export class JamfClient {
                 logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (${key})`, response.status, Date.now() - apiStart);
             }
 
-            this.logger.info('Policy scope updated', { id, name });
+            // Confirmed live (Jamf Pro 11.29.1, policy ID 1 "Update Inventory") — and
+            // confirmed the HARD way: this policy was accidentally left DISABLED in
+            // production after a test run, because the first version of this
+            // verification loop exited on the first read that happened to match the
+            // target value. Reads of a just-written general.enabled/general.frequency
+            // are not just delayed, they can be genuinely NON-MONOTONIC for up to a
+            // minute or more afterward — a read can show the NEW value, then revert
+            // to showing the OLD value on a later read, before finally settling. A
+            // single matching read is NOT proof the change stuck. So this requires
+            // TWO CONSECUTIVE matching reads (5s apart) before accepting success —
+            // still not an absolute guarantee given how long the flip-flopping window
+            // can be, which is why frequencyChangeFailed exists at all: always treat
+            // a change to `enabled` (safety/operational impact) as unconfirmed until
+            // independently re-checked via jamf_get_policy a minute or more later,
+            // not just trusted from this call's return value.
+            let verifyDetail = await this.getPolicyDetail(id);
+            const matchesTarget = (d: any) =>
+                (changes.frequency === undefined || d.general?.frequency === changes.frequency) &&
+                (changes.enabled === undefined || d.general?.enabled === changes.enabled);
+            let consecutiveMatches = matchesTarget(verifyDetail) ? 1 : 0;
+            for (let attempt = 0; attempt < 12 && consecutiveMatches < 2; attempt++) {
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+                verifyDetail = await this.getPolicyDetail(id);
+                consecutiveMatches = matchesTarget(verifyDetail) ? consecutiveMatches + 1 : 0;
+            }
+            const actualFrequency: string = verifyDetail.general?.frequency;
+            const actualEnabled: boolean = verifyDetail.general?.enabled;
+            const frequencyChangeFailed = changes.frequency !== undefined && actualFrequency !== changes.frequency;
+            const enabledChangeFailed = changes.enabled !== undefined && actualEnabled !== changes.enabled;
+
+            this.logger.info('Policy scope updated', { id, name, frequencyChangeFailed, enabledChangeFailed });
             return {
                 success: true,
                 id,
                 name,
-                enabled: changes.enabled !== undefined ? changes.enabled : current.general.enabled,
+                enabled: actualEnabled,
+                frequency: actualFrequency,
+                frequencyChangeFailed,
+                enabledChangeFailed,
                 targetGroups: mergedTargets.map((g: any) => g.name),
                 exclusionGroups: mergedExclusions.map((g: any) => g.name),
             };
@@ -2428,6 +2534,351 @@ export class JamfClient {
             };
         } catch (error) {
             this.logger.error('Error fetching FileVault status', { nameOrSerial, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Wraps GET /api/v1/auth — the same "who am I" check the JAMF Pro UI's own
+    // account page uses. Exists because a bare 401/403 from any other endpoint
+    // doesn't say *which* privilege is missing; diffing this call's `privileges`
+    // list against what an endpoint needs is the fastest way to confirm "client
+    // authenticated fine but its role lacks this one privilege" vs. "bad token".
+    public async getAuthDetails() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching current API client auth/privilege details');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/api/v1/auth');
+            logApiCall(this.logger, 'GET', '/api/v1/auth', response.status, Date.now() - apiStart);
+            this.logger.info('Auth details retrieved');
+            return response.data;
+        } catch (error) {
+            this.logger.error('Error fetching auth details', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Disk Encryption Configuration objects (name/key-type/escrow behavior a
+    // policy's <disk_encryption> section references by ID) are a distinct object
+    // type from a computer's per-machine FileVault status (getFilevaultStatus,
+    // above) — this is Classic API only, no v1/v3 equivalent exists.
+    public async getDiskEncryptionConfigurations() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching disk encryption configurations');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/JSSResource/diskencryptionconfigurations', {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', '/JSSResource/diskencryptionconfigurations', response.status, Date.now() - apiStart);
+            const configs: any[] = response.data.disk_encryption_configurations ?? [];
+            this.logger.info('Disk encryption configurations retrieved', { count: configs.length });
+            return { totalCount: configs.length, results: configs };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Disk Encryption Configurations' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching disk encryption configurations', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Confirmed live (Jamf Pro 11.29.1) against GET .../diskencryptionconfigurations/id/{id}:
+    // the writable shape is {name, key_type, file_vault_enabled_users,
+    // institutional_recovery_key: {key, certificate_type, password_sha256, data}}.
+    // Scoped to key_type=Individual only — Institutional additionally needs an
+    // uploaded recovery-key certificate (institutional_recovery_key), comparable
+    // in complexity to package file upload, and wasn't asked for here.
+    public async upsertDiskEncryptionConfiguration(params: {
+        name: string;
+        fileVaultEnabledUsers?: 'Management Account' | 'Current or Next User' | 'Management Account And Current or Next User';
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting disk encryption configuration', { name: params.name });
+        const fields = {
+            name: params.name,
+            key_type: 'Individual',
+            file_vault_enabled_users: params.fileVaultEnabledUsers ?? 'Current or Next User',
+        };
+        try {
+            const data = await this.getDiskEncryptionConfigurations();
+            const lower = params.name.trim().toLowerCase();
+            const existing = (data.results ?? []).find((c: any) => c.name?.toLowerCase() === lower);
+
+            if (!existing) {
+                const xml = buildXmlDocument('disk_encryption_configuration', fields);
+                const apiStart = Date.now();
+                const response = await this.client.post('/JSSResource/diskencryptionconfigurations/id/0', xml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'POST', '/JSSResource/diskencryptionconfigurations/id/0', response.status, Date.now() - apiStart);
+                const match = String(response.data).match(/<id>(\d+)<\/id>/);
+                if (!match) throw new Error('Disk Encryption Configuration created but no ID could be determined from the response.');
+                this.logger.info('Disk encryption configuration created', { name: params.name, id: match[1] });
+                return { action: 'created' as const, id: match[1], name: params.name };
+            }
+
+            const id = String(existing.id);
+            const xml = buildXmlDocument('disk_encryption_configuration', fields);
+            const apiStart = Date.now();
+            const response = await this.client.put(`/JSSResource/diskencryptionconfigurations/id/${id}`, xml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `/JSSResource/diskencryptionconfigurations/id/${id}`, response.status, Date.now() - apiStart);
+            this.logger.info('Disk encryption configuration updated', { name: params.name, id });
+            return { action: 'updated' as const, id, name: params.name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Disk Encryption Configurations' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error upserting disk encryption configuration', { name: params.name, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // ── App Installers (Jamf App Catalog) ────────────────────────────────────
+    // A distinct feature from packages/policies: Jamf-hosted/curated installer
+    // "titles" (e.g. Chrome, Zoom, Slack) deployed via /api/v1/app-installers,
+    // not the Classic API package/policy machinery used elsewhere in this file.
+
+    public async getAppInstallerTitles(page?: number, pageSize?: number) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching app installer titles');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/api/v1/app-installers/titles', {
+                params: { page: page ?? 0, 'page-size': pageSize ?? 200 }
+            });
+            logApiCall(this.logger, 'GET', '/api/v1/app-installers/titles', response.status, Date.now() - apiStart);
+            this.logger.info('App installer titles retrieved', { count: response.data.results?.length });
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read App Installers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching app installer titles', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Confirmed live (Jamf Pro 11.29.1): the catalog title's display name field
+    // is `titleName`, not `title` — e.g. {id: "0BC", titleName: "Google Chrome",
+    // bundleId: "com.google.Chrome", publisher: "Google", ...}. `id` is an
+    // alphanumeric catalog code (e.g. "0BC"), not a numeric JAMF object ID.
+    private async findAppInstallerTitleByName(name: string): Promise<any> {
+        const data = await this.getAppInstallerTitles(0, 999);
+        const titles: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        const match = titles.find((t) => t.titleName?.toLowerCase() === lower)
+            ?? titles.find((t) => t.titleName?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`App installer title not found in the Jamf catalog: "${name}"`);
+        return match;
+    }
+
+    public async listAppInstallerDeployments(page?: number, pageSize?: number) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching app installer deployments');
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get('/api/v1/app-installers/deployments', {
+                params: { page: page ?? 0, 'page-size': pageSize ?? 200 }
+            });
+            logApiCall(this.logger, 'GET', '/api/v1/app-installers/deployments', response.status, Date.now() - apiStart);
+            this.logger.info('App installer deployments retrieved', { count: response.data.results?.length });
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read App Installers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching app installer deployments', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async getAppInstallerDeploymentDetail(deploymentId: string) {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching app installer deployment detail', { deploymentId });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/api/v1/app-installers/deployments/${deploymentId}`);
+            logApiCall(this.logger, 'GET', `/api/v1/app-installers/deployments/${deploymentId}`, response.status, Date.now() - apiStart);
+            this.logger.info('App installer deployment detail retrieved', { deploymentId });
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read App Installers' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`App installer deployment with ID ${deploymentId} not found.`);
+            }
+            this.logger.error('Error fetching app installer deployment detail', { deploymentId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    private async findAppInstallerDeploymentByName(name: string): Promise<any> {
+        const data = await this.listAppInstallerDeployments(0, 999);
+        const deployments: any[] = data.results ?? [];
+        const lower = name.trim().toLowerCase();
+        const match = deployments.find((d) => d.name?.toLowerCase() === lower)
+            ?? deployments.find((d) => d.name?.toLowerCase().includes(lower));
+        if (!match) throw new Error(`App installer deployment not found: "${name}"`);
+        return match;
+    }
+
+    // Resolves an id-or-name deployment reference to its numeric ID — mirrors
+    // resolvePolicyId's shape for the same reason (callers shouldn't need to
+    // separately call a list tool just to get an ID for jamf_update_app_installer_deployment).
+    private async resolveAppInstallerDeploymentId(nameOrId: string): Promise<string> {
+        if (/^\d+$/.test(nameOrId)) return nameOrId;
+        const match = await this.findAppInstallerDeploymentByName(nameOrId);
+        return String(match.id);
+    }
+
+    // Creates a new App Installer deployment (an ongoing Jamf-managed update
+    // subscription for a catalog title, scoped to a smart group). Not an
+    // upsert — Jamf's own UI treats deployment name as free text, not a unique
+    // key, so re-running with the same name would need to be a deliberate
+    // "update the existing one" call via jamf_update_app_installer_deployment
+    // instead, mirroring intune_create_win32_app's create-only design (see
+    // MCP_TOOL_GAPS.md's Intune section) rather than the upsert-by-name pattern
+    // used elsewhere in this file for scripts/packages/smart groups.
+    public async createAppInstallerDeployment(params: {
+        name: string;
+        appTitleName: string;
+        smartGroupName: string;
+        enabled?: boolean;
+        categoryName?: string;
+        siteId?: string;
+        deploymentType?: 'INSTALL_AUTOMATICALLY' | 'SELF_SERVICE';
+        updateBehavior?: 'AUTOMATIC' | 'MANUAL';
+        notificationInterval?: number;
+        deadline?: number;
+        installPredefinedConfigProfiles?: boolean;
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Creating app installer deployment', { name: params.name, appTitleName: params.appTitleName });
+        try {
+            const [title, smartGroup, categoryId] = await Promise.all([
+                this.findAppInstallerTitleByName(params.appTitleName),
+                this.resolveComputerGroupIdByName(params.smartGroupName),
+                params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
+            ]);
+
+            // Confirmed live (Jamf Pro 11.29.1) end-to-end — created a real
+            // deployment (Adobe Photoshop 2026, disabled, scoped to an empty
+            // smart group), fetched it back, and diffed every field against
+            // this exact body before deleting it: appTitleId/categoryId/siteId/
+            // smartGroupId are flat top-level fields, and notificationInterval/
+            // deadline are nested under `notificationSettings` on both the
+            // request body and the response, exactly as built here.
+            const body: Record<string, any> = {
+                name: params.name,
+                enabled: params.enabled ?? true,
+                appTitleId: String(title.id),
+                siteId: params.siteId ?? '-1',
+                smartGroupId: smartGroup.id,
+                deploymentType: params.deploymentType ?? 'INSTALL_AUTOMATICALLY',
+                updateBehavior: params.updateBehavior ?? 'AUTOMATIC',
+                installPredefinedConfigProfiles: params.installPredefinedConfigProfiles ?? false,
+                notificationSettings: {
+                    notificationInterval: params.notificationInterval ?? 24,
+                    deadline: params.deadline ?? 7,
+                },
+            };
+            if (categoryId) body.categoryId = categoryId;
+
+            const apiStart = Date.now();
+            const response = await this.client.post('/api/v1/app-installers/deployments', body);
+            logApiCall(this.logger, 'POST', '/api/v1/app-installers/deployments', response.status, Date.now() - apiStart);
+            const id = String(response.data.id ?? response.data.deploymentId);
+            this.logger.info('App installer deployment created', { name: params.name, id });
+            return { action: 'created' as const, id, name: params.name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create App Installers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error creating app installer deployment', { name: params.name, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Updates an existing deployment by name or numeric ID. Confirmed live
+    // (Jamf Pro 11.29.1): unlike the Classic API XML endpoints elsewhere in
+    // this file, this v1 JSON PUT applies a full-object echo-back cleanly —
+    // enabled/notificationInterval/deadline all landed correctly in one PUT,
+    // no section-splitting workaround needed. Still reads the current
+    // deployment first and merges only the given fields on top before writing
+    // the whole object back (the same defensive read-merge-write approach
+    // updateScriptById/updatePackageMetadata use for other v1 JSON resources),
+    // so an omitted field can't be silently nulled out even though a naive
+    // partial PUT wasn't observed to be a problem here.
+    public async updateAppInstallerDeployment(nameOrId: string, changes: {
+        enabled?: boolean;
+        smartGroupName?: string;
+        categoryName?: string;
+        deploymentType?: 'INSTALL_AUTOMATICALLY' | 'SELF_SERVICE';
+        updateBehavior?: 'AUTOMATIC' | 'MANUAL';
+        notificationInterval?: number;
+        deadline?: number;
+    }) {
+        await this.ensureAuthenticated();
+        const id = await this.resolveAppInstallerDeploymentId(nameOrId);
+        this.logger.info('Updating app installer deployment', { id, changes });
+        try {
+            // Confirmed live (Jamf Pro 11.29.1): GET .../deployments/{id} nests
+            // notificationInterval/deadline under `notificationSettings`, not
+            // top-level — merge into that sub-object rather than the top level.
+            const existing = await this.getAppInstallerDeploymentDetail(id);
+            const [smartGroup, categoryId] = await Promise.all([
+                changes.smartGroupName ? this.resolveComputerGroupIdByName(changes.smartGroupName) : Promise.resolve(undefined),
+                changes.categoryName ? this.resolveCategoryId(changes.categoryName) : Promise.resolve(undefined),
+            ]);
+
+            const body: Record<string, any> = {
+                ...existing,
+                enabled: changes.enabled ?? existing.enabled,
+                smartGroupId: smartGroup?.id ?? existing.smartGroupId,
+                categoryId: categoryId ?? existing.categoryId,
+                deploymentType: changes.deploymentType ?? existing.deploymentType,
+                updateBehavior: changes.updateBehavior ?? existing.updateBehavior,
+                notificationSettings: {
+                    ...existing.notificationSettings,
+                    notificationInterval: changes.notificationInterval ?? existing.notificationSettings?.notificationInterval,
+                    deadline: changes.deadline ?? existing.notificationSettings?.deadline,
+                },
+            };
+
+            const apiStart = Date.now();
+            const response = await this.client.put(`/api/v1/app-installers/deployments/${id}`, body);
+            logApiCall(this.logger, 'PUT', `/api/v1/app-installers/deployments/${id}`, response.status, Date.now() - apiStart);
+            this.logger.info('App installer deployment updated', { id });
+            return { success: true, id, name: existing.name ?? nameOrId };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update App Installers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating app installer deployment', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Confirmed live (Jamf Pro 11.29.1): DELETE .../app-installers/deployments/{id}
+    // returns 204 and the object is gone on a follow-up GET (404) — unlike
+    // scripts/policies/smart groups, this API client's role CAN delete these.
+    // Test-hygiene only — no corresponding MCP tool, since deleting a live
+    // install/update subscription isn't a workflow this project has asked for.
+    public async deleteAppInstallerDeployment(id: string): Promise<void> {
+        await this.ensureAuthenticated();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.delete(`/api/v1/app-installers/deployments/${id}`);
+            logApiCall(this.logger, 'DELETE', `/api/v1/app-installers/deployments/${id}`, response.status, Date.now() - apiStart);
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Delete App Installers' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error deleting app installer deployment', { id, error: (error as Error).message });
             throw error;
         }
     }
