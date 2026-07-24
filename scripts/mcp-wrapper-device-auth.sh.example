@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Template MCP client wrapper for headless boxes where mcp-remote's normal
+# localhost-callback OAuth flow can't complete (no local browser, and setting
+# up SSH port forwarding for every session is a hassle).
+#
+# Fetches a fresh Entra access token via the device code flow (see
+# src/cli/entra-device-auth.ts — run its `login` subcommand once, interactively,
+# before wiring this up) and hands it to mcp-remote via --header, which
+# bypasses mcp-remote's own OAuth entirely (its documented "Custom Headers"
+# bypass-auth mechanism).
+#
+# Copy this file to e.g. ~/.claude/mcp-wrappers/intune-mcp-device.sh, chmod +x
+# it, set PROFILE below (or pass it as $1), and point your MCP client config's
+# "command" at the copy instead of invoking mcp-remote directly.
+set -euo pipefail
+
+DESKTOP_MCP_DIR="/home/ad/cobbr/desktop-management-mcp"
+PROFILE="${1:-intune}"          # matches the --profile used with `entra-device-auth login`
+MCP_URL="${2:-https://intune-mcp.colgate.edu/mcp}"
+CALLBACK_PORT="${3:-3335}"      # unused by mcp-remote once --header bypasses OAuth, but it still binds this port
+
+TOKEN=$(node "${DESKTOP_MCP_DIR}/dist/src/cli/entra-device-auth.js" token --profile "${PROFILE}")
+
+exec mcp-remote "${MCP_URL}" "${CALLBACK_PORT}" --header "Authorization:Bearer ${TOKEN}"

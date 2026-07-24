@@ -9,6 +9,7 @@
     "clean": "rimraf dist",
     "start:jamf": "node dist/src/mcp/jamf-server.js",
     "start:intune": "node dist/src/mcp/intune-server.js",
+    "auth:device": "node dist/src/cli/entra-device-auth.js",
     "test": "tsc -p tsconfig.test.json && node --test dist/test/jamf-api.test.js dist/test/auth.test.js",
     "test:write": "tsc -p tsconfig.test.json && JAMF_TEST_WRITE=1 node --test dist/test/jamf-api.test.js dist/test/auth.test.js",
     "test:unit": "tsc -p tsconfig.test.json && node --test dist/test/auth.test.js"
