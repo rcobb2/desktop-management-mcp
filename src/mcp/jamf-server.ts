@@ -40,6 +40,7 @@ import { JamfClient } from "../jamf/jamf-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, JAMF_READ, JAMF_WRITE, JAMF_ALL_ROLES } from "../utils/roles.js";
+import { metricsMiddleware, metricsHandler } from "../utils/metrics.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -2274,6 +2275,8 @@ function createJamfMcpServer(roles: string[]): McpServer {
 async function main() {
     const app = express();
     app.use(express.json());
+    // Mounted before routes so it wraps everything below, including /health and /metrics itself.
+    app.use(metricsMiddleware);
 
     const PORT = parseInt(process.env.PORT ?? "3001", 10);
     const publicUrl = process.env.JAMF_MCP_PUBLIC_URL;
@@ -2350,6 +2353,10 @@ async function main() {
     app.get("/health", (_req: Request, res: Response) => {
         res.json({ status: "ok", server: "jamf-mcp-server", version: "1.0.0" });
     });
+
+    // Scraped by Prometheus. Open like /health — not behind requireMcpAuth — since
+    // both servers are loopback-bound in production, fronted by Caddy.
+    app.get("/metrics", metricsHandler);
 
     app.listen(PORT, () => {
         console.log(`[jamf-mcp] JAMF Pro MCP server listening on port ${PORT}`);

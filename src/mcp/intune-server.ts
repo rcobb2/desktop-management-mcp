@@ -38,6 +38,7 @@ import { IntuneClient } from "../intune/graph-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, INTUNE_READ, INTUNE_WRITE, INTUNE_ALL_ROLES } from "../utils/roles.js";
+import { metricsMiddleware, metricsHandler } from "../utils/metrics.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1561,6 +1562,8 @@ function createIntuneMcpServer(roles: string[]): McpServer {
 async function main() {
     const app = express();
     app.use(express.json());
+    // Mounted before routes so it wraps everything below, including /health and /metrics itself.
+    app.use(metricsMiddleware);
 
     const PORT = parseInt(process.env.PORT ?? "3002", 10);
     const publicUrl = process.env.INTUNE_MCP_PUBLIC_URL;
@@ -1637,6 +1640,10 @@ async function main() {
     app.get("/health", (_req: Request, res: Response) => {
         res.json({ status: "ok", server: "intune-mcp-server", version: "1.0.0" });
     });
+
+    // Scraped by Prometheus. Open like /health — not behind requireMcpAuth — since
+    // both servers are loopback-bound in production, fronted by Caddy.
+    app.get("/metrics", metricsHandler);
 
     app.listen(PORT, () => {
         console.log(`[intune-mcp] Intune MCP server listening on port ${PORT}`);

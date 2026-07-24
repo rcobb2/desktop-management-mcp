@@ -5,12 +5,18 @@
  * (jamf-api.ts, graph-api.ts) so they require zero changes.
  */
 
+import { externalApiRequestDuration, externalApiErrorsTotal } from './metrics.js';
+
 // Minimal logger interface matching what API clients expect
 interface Logger {
     info(message: string, meta?: Record<string, any>): void;
     warn(message: string, meta?: Record<string, any>): void;
     error(message: string, meta?: Record<string, any>): void;
     debug(message: string, meta?: Record<string, any>): void;
+    // Set by createLogger; read back by logApiCall() below to label external-API
+    // metrics without every jamf-api.ts/graph-api.ts call site having to pass a
+    // target explicitly.
+    readonly service: string;
 }
 
 function formatMeta(meta?: Record<string, any>): string {
@@ -20,6 +26,7 @@ function formatMeta(meta?: Record<string, any>): string {
 
 export const createLogger = (service: string): Logger => {
     return {
+        service,
         info: (message: string, meta?: Record<string, any>) => {
             console.log(`[INFO] [${service}]: ${message}${formatMeta(meta)}`);
         },
@@ -37,6 +44,21 @@ export const createLogger = (service: string): Logger => {
     };
 };
 
+// 'jamf-api' -> 'jamf', 'intune-api' -> 'intune' (matches the `target` label
+// jamf-prestage-tool's metrics use for its own external dependencies).
+function targetFromService(service: string): string {
+    return service.replace(/-api$/, '');
+}
+
+// Best-effort status extraction from a caught error, for metric labeling only
+// (never thrown/logged as-is). Handles both axios errors (jamf-api.ts) and the
+// Microsoft Graph SDK's GraphError shape (graph-api.ts), falling back to
+// 'network_error' the same way jamf-prestage-tool's axios interceptor does.
+function statusFromError(error?: Error): string {
+    const status = (error as any)?.response?.status ?? (error as any)?.statusCode ?? (error as any)?.code;
+    return status !== undefined ? String(status) : 'network_error';
+}
+
 // Convenience function for logging API calls (used by jamf-api.ts, graph-api.ts)
 export const logApiCall = (
     logger: Logger,
@@ -46,6 +68,8 @@ export const logApiCall = (
     duration?: number,
     error?: Error
 ) => {
+    const target = targetFromService(logger.service);
+
     if (error) {
         logger.error('API call failed', {
             method,
@@ -54,6 +78,11 @@ export const logApiCall = (
             duration: duration ? `${duration}ms` : undefined,
             error: error.message,
         });
+        const status = statusCode !== undefined ? String(statusCode) : statusFromError(error);
+        externalApiErrorsTotal.inc({ target, method, status });
+        if (duration !== undefined) {
+            externalApiRequestDuration.observe({ target, method, status }, duration / 1000);
+        }
     } else {
         logger.info('API call completed', {
             method,
@@ -61,6 +90,9 @@ export const logApiCall = (
             statusCode,
             duration: duration ? `${duration}ms` : undefined,
         });
+        if (duration !== undefined) {
+            externalApiRequestDuration.observe({ target, method, status: String(statusCode ?? 'unknown') }, duration / 1000);
+        }
     }
 };
 
