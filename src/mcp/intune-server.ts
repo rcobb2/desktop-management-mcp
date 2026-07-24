@@ -1236,6 +1236,323 @@ function createIntuneMcpServer(roles: string[]): McpServer {
         );
     }
 
+    // ── 17. intune_send_device_action ────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_send_device_action",
+            {
+                description:
+                    "Send a remote action to a managed device in Intune. Accepts device name, Intune device ID, " +
+                    "or serial number. Supported actions: Sync (trigger an immediate check-in), Reboot, RemoteLock " +
+                    "(Android only), Retire (IRREVERSIBLE — removes company data and unenrolls the device from " +
+                    "Intune), Wipe (IRREVERSIBLE — factory-resets the device). " +
+                    "For Wipe, keepEnrollmentData/keepUserData let you do a 'reset but stay enrolled' style wipe; " +
+                    "macOsUnlockCode is required to wipe a Mac with a firmware password/Activation Lock set.",
+                inputSchema: {
+                    ...DeviceIdentifierSchema,
+                    action: z.enum(["Sync", "Reboot", "RemoteLock", "Retire", "Wipe"]).describe("The remote action to send"),
+                    keepEnrollmentData: z.boolean().optional().describe("Wipe only: keep MDM enrollment data (device stays enrolled after reset)"),
+                    keepUserData: z.boolean().optional().describe("Wipe only: keep user data during the reset"),
+                    macOsUnlockCode: z.string().optional().describe("Wipe only: 6-digit recovery PIN for wiping a Mac with a firmware password set"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+            },
+            async ({ deviceName, deviceId, serialNumber, action, keepEnrollmentData, keepUserData, macOsUnlockCode }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                    if (!resolved) {
+                        return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    }
+
+                    const actionMap = {
+                        Sync: "sync",
+                        Reboot: "reboot",
+                        RemoteLock: "remoteLock",
+                        Retire: "retire",
+                        Wipe: "wipe",
+                    } as const;
+
+                    await client.sendManagedDeviceAction(resolved.deviceId, actionMap[action], {
+                        keepEnrollmentData,
+                        keepUserData,
+                        macOsUnlockCode,
+                    });
+
+                    const text = `**${action}** sent successfully to device ${deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId}.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18. intune_set_device_category ───────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_set_device_category",
+            {
+                description:
+                    "Set the Intune device category for a managed device. Accepts device name, Intune device ID, " +
+                    "or serial number. The category must already exist in Intune (categories are created in the " +
+                    "Intune portal — there is no write API for creating them exposed here).",
+                inputSchema: {
+                    ...DeviceIdentifierSchema,
+                    categoryName: z.string().describe("Exact display name of an existing Intune device category"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ deviceName, deviceId, serialNumber, categoryName }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                    if (!resolved) {
+                        return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    }
+
+                    const result = await client.setDeviceCategory(resolved.deviceId, categoryName);
+                    const text = `Device category set to **${result.category.displayName}** for device ${deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId}.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 19. intune_set_device_name ───────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_set_device_name",
+            {
+                description:
+                    "Rename a managed device in Intune via the setDeviceName remote action. Windows-only " +
+                    "(the device must support remote rename) — this action has no v1.0 form in Graph, so it's " +
+                    "called against the beta endpoint. The device will reflect the new name after its next check-in.",
+                inputSchema: {
+                    ...DeviceIdentifierSchema,
+                    newDeviceName: z.string().describe("The new device name to set"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ deviceName, deviceId, serialNumber, newDeviceName }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                    if (!resolved) {
+                        return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    }
+
+                    await client.setDeviceName(resolved.deviceId, newDeviceName);
+                    const text = `Rename to **${newDeviceName}** sent successfully for device ${deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId}. It will take effect after the device's next check-in.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 20. intune_set_autopilot_group_tag ───────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_set_autopilot_group_tag",
+            {
+                description:
+                    "Set the Windows Autopilot group tag for a device by serial number (or device name, resolved " +
+                    "to serial automatically). Group tags are the standard mechanism for dynamic Azure AD group " +
+                    "membership rules based on Autopilot registration, so this is the way to retroactively sort " +
+                    "already-registered devices into those groups without re-running Autopilot registration.",
+                inputSchema: {
+                    serialNumber: z.string().optional().describe("Device serial number (preferred for Autopilot lookups)"),
+                    deviceName: z.string().optional().describe("Intune device display name (resolved to serial automatically)"),
+                    groupTag: z.string().describe("The group tag value to set"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ serialNumber, deviceName, groupTag }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let targetSerial = serialNumber;
+
+                    if (deviceName && !targetSerial) {
+                        const device = await client.getManagedDeviceByName(deviceName);
+                        if (!device) return notFound(`device "${deviceName}"`);
+                        targetSerial = (device as any).serialNumber;
+                    }
+
+                    if (!targetSerial) {
+                        return {
+                            isError: true,
+                            content: [{ type: "text", text: "Error: provide serialNumber or deviceName." }],
+                        };
+                    }
+
+                    const result = await client.updateAutopilotGroupTag(targetSerial, groupTag);
+                    const text = `Autopilot group tag set to **${result.groupTag}** for serial **${result.serialNumber}**.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 21. intune_assign_policy ──────────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_policy",
+            {
+                description:
+                    "Add (or move) a group assignment on an Intune configuration policy — classic device " +
+                    "configuration or Settings Catalog. Accepts policy by ID or name. " +
+                    "IMPORTANT: Graph's assign action REPLACES the entire assignment set rather than appending " +
+                    "to it, so this tool always reads the policy's current assignments first, removes any " +
+                    "existing assignment for the same group (so calling again with a different exclude value " +
+                    "moves the group rather than duplicating it), adds the new one, and posts the full set back — " +
+                    "other groups' assignments are preserved untouched.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Intune policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    source: z
+                        .enum(["classic", "settingsCatalog", "auto"])
+                        .default("auto")
+                        .describe('Policy type: "classic" for device configuration profiles, "settingsCatalog" for Settings Catalog, "auto" to detect (default)'),
+                    group: z.string().describe("Azure AD group display name or object ID (GUID) to assign"),
+                    exclude: z.boolean().optional().describe("If true, EXCLUDE this group from the policy's scope instead of including it"),
+                    filterId: z.string().optional().describe("Optional assignment filter ID to attach to this assignment"),
+                    filterType: z.enum(["include", "exclude"]).optional().describe('How the filter narrows scope (default "include"). Only used if filterId is set.'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ policyId, policyName, source = "auto", group, exclude, filterId, filterType, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedPolicyId = policyId;
+                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
+                    let resolvedName = policyName;
+
+                    if (!resolvedPolicyId && policyName) {
+                        const resolved = await resolvePolicyByName(client, policyName, source);
+                        if (!resolved) return notFound(`policy "${policyName}"`);
+                        resolvedPolicyId = resolved.policyId;
+                        resolvedSource = resolved.source;
+                        resolvedName = resolved.policyName;
+                    }
+
+                    if (!resolvedPolicyId) {
+                        return {
+                            isError: true,
+                            content: [{ type: "text", text: "Error: provide policyId or policyName." }],
+                        };
+                    }
+
+                    if (!resolvedSource) {
+                        if (source === "auto") {
+                            return {
+                                isError: true,
+                                content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }],
+                            };
+                        }
+                        resolvedSource = source;
+                    }
+
+                    const result = await client.assignConfigurationPolicyToGroup(resolvedPolicyId, resolvedSource, group, {
+                        exclude,
+                        filterId,
+                        filterType,
+                    });
+
+                    const text = toText(result, response_format, () => {
+                        const label = resolvedName ?? resolvedPolicyId;
+                        const direction = exclude ? "excluded from" : "included in";
+                        return [
+                            `## Assignment updated — "${label}"`,
+                            `Group **${result.group.displayName}** is now ${direction} this policy's scope.`,
+                            `- Total assignments on policy: ${result.totalAssignments}`,
+                            result.replacedExistingForGroup ? `- This replaced a prior assignment for the same group.` : "",
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 22. intune_assign_app ─────────────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_app",
+            {
+                description:
+                    "Add (or move) a group assignment on an Intune app deployment, with the given install intent. " +
+                    "Accepts app by ID or name. " +
+                    "IMPORTANT: Graph's assign action REPLACES the entire assignment set rather than appending " +
+                    "to it, so this tool always reads the app's current assignments first, removes any existing " +
+                    "assignment for the same group (so calling again with a different intent or exclude value " +
+                    "moves the group rather than duplicating it), adds the new one, and posts the full set back — " +
+                    "other groups' assignments are preserved untouched.",
+                inputSchema: {
+                    appId: z.string().optional().describe("Intune mobile app ID (GUID). Use if you already have it."),
+                    appName: z.string().optional().describe("App display name (resolved to ID automatically)"),
+                    group: z.string().describe("Azure AD group display name or object ID (GUID) to assign"),
+                    intent: z
+                        .enum(["required", "available", "uninstall", "availableWithoutEnrollment"])
+                        .default("required")
+                        .describe("Install intent for this assignment"),
+                    exclude: z.boolean().optional().describe("If true, EXCLUDE this group from the app's scope instead of including it"),
+                    filterId: z.string().optional().describe("Optional assignment filter ID to attach to this assignment"),
+                    filterType: z.enum(["include", "exclude"]).optional().describe('How the filter narrows scope (default "include"). Only used if filterId is set.'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ appId, appName, group, intent = "required", exclude, filterId, filterType, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedAppId = appId;
+                    let resolvedAppName = appName;
+
+                    if (!resolvedAppId && appName) {
+                        const resolved = await resolveAppByName(client, appName);
+                        if (!resolved) return notFound(`app "${appName}"`);
+                        resolvedAppId = resolved.appId;
+                        resolvedAppName = resolved.appName;
+                    }
+
+                    if (!resolvedAppId) {
+                        return {
+                            isError: true,
+                            content: [{ type: "text", text: "Error: provide appId or appName." }],
+                        };
+                    }
+
+                    const result = await client.assignAppToGroup(resolvedAppId, group, intent, { exclude, filterId, filterType });
+
+                    const text = toText(result, response_format, () => {
+                        const label = resolvedAppName ?? resolvedAppId;
+                        const direction = exclude ? "excluded from" : `included in (intent: ${intent})`;
+                        return [
+                            `## Assignment updated — "${label}"`,
+                            `Group **${result.group.displayName}** is now ${direction} this app's scope.`,
+                            `- Total assignments on app: ${result.totalAssignments}`,
+                            result.replacedExistingForGroup ? `- This replaced a prior assignment for the same group.` : "",
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     return server;
 }
 

@@ -2175,4 +2175,359 @@ export class IntuneClient {
             throw error;
         }
     }
+
+    // ─── Write operations ─────────────────────────────────────────────────
+
+    /**
+     * Keep only the properties Graph's assign actions accept on a target when re-posting
+     * assignments fetched from a GET — echoing back extra read-only fields risks a rejected write
+     * (the JAMF client hit an analogous issue with policies: echoing full GET output back on PUT
+     * triggered a 409 from a read-only section Jamf doesn't expect on write).
+     */
+    private sanitizeAssignmentTarget(target: any): any {
+        const sanitized: any = { '@odata.type': target?.['@odata.type'] };
+        if (target?.groupId) sanitized.groupId = target.groupId;
+        if (target?.collectionId) sanitized.collectionId = target.collectionId;
+        if (target?.deviceAndAppManagementAssignmentFilterId) {
+            sanitized.deviceAndAppManagementAssignmentFilterId = target.deviceAndAppManagementAssignmentFilterId;
+            sanitized.deviceAndAppManagementAssignmentFilterType = target.deviceAndAppManagementAssignmentFilterType;
+        }
+        return sanitized;
+    }
+
+    /**
+     * Send a remote action to a managed device: sync, reboot, remoteLock, retire, or wipe.
+     * retire and wipe are destructive/irreversible (retire removes company data and unenrolls;
+     * wipe factory-resets the device). All five actions return 204 No Content from Graph on success.
+     */
+    public async sendManagedDeviceAction(
+        deviceId: string,
+        action: 'sync' | 'reboot' | 'remoteLock' | 'retire' | 'wipe',
+        options?: { keepEnrollmentData?: boolean; keepUserData?: boolean; macOsUnlockCode?: string }
+    ) {
+        this.logger.info('Sending managed device action', { deviceId, action });
+        await this.trackAuthAttempt();
+
+        const actionPaths: Record<typeof action, string> = {
+            sync: 'syncDevice',
+            reboot: 'rebootNow',
+            remoteLock: 'remoteLock',
+            retire: 'retire',
+            wipe: 'wipe'
+        };
+
+        const path = `/deviceManagement/managedDevices/${deviceId}/${actionPaths[action]}`;
+
+        let body: Record<string, unknown> = {};
+        if (action === 'wipe') {
+            if (options?.keepEnrollmentData !== undefined) body.keepEnrollmentData = options.keepEnrollmentData;
+            if (options?.keepUserData !== undefined) body.keepUserData = options.keepUserData;
+            if (options?.macOsUnlockCode) body.macOsUnlockCode = options.macOsUnlockCode;
+        }
+
+        try {
+            const apiStart = Date.now();
+            await this.client.api(path).version('v1.0').post(body);
+            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            this.logger.info('Managed device action sent successfully', { deviceId, action });
+            return { deviceId, action };
+        } catch (error) {
+            this.logger.error(`Error sending ${action} action to device ${deviceId}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'POST', path, undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Assign a device category to a managed device. Confirmed live that neither documented approach
+     * actually works against this tenant: `deviceCategory@odata.bind` on `PATCH .../managedDevices/{id}`
+     * is rejected with "Bind requests not supported for containment navigation property", and
+     * `PATCH .../managedDevices/{id}/deviceCategory` (the form Microsoft's own docs and a still-open
+     * msgraph-sdk-powershell issue describe) 404s with an empty body. The form that actually works is
+     * `PUT .../managedDevices/{id}/deviceCategory/$ref` with an `@odata.id` body pointing at the target
+     * category — standard single-valued-nav-property $ref syntax, verified with a live set + revert.
+     */
+    public async setDeviceCategory(deviceId: string, categoryName: string) {
+        this.logger.info('Setting device category', { deviceId, categoryName });
+        await this.trackAuthAttempt();
+
+        try {
+            const escaped = this.escapeODataString(categoryName.trim());
+            const categoryResponse = await this.client
+                .api('/deviceManagement/deviceCategories')
+                .version('v1.0')
+                .filter(`displayName eq '${escaped}'`)
+                .select('id,displayName')
+                .top(1)
+                .get();
+
+            const category = (categoryResponse.value || [])[0];
+            if (!category) {
+                throw new Error(`Device category "${categoryName}" not found. Categories are created in the Intune portal — there's no write API for that exposed here.`);
+            }
+
+            const path = `/deviceManagement/managedDevices/${deviceId}/deviceCategory/$ref`;
+            const apiStart = Date.now();
+            await this.client
+                .api(path)
+                .version('v1.0')
+                .put({ '@odata.id': `https://graph.microsoft.com/v1.0/deviceManagement/deviceCategories/${category.id}` });
+
+            logApiCall(this.logger, 'PUT', path, 204, Date.now() - apiStart);
+            this.logger.info('Device category set', { deviceId, categoryId: category.id, categoryName: category.displayName });
+            return { deviceId, category };
+        } catch (error) {
+            this.logger.error(`Error setting device category for ${deviceId}`, { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Rename a managed device via the setDeviceName action. Windows-only (the device must support
+     * remote rename) and beta-only in Graph — there is no v1.0 form of this action.
+     */
+    public async setDeviceName(deviceId: string, deviceName: string) {
+        this.logger.info('Setting device name', { deviceId, deviceName });
+        await this.trackAuthAttempt();
+
+        try {
+            const path = `/deviceManagement/managedDevices/${deviceId}/setDeviceName`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('beta').post({ deviceName });
+            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            this.logger.info('Device name set', { deviceId, deviceName });
+            return { deviceId, deviceName };
+        } catch (error) {
+            this.logger.error(`Error setting device name for ${deviceId}`, { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Update the Autopilot group tag for a device by serial number. Group tags are the standard
+     * mechanism for dynamic Azure AD group membership rules based on Autopilot registration, so this
+     * is the primary lever for retroactively sorting already-registered devices into those groups.
+     * Resolves serial -> windowsAutopilotDeviceIdentity ID the same way getAutopilotProfileStatus
+     * does (server-side filter first, client-side scan of a beta page as fallback).
+     */
+    public async updateAutopilotGroupTag(serialNumber: string, groupTag: string) {
+        this.logger.info('Updating Autopilot group tag', { serialNumber, groupTag });
+        await this.trackAuthAttempt();
+
+        const normalizedSerial = serialNumber.trim();
+        let autopilotId: string | null = null;
+
+        try {
+            const escapedSerial = this.escapeODataString(normalizedSerial);
+            const lookupResponse = await this.client
+                .api('/deviceManagement/windowsAutopilotDeviceIdentities')
+                .version('v1.0')
+                .filter(`serialNumber eq '${escapedSerial}'`)
+                .select('id,serialNumber')
+                .get();
+
+            if (lookupResponse.value && lookupResponse.value.length > 0) {
+                autopilotId = lookupResponse.value[0].id;
+            }
+        } catch (error) {
+            this.logger.warn('Server-side Autopilot lookup failed for group tag update; trying client-side fallback', {
+                serialNumber: normalizedSerial,
+                error: (error as Error).message
+            });
+        }
+
+        if (!autopilotId) {
+            const fallbackResponse = await this.client
+                .api('/deviceManagement/windowsAutopilotDeviceIdentities')
+                .version('beta')
+                .top(500)
+                .get();
+            const found = (fallbackResponse.value || []).find(
+                (d: any) => String(d.serialNumber || '').toLowerCase() === normalizedSerial.toLowerCase()
+            );
+            if (found) autopilotId = found.id;
+        }
+
+        if (!autopilotId) {
+            throw new Error(`No Autopilot device identity found for serial "${normalizedSerial}".`);
+        }
+
+        try {
+            const path = `/deviceManagement/windowsAutopilotDeviceIdentities/${autopilotId}/updateDeviceProperties`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('v1.0').post({ groupTag });
+            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            this.logger.info('Autopilot group tag updated', { serialNumber: normalizedSerial, autopilotId, groupTag });
+            return { serialNumber: normalizedSerial, autopilotId, groupTag };
+        } catch (error) {
+            this.logger.error(`Error updating Autopilot group tag for ${normalizedSerial}`, { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Add (or move) a group assignment on an Intune configuration policy — classic device
+     * configuration or Settings Catalog. Graph's `/assign` action REPLACES the entire assignment set
+     * rather than appending to it (unlike JAMF's Classic API PUT, which is a partial merge) — so this
+     * always does its own read-modify-write: fetch current assignments, drop any existing assignment
+     * for this same group (so re-running with a different include/exclude direction moves it rather
+     * than duplicating it), append the new one, then POST the full array back.
+     *
+     * Confirmed live: assignments can carry `source: "policySets"` (auto-derived from an Intune Policy
+     * Set the policy belongs to) alongside `source: "direct"` ones. Echoing a `policySets` assignment
+     * back through `/assign` does NOT get recognized as "the same assignment" — it creates a second,
+     * independent `direct` assignment for that group, duplicating scope the Policy Set already grants.
+     * The policySets-derived assignment regenerates itself automatically on every read regardless, so
+     * only `direct` assignments (or ones with no `source` field at all, as classic deviceConfigurations
+     * assignments have) are retained when rebuilding the array to post back.
+     */
+    public async assignConfigurationPolicyToGroup(
+        policyId: string,
+        source: 'classic' | 'settingsCatalog',
+        groupNameOrId: string,
+        options?: { exclude?: boolean; filterId?: string; filterType?: 'include' | 'exclude' }
+    ) {
+        this.logger.info('Assigning configuration policy to group', { policyId, source, groupNameOrId, ...options });
+        await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
+        const base = source === 'classic'
+            ? `/deviceManagement/deviceConfigurations/${policyId}`
+            : `/deviceManagement/configurationPolicies/${policyId}`;
+        const version = source === 'classic' ? 'v1.0' : 'beta';
+        const assignmentODataType = source === 'classic'
+            ? '#microsoft.graph.deviceConfigurationAssignment'
+            : '#microsoft.graph.deviceManagementConfigurationPolicyAssignment';
+
+        try {
+            const existingResponse = await this.client.api(`${base}/assignments`).version(version).top(999).get();
+            const existing: any[] = existingResponse.value || [];
+            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
+            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
+
+            const retained = directOnly
+                .filter((a: any) => a.target?.groupId !== group.id)
+                .map((a: any) => ({
+                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
+                    target: this.sanitizeAssignmentTarget(a.target)
+                }));
+
+            const newTarget: any = {
+                '@odata.type': options?.exclude
+                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
+                    : '#microsoft.graph.groupAssignmentTarget',
+                groupId: group.id
+            };
+            if (options?.filterId) {
+                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
+                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
+            }
+
+            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
+
+            const apiStart = Date.now();
+            await this.client.api(`${base}/assign`).version(version).post({ assignments: updatedAssignments });
+            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
+
+            this.logger.info('Configuration policy assignment updated', {
+                policyId, source, groupId: group.id, totalAssignments: updatedAssignments.length
+            });
+
+            return {
+                policyId,
+                source,
+                group,
+                exclude: Boolean(options?.exclude),
+                totalAssignments: updatedAssignments.length,
+                previousAssignmentCount: existing.length,
+                replacedExistingForGroup: hadExistingForGroup
+            };
+        } catch (error) {
+            this.logger.error('Error assigning configuration policy to group', {
+                policyId, source, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Add (or move) a group assignment on an Intune app deployment, with the given install intent.
+     * Same replace-the-full-set semantics as assignConfigurationPolicyToGroup — read current
+     * assignments, drop any existing assignment for this group, append the new one, POST the whole
+     * array back to `/assign`. Same Policy Sets caveat too: only `source: "direct"` (or sourceless)
+     * assignments are retained — a `policySets`-derived one gets duplicated as an independent direct
+     * assignment if echoed back, since it regenerates itself automatically and isn't recognized as
+     * "the same assignment" when re-posted (confirmed live on the configuration-policy path; applied
+     * here defensively since mobileApp assignments can equally originate from a Policy Set).
+     */
+    public async assignAppToGroup(
+        appId: string,
+        groupNameOrId: string,
+        intent: 'required' | 'available' | 'uninstall' | 'availableWithoutEnrollment',
+        options?: { exclude?: boolean; filterId?: string; filterType?: 'include' | 'exclude' }
+    ) {
+        this.logger.info('Assigning app to group', { appId, groupNameOrId, intent, ...options });
+        await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
+        const base = `/deviceAppManagement/mobileApps/${appId}`;
+
+        try {
+            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
+            const existing: any[] = existingResponse.value || [];
+            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
+            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
+
+            const retained = directOnly
+                .filter((a: any) => a.target?.groupId !== group.id)
+                .map((a: any) => ({
+                    '@odata.type': a['@odata.type'] ?? '#microsoft.graph.mobileAppAssignment',
+                    intent: a.intent,
+                    target: this.sanitizeAssignmentTarget(a.target)
+                }));
+
+            const newTarget: any = {
+                '@odata.type': options?.exclude
+                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
+                    : '#microsoft.graph.groupAssignmentTarget',
+                groupId: group.id
+            };
+            if (options?.filterId) {
+                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
+                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
+            }
+
+            const updatedAssignments = [
+                ...retained,
+                { '@odata.type': '#microsoft.graph.mobileAppAssignment', intent, target: newTarget }
+            ];
+
+            const apiStart = Date.now();
+            await this.client.api(`${base}/assign`).version('v1.0').post({ mobileAppAssignments: updatedAssignments });
+            logApiCall(this.logger, 'POST', `${base}/assign`, 204, Date.now() - apiStart);
+
+            this.logger.info('App assignment updated', { appId, groupId: group.id, intent, totalAssignments: updatedAssignments.length });
+
+            return {
+                appId,
+                group,
+                intent,
+                exclude: Boolean(options?.exclude),
+                totalAssignments: updatedAssignments.length,
+                previousAssignmentCount: existing.length,
+                replacedExistingForGroup: hadExistingForGroup
+            };
+        } catch (error) {
+            this.logger.error('Error assigning app to group', {
+                appId, groupNameOrId, intent, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
 }
