@@ -40,7 +40,7 @@ import { JamfClient } from "../jamf/jamf-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, JAMF_READ, JAMF_WRITE, JAMF_ALL_ROLES } from "../utils/roles.js";
-import { metricsMiddleware, metricsHandler } from "../utils/metrics.js";
+import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -73,13 +73,14 @@ function errorResult(err: unknown): { content: [{ type: "text"; text: string }];
 
 // ─── Server factory ──────────────────────────────────────────────────────────
 
-function createJamfMcpServer(roles: string[]): McpServer {
+function createJamfMcpServer(roles: string[], caller: string): McpServer {
     const client = new JamfClient();
 
     const server = new McpServer({
         name: "jamf-mcp-server",
         version: "1.0.0",
     });
+    instrumentToolCalls(server, "jamf", caller);
 
     // ── 1. jamf_get_computer ─────────────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
@@ -2320,7 +2321,8 @@ async function main() {
     app.post("/mcp", async (req: Request, res: Response) => {
         try {
             const roles = req.auth?.extra.roles ?? [];
-            const server = createJamfMcpServer(roles);
+            const caller = req.auth?.extra.upn ?? req.auth?.clientId ?? "unknown";
+            const server = createJamfMcpServer(roles, caller);
             const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: undefined, // stateless
             });

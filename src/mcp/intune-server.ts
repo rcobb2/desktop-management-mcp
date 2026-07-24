@@ -38,7 +38,7 @@ import { IntuneClient } from "../intune/graph-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, INTUNE_READ, INTUNE_WRITE, INTUNE_ALL_ROLES } from "../utils/roles.js";
-import { metricsMiddleware, metricsHandler } from "../utils/metrics.js";
+import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -129,13 +129,14 @@ const DeviceIdentifierSchema = {
 
 // ─── Server factory ───────────────────────────────────────────────────────────
 
-function createIntuneMcpServer(roles: string[]): McpServer {
+function createIntuneMcpServer(roles: string[], caller: string): McpServer {
     const client = new IntuneClient();
 
     const server = new McpServer({
         name: "intune-mcp-server",
         version: "1.0.0",
     });
+    instrumentToolCalls(server, "intune", caller);
 
     // ── 1. intune_get_device_by_name ─────────────────────────────────────────
     if (hasRole(roles, INTUNE_READ)) {
@@ -1607,7 +1608,8 @@ async function main() {
     app.post("/mcp", async (req: Request, res: Response) => {
         try {
             const roles = req.auth?.extra.roles ?? [];
-            const server = createIntuneMcpServer(roles);
+            const caller = req.auth?.extra.upn ?? req.auth?.clientId ?? "unknown";
+            const server = createIntuneMcpServer(roles, caller);
             const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: undefined, // stateless
             });

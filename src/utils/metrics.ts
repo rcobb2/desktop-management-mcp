@@ -1,5 +1,6 @@
 import client from "prom-client";
 import type { Request, Response, NextFunction } from "express";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 /**
  * Shared Prometheus registry/metrics for both MCP servers (jamf-server.ts,
@@ -54,6 +55,70 @@ export const externalApiErrorsTotal = new client.Counter({
     labelNames: ["target", "method", "status"] as const,
     registers: [register],
 });
+
+// Per-MCP-tool-call metrics — distinct from http_requests_total (which only
+// sees one inbound POST /mcp per call, regardless of which tool it invoked
+// or whether the tool itself succeeded). `caller` identifies who invoked the
+// tool: the Entra token's `upn` when available, else its `clientId`, else the
+// literal "static-token" for the legacy auth path — resolved once per request
+// in jamf-server.ts/intune-server.ts (the only place req.auth is available)
+// and threaded into instrumentToolCalls() below. Duration deliberately omits
+// `caller` to keep histogram cardinality bounded (tool × status is already
+// the useful axis for latency; who called it matters for volume/attribution,
+// not for spotting a slow tool).
+export const mcpToolCallsTotal = new client.Counter({
+    name: "mcp_tool_calls_total",
+    help: "Total number of MCP tool invocations",
+    labelNames: ["server", "tool", "status", "caller"] as const,
+    registers: [register],
+});
+
+export const mcpToolCallDuration = new client.Histogram({
+    name: "mcp_tool_call_duration_seconds",
+    help: "Duration of MCP tool invocations in seconds",
+    labelNames: ["server", "tool", "status"] as const,
+    buckets: [0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5, 10],
+    registers: [register],
+});
+
+/**
+ * Wraps every tool a `McpServer` registers from this point forward with
+ * call-count/duration/success-rate instrumentation, without touching each of
+ * the dozens of individual `registerTool()` call sites in jamf-server.ts /
+ * intune-server.ts. Call this immediately after constructing the server and
+ * before any `registerTool()` calls — both servers build a fresh `McpServer`
+ * per HTTP request (stateless mode), so this also runs fresh per request,
+ * with `caller` resolved from that request's `req.auth`.
+ *
+ * A tool call counts as `status: "error"` either when its handler throws, or
+ * when it returns normally with `isError: true` — every tool here catches its
+ * own errors internally (see errorResult() in both server files) and returns
+ * the latter shape rather than throwing, so both paths matter.
+ */
+export function instrumentToolCalls(server: McpServer, serverLabel: string, caller: string): void {
+    const originalRegisterTool = server.registerTool.bind(server);
+    server.registerTool = ((name: string, config: unknown, handler: (...args: unknown[]) => unknown) => {
+        const wrapped = async (...handlerArgs: unknown[]) => {
+            const start = process.hrtime.bigint();
+            let status = "success";
+            try {
+                const result = await handler(...handlerArgs);
+                if (result && typeof result === "object" && (result as { isError?: boolean }).isError) {
+                    status = "error";
+                }
+                return result;
+            } catch (err) {
+                status = "error";
+                throw err;
+            } finally {
+                const durationSeconds = Number(process.hrtime.bigint() - start) / 1e9;
+                mcpToolCallDuration.observe({ server: serverLabel, tool: name, status }, durationSeconds);
+                mcpToolCallsTotal.inc({ server: serverLabel, tool: name, status, caller });
+            }
+        };
+        return originalRegisterTool(name, config as never, wrapped as never);
+    }) as typeof server.registerTool;
+}
 
 /**
  * Express middleware recording inbound request count/duration. Mount before
