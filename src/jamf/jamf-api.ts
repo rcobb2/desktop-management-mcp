@@ -12,6 +12,32 @@ function escapeRsqlValue(value: string): string {
 }
 
 /**
+ * Pulls a human-readable detail string out of a failed axios call against a
+ * v2 Jamf API endpoint. Those endpoints return `{"errors": [{"code": "...",
+ * "description": "...", ...}]}` on failure (confirmed live — e.g.
+ * `DEVICE_DOES_NOT_EXIST_ON_TOKEN` from computer-prestages scope writes) —
+ * distinct from the Classic API's bare-status-code-no-body failures
+ * elsewhere in this file. Falls back to whatever's available if the body
+ * doesn't match that shape, rather than throwing away detail the caller
+ * hasn't seen before.
+ */
+function extractJamfErrorDetail(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+        const data = error.response?.data as { errors?: Array<{ code?: string; description?: string }>; message?: string } | string | undefined;
+        if (data && typeof data === 'object') {
+            if (Array.isArray(data.errors) && data.errors.length > 0) {
+                return data.errors.map((e) => e.description ?? e.code ?? JSON.stringify(e)).join('; ');
+            }
+            if (data.message) return data.message;
+            return JSON.stringify(data);
+        }
+        if (typeof data === 'string' && data) return data;
+        return `HTTP ${error.response?.status ?? '?'}: ${error.message}`;
+    }
+    return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * Escapes a value for safe use as XML element text content.
  */
 function escapeXml(value: unknown): string {
@@ -22,6 +48,13 @@ function escapeXml(value: unknown): string {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&apos;');
 }
+
+// Matches the legacy/imaging-era auto-generated policy naming pattern observed
+// across this tenant's full policy list (e.g. "2014-05-27 at 1:47 PM |
+// akhazaee | 1 Computer") — timestamp + admin username + computer count, none
+// of which are real Self Service catalog entries. Used to cheaply narrow the
+// ~2,724-policy list without an expensive per-policy detail fetch.
+const JAMF_AUTO_GENERATED_POLICY_NAME = /^\d{4}-\d{2}-\d{2} at \d{1,2}:\d{2} ?(AM|PM) \| .+ \| \d+ Computers?$/i;
 
 // Jamf's Classic API rejects JSON bodies on policy/computer-group POST/PUT with a
 // 415 (confirmed live — only GETs on these endpoints accept the Accept:
@@ -1545,46 +1578,72 @@ export class JamfClient {
     }
 
     // Adds serials to a computer prestage's scope without disturbing existing
-    // assignments. Jamf's scope endpoint replaces the entire scope on write, so
-    // this reads the current scope, merges in only the new serials, and writes
-    // the full list back with the versionLock Jamf requires for optimistic
-    // concurrency. Does NOT remove a serial from any other prestage it may
-    // already be scoped to.
+    // assignments, one serial per POST rather than one PUT with the whole
+    // merged list. Confirmed live (scripts/reassign-prestage-scope.sh in the
+    // DesktopManagementContext repo, built investigating a bulk-unassignment
+    // incident): Jamf's v2 scope endpoint's POST verb adds a single serial
+    // without needing/replacing the full existing list, and validates each
+    // serial independently — unlike PUT (a full-replace), which 400s the
+    // *entire* batch with no per-serial detail if even one serial fails
+    // Jamf's server-side ADE validation (most commonly
+    // `DEVICE_DOES_NOT_EXIST_ON_TOKEN`: the serial's Apple Business Manager
+    // assignment has moved off this MDM server's token, even though the
+    // computer's own Jamf record may still show a past PreStage enrollment —
+    // an ABM-side state, not a Jamf or tool bug). Doing one serial per
+    // request means a bad serial only fails itself instead of blocking every
+    // other, otherwise-valid serial behind it in the same call. Does NOT
+    // remove a serial from any other prestage it may already be scoped to.
     public async assignSerialsToPrestage(prestageNameOrId: string, serialNumbers: string[]) {
         await this.ensureAuthenticated();
         const { id: prestageId, displayName } = await this.resolvePrestage(prestageNameOrId);
         this.logger.info('Assigning serials to prestage', { prestageId, displayName, count: serialNumbers.length });
-        try {
-            const scope = await this.getPrestageScope(prestageId);
-            const existing: string[] = (scope.assignments ?? []).map((a: any) => a.serialNumber);
-            const versionLock = scope.versionLock;
 
-            const normalized = serialNumbers.map((s) => s.trim().toUpperCase()).filter(Boolean);
-            const alreadyScoped = normalized.filter((s) => existing.includes(s));
-            const toAdd = normalized.filter((s) => !existing.includes(s));
+        const scope = await this.getPrestageScope(prestageId);
+        const existing: string[] = (scope.assignments ?? []).map((a: any) => a.serialNumber);
+        let versionLock = scope.versionLock;
 
-            if (toAdd.length === 0) {
-                this.logger.info('No new serials to add', { prestageId });
-                return { success: true, prestageId, prestageName: displayName, added: [], alreadyScoped, totalScoped: existing.length };
-            }
+        const normalized = serialNumbers.map((s) => s.trim().toUpperCase()).filter(Boolean);
+        const alreadyScoped = normalized.filter((s) => existing.includes(s));
+        const toAdd = normalized.filter((s) => !existing.includes(s));
 
-            const merged = [...existing, ...toAdd];
-            const apiStart = Date.now();
-            const response = await this.client.put(`/api/v2/computer-prestages/${prestageId}/scope`, {
-                serialNumbers: merged,
-                versionLock,
-            });
-            logApiCall(this.logger, 'PUT', `/api/v2/computer-prestages/${prestageId}/scope`, response.status, Date.now() - apiStart);
-
-            this.logger.info('Serials assigned to prestage', { prestageId, added: toAdd.length });
-            return { success: true, prestageId, prestageName: displayName, added: toAdd, alreadyScoped, totalScoped: merged.length };
-        } catch (error) {
-            if (axios.isAxiosError(error) && error.response?.status === 403) {
-                throw new Error(`Permission denied (403). The API client may be missing 'Update Prestage Assignments' permissions in JAMF Pro.`);
-            }
-            this.logger.error('Error assigning serials to prestage', { prestageId, error: (error as Error).message });
-            throw error;
+        if (toAdd.length === 0) {
+            this.logger.info('No new serials to add', { prestageId });
+            return { success: true, prestageId, prestageName: displayName, added: [], failed: [], alreadyScoped, totalScoped: existing.length };
         }
+
+        const added: string[] = [];
+        const failed: { serial: string; error: string }[] = [];
+
+        for (const serial of toAdd) {
+            try {
+                const apiStart = Date.now();
+                const response = await this.client.post(`/api/v2/computer-prestages/${prestageId}/scope`, {
+                    serialNumbers: [serial],
+                    versionLock,
+                });
+                logApiCall(this.logger, 'POST', `/api/v2/computer-prestages/${prestageId}/scope`, response.status, Date.now() - apiStart);
+                versionLock = response.data?.versionLock ?? versionLock;
+                added.push(serial);
+            } catch (error) {
+                if (axios.isAxiosError(error) && error.response?.status === 403) {
+                    throw new Error(`Permission denied (403). The API client may be missing 'Update Prestage Assignments' permissions in JAMF Pro.`);
+                }
+                const detail = extractJamfErrorDetail(error);
+                failed.push({ serial, error: detail });
+                this.logger.warn('Serial failed prestage assignment', { prestageId, serial, error: detail });
+            }
+        }
+
+        this.logger.info('Serials assigned to prestage', { prestageId, added: added.length, failed: failed.length });
+        return {
+            success: failed.length === 0,
+            prestageId,
+            prestageName: displayName,
+            added,
+            failed,
+            alreadyScoped,
+            totalScoped: existing.length + added.length,
+        };
     }
 
     public async getStaticComputerGroups() {
@@ -1792,19 +1851,30 @@ export class JamfClient {
         }
     }
 
-    public async getPolicies(name?: string, page?: number, pageSize?: number) {
+    public async getPolicies(name?: string, page?: number, pageSize?: number, options?: { categoryName?: string; excludeAutoGeneratedNames?: boolean }) {
         await this.ensureAuthenticated();
-        this.logger.info('Fetching policies', { name, page, pageSize });
+        this.logger.info('Fetching policies', { name, page, pageSize, options });
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/JSSResource/policies', {
+            // Classic API's /JSSResource/policies/category/{category} filters
+            // server-side, avoiding a full-fleet fetch when the caller already
+            // knows the category — the plain /JSSResource/policies endpoint
+            // returns every policy (id + name only, no other fields) with no
+            // query-param filtering support at all.
+            const endpoint = options?.categoryName
+                ? `/JSSResource/policies/category/${encodeURIComponent(options.categoryName)}`
+                : '/JSSResource/policies';
+            const response = await this.client.get(endpoint, {
                 headers: { Accept: 'application/json' }
             });
-            logApiCall(this.logger, 'GET', '/JSSResource/policies', response.status, Date.now() - apiStart);
+            logApiCall(this.logger, 'GET', endpoint, response.status, Date.now() - apiStart);
             let policies: any[] = response.data.policies ?? [];
             if (name) {
                 const lower = name.toLowerCase();
                 policies = policies.filter((p: any) => p.name?.toLowerCase().includes(lower));
+            }
+            if (options?.excludeAutoGeneratedNames) {
+                policies = policies.filter((p: any) => !JAMF_AUTO_GENERATED_POLICY_NAME.test(p.name ?? ''));
             }
             const start = (page ?? 0) * (pageSize ?? 100);
             const paged = policies.slice(start, start + (pageSize ?? 100));
@@ -1813,6 +1883,9 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Policies' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404 && options?.categoryName) {
+                throw new Error(`No category named "${options.categoryName}" found (or it has no policies) — use jamf_list_categories to see valid names.`);
             }
             this.logger.error('Error fetching policies', { error: (error as Error).message });
             throw error;
@@ -1840,6 +1913,73 @@ export class JamfClient {
             this.logger.error('Error fetching policy detail', { policyId, error: (error as Error).message });
             throw error;
         }
+    }
+
+    // Narrows the full policy list down to real Self Service catalog entries.
+    // The Classic API's bulk /JSSResource/policies list only ever returns
+    // id+name (confirmed — no self_service field, no query-param filter for
+    // it), so there's no way to filter server-side by
+    // `self_service.use_for_self_service` the way categoryName can. This
+    // narrows candidates as cheaply as possible first (optional category
+    // filter via the server-side-filtered endpoint, then the
+    // auto-generated-name exclusion heuristic, both free), then hydrates only
+    // the remaining candidates via getPolicyDetail — capped at
+    // `maxDetailChecks` (default 300) since hydrating the full ~2,724-policy
+    // fleet one-by-one isn't practical as a single tool call. Reports how
+    // many candidates were dropped by the cap rather than silently
+    // truncating, so a caller knows the result may be incomplete.
+    public async listSelfServicePolicies(options?: { categoryName?: string; name?: string; maxDetailChecks?: number }) {
+        await this.ensureAuthenticated();
+        const maxDetailChecks = options?.maxDetailChecks ?? 300;
+        const candidates = await this.getPolicies(options?.name, 0, 100000, {
+            categoryName: options?.categoryName,
+            excludeAutoGeneratedNames: true,
+        });
+        const toCheck = candidates.results.slice(0, maxDetailChecks);
+        const droppedCount = candidates.results.length - toCheck.length;
+
+        this.logger.info('Checking candidates for Self Service status', {
+            totalCandidates: candidates.totalCount,
+            checking: toCheck.length,
+            droppedCount,
+        });
+
+        const matches: Array<{
+            id: number;
+            name: string;
+            categoryName?: string;
+            displayName?: string;
+            hasIcon: boolean;
+            iconFilename?: string;
+        }> = [];
+
+        for (const candidate of toCheck) {
+            let detail: any;
+            try {
+                detail = await this.getPolicyDetail(String(candidate.id));
+            } catch (error) {
+                this.logger.warn('Skipping candidate — detail fetch failed', { id: candidate.id, error: (error as Error).message });
+                continue;
+            }
+            const selfService = detail?.self_service;
+            if (selfService?.use_for_self_service) {
+                matches.push({
+                    id: candidate.id,
+                    name: candidate.name,
+                    categoryName: detail?.general?.category?.name,
+                    displayName: selfService.self_service_display_name,
+                    hasIcon: Boolean(selfService.self_service_icon?.id),
+                    iconFilename: selfService.self_service_icon?.filename,
+                });
+            }
+        }
+
+        return {
+            totalCandidates: candidates.totalCount,
+            checked: toCheck.length,
+            droppedCount,
+            matches,
+        };
     }
 
     // Exact-name match only (like findScriptByName) — getPolicies already supports a
@@ -2154,6 +2294,74 @@ export class JamfClient {
             this.logger.error('Error updating policy scope', { id, error: (error as Error).message });
             throw error;
         }
+    }
+
+    // Uploads a Self Service icon for a policy — confirmed live (2026-07-24,
+    // 8 policies): POST /JSSResource/fileuploads/policies/id/{id} with the
+    // image as a multipart field named `name` (not `file` — Classic API's
+    // fileuploads endpoint uses that field name regardless of what's being
+    // uploaded). Native fetch/FormData rather than axios, matching
+    // uploadPackageFileBuffer's precedent (axios's Node adapter doesn't
+    // cleanly multipart-encode a plain FormData without the extra
+    // `form-data` package). One upload during that session hit the exact
+    // "201 but silently no-op'd" pattern already known from policy
+    // list/scope writes (self_service_icon stayed empty on a follow-up GET
+    // despite the 201) — a short OAuth token TTL was a suspected but
+    // unconfirmed contributing factor. So this always verifies with a GET
+    // after uploading, and retries once (ensureAuthenticated re-runs before
+    // the retry, refreshing the token if it's within 60s of expiry) rather
+    // than trusting the initial response.
+    public async uploadPolicyIcon(policyNameOrId: string, fileContentBase64: string, fileName: string) {
+        await this.ensureAuthenticated();
+        const { id, name } = await this.resolvePolicyId(policyNameOrId);
+        this.logger.info('Uploading Self Service icon', { id, name, fileName });
+
+        const doUpload = async (): Promise<void> => {
+            await this.ensureAuthenticated();
+            const buffer = Buffer.from(fileContentBase64, 'base64');
+            const form = new FormData();
+            form.append('name', new Blob([new Uint8Array(buffer)]), fileName);
+
+            const apiStart = Date.now();
+            const response = await fetch(`${this.jamfUrl}/JSSResource/fileuploads/policies/id/${id}`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${this.token}` },
+                body: form,
+            });
+            logApiCall(this.logger, 'POST', `/JSSResource/fileuploads/policies/id/${id}`, response.status, Date.now() - apiStart);
+            if (response.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing file-upload permissions for Policies in JAMF Pro.`);
+            }
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                throw new Error(`Icon upload failed (${response.status}): ${text}`);
+            }
+        };
+
+        await doUpload();
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        let detail = await this.getPolicyDetail(id);
+        let icon = detail?.self_service?.self_service_icon;
+        let retried = false;
+
+        if (!icon?.id) {
+            retried = true;
+            this.logger.warn('Icon upload returned success but did not stick — retrying once', { id, name });
+            await doUpload();
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+            detail = await this.getPolicyDetail(id);
+            icon = detail?.self_service?.self_service_icon;
+        }
+
+        this.logger.info('Icon upload result', { id, name, success: Boolean(icon?.id), retried });
+        return {
+            success: Boolean(icon?.id),
+            policyId: id,
+            policyName: name,
+            iconId: icon?.id,
+            iconFilename: icon?.filename,
+            retried,
+        };
     }
 
     public async getComputerConfigurationProfiles(name?: string) {
