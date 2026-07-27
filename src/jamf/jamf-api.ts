@@ -1801,6 +1801,9 @@ export class JamfClient {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Send Computer Remote Commands' permissions in JAMF Pro.`);
             }
+            if (axios.isAxiosError(error) && error.response?.status === 401) {
+                throw new Error(`Authentication error (401) sending "${command}": ${extractJamfErrorDetail(error)}`);
+            }
             this.logger.error('Error sending MDM command', { nameOrSerial, command, error: (error as Error).message });
             throw error;
         }
