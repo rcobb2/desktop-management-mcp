@@ -43,7 +43,7 @@ See `bws-secrets.map` for the secret names to create in your BWS project.
 1. **Static bearer token** — `JAMF_MCP_AUTH_TOKEN` / `INTUNE_MCP_AUTH_TOKEN` (comma-separated to allow rotating without downtime). This is the only mechanism available to non-interactive automation (scripts, n8n), and grants that server's full tool set — every tool below, including the destructive ones. Treat this token as equivalent to full admin access to the corresponding backend.
 2. **Entra ID OAuth** (`ENTRA_OAUTH_ENABLED=true`) — a JWT issued by Microsoft Entra ID, verified against Entra's JWKS. Tool visibility is driven by the token's `roles` claim (`Jamf.Read`, `Jamf.Write`, `Intune.Read` — see `src/utils/roles.ts`): a tool a caller's role doesn't grant is never registered on that request's server instance, so it's not just hidden, it's uncallable. This lets real staff authenticate as themselves instead of sharing one all-or-nothing token.
 
-**`jamf_send_mdm_command` is flagged `destructiveHint: true`** and supports `EraseDevice` (irreversible) among other commands; it and the other nine write/mutating JAMF tools (computer/prestage/inventory-preload updates, MDM flush, plus the script/package/smart-group/policy create-and-update tools) are gated behind the `Jamf.Write` role under Entra auth (or the static token, which grants both read and write). Anyone holding a valid `JAMF_MCP_AUTH_TOKEN` can call all of them — the token itself is the access boundary for the automation path.
+The write/mutating JAMF tools (computer/prestage/inventory-preload updates, MDM flush, plus the script/package/smart-group/policy/disk-encryption-config/app-installer create-and-update tools) are gated behind the `Jamf.Write` role under Entra auth (or the static token, which grants both read and write). Anyone holding a valid `JAMF_MCP_AUTH_TOKEN` can call all of them — the token itself is the access boundary for the automation path. (`jamf_send_mdm_command`, the one tool that was flagged `destructiveHint: true`, was retired 2026-07-27 — see `CLAUDE.md` for why.)
 
 In production (podman02), network exposure is layered on top of this: internal-DNS-only hostnames, plus a Caddy IP allowlist. `/mcp`'s bearer-token requirement is the one layer that's actual authentication rather than network-level exposure control, and the one that still holds if the other two are ever misconfigured — see `CLAUDE.md` for the full deployment/defense-in-depth writeup.
 
@@ -200,7 +200,7 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 
 ### JAMF Pro Tools
 
-`jamf_send_mdm_command` is the one tool flagged `destructiveHint: true` (supports `EraseDevice`, irreversible on Apple Silicon without the erasure passcode). It and the other write tools below require the `Jamf.Write` role under Entra auth. `jamf_create_script`/`jamf_upload_package`/`jamf_create_smart_group` are upserts by name (re-running updates the existing object in place); `jamf_create_policy` always creates a new policy; `jamf_update_policy` handles enable/disable + scope widening for an existing one. See `CLAUDE.md` for the Classic-API-requires-XML detail and the known Delete-permission gap (Scripts/Policies/Smart Groups can be created/updated but not deleted by this API client — package deletion does work).
+The write tools below require the `Jamf.Write` role under Entra auth. `jamf_create_script`/`jamf_upload_package`/`jamf_create_smart_group` are upserts by name (re-running updates the existing object in place); `jamf_create_policy` always creates a new policy; `jamf_update_policy` handles enable/disable + scope widening for an existing one. See `CLAUDE.md` for the Classic-API-requires-XML detail, the known Delete-permission gap (Scripts/Policies/Smart Groups can be created/updated but not deleted by this API client — package deletion does work), and why `jamf_send_mdm_command` was retired (infeasible via this API client's OAuth auth, not a per-command privilege gap).
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -227,7 +227,6 @@ Swap in the `http://localhost:<port>/mcp` URLs from the table above for local de
 | `jamf_list_categories` | Categories | `page?`, `pageSize?` |
 | `jamf_list_departments` | Departments | — |
 | `jamf_get_filevault_status` | FileVault encryption status | `computerNameOrSerial` |
-| `jamf_send_mdm_command` | Send an MDM command (`EraseDevice`, `RestartDevice`, `UnlockUserAccount`, etc.) | `computerNameOrSerial`, `command`, `unlockUsername?`, `erasurePasscode?` |
 | `jamf_update_computer` | Update computer inventory fields | `computerNameOrSerial`, `username?`, `realName?`, `emailAddress?`, `department?`, `building?`, `room?`, `assetTag?` |
 | `jamf_flush_mdm_commands` | Flush pending/failed MDM commands | `computerNameOrSerial`, `status?` |
 | `jamf_create_script` | Create/update a script (upsert by name) | `name`, `scriptContents`, `categoryName?`, `info?`, `notes?`, `priority?`, `osRequirements?`, `parameter4?`...`parameter11?` |

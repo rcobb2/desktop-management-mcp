@@ -411,17 +411,6 @@ describe("JamfClient", () => {
     // ── Write operations (skipped unless JAMF_TEST_WRITE=1) ──────────────────
     describe("Write operations", () => {
 
-        skipWrite("send BlankPush MDM command to test computer", async () => {
-            const result = await client.sendComputerMdmCommand(TEST_COMPUTER_SERIAL, "BlankPush");
-            assert.ok(result.success === true);
-            assert.equal(result.command, "BlankPush");
-        });
-
-        skipWrite("trigger inventory update on test computer", async () => {
-            const result = await client.sendComputerMdmCommand(TEST_COMPUTER_SERIAL, "UpdateInventory");
-            assert.ok(result.success === true);
-        });
-
         skipWrite("update computer record and restore original values", async () => {
             // Read current values first
             const before = await client.getComputerBySerial(TEST_COMPUTER_SERIAL);

@@ -1773,42 +1773,6 @@ export class JamfClient {
         }
     }
 
-    public async sendComputerMdmCommand(
-        nameOrSerial: string,
-        command: string,
-        options?: { unlockUsername?: string; erasurePasscode?: string }
-    ) {
-        await this.ensureAuthenticated();
-        this.logger.info('Sending MDM command', { nameOrSerial, command });
-        try {
-            const computerId = await this.resolveComputerId(nameOrSerial);
-            let url = `/JSSResource/computercommands/command/${command}`;
-            if (command === 'UnlockUserAccount' && options?.unlockUsername) {
-                url += `/username/${encodeURIComponent(options.unlockUsername)}`;
-            }
-            url += `/id/${computerId}`;
-
-            const body = command === 'EraseDevice' && options?.erasurePasscode
-                ? { computer_command: { command: { passcode: options.erasurePasscode } } }
-                : null;
-
-            const apiStart = Date.now();
-            const response = await this.client.post(url, body);
-            logApiCall(this.logger, 'POST', url, response.status, Date.now() - apiStart);
-            this.logger.info('MDM command sent successfully', { nameOrSerial, command, computerId });
-            return { success: true, command, computerId };
-        } catch (error) {
-            if (axios.isAxiosError(error) && error.response?.status === 403) {
-                throw new Error(`Permission denied (403). The API client may be missing 'Send Computer Remote Commands' permissions in JAMF Pro.`);
-            }
-            if (axios.isAxiosError(error) && error.response?.status === 401) {
-                throw new Error(`Authentication error (401) sending "${command}": ${extractJamfErrorDetail(error)}`);
-            }
-            this.logger.error('Error sending MDM command', { nameOrSerial, command, error: (error as Error).message });
-            throw error;
-        }
-    }
-
     public async updateComputerRecord(
         nameOrSerial: string,
         updates: {

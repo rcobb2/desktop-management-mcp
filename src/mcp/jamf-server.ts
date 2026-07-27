@@ -806,60 +806,6 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
-    // ── 14. jamf_send_mdm_command ────────────────────────────────────────────
-    if (hasRole(roles, JAMF_WRITE)) {
-        server.registerTool(
-            "jamf_send_mdm_command",
-            {
-                description:
-                    "Send an MDM command to a Mac managed by JAMF Pro. " +
-                    "Accepts the computer name or serial number. " +
-                    "Supported commands: RestartDevice, ShutDownDevice, EraseDevice (IRREVERSIBLE), " +
-                    "EnableRemoteDesktop, DisableRemoteDesktop, UnlockUserAccount, UpdateInventory, " +
-                    "RotateFileVaultKey, BlankPush. " +
-                    "EraseDevice requires erasurePasscode for Apple Silicon Macs. " +
-                    "UnlockUserAccount requires the unlockUsername parameter.",
-                inputSchema: {
-                    computerNameOrSerial: z.string().describe("Computer display name or serial number"),
-                    command: z.enum([
-                        "RestartDevice",
-                        "ShutDownDevice",
-                        "EraseDevice",
-                        "EnableRemoteDesktop",
-                        "DisableRemoteDesktop",
-                        "UnlockUserAccount",
-                        "UpdateInventory",
-                        "RotateFileVaultKey",
-                        "BlankPush",
-                    ]).describe("The MDM command to send"),
-                    unlockUsername: z
-                        .string()
-                        .optional()
-                        .describe("Required for UnlockUserAccount: the local username to unlock"),
-                    erasurePasscode: z
-                        .string()
-                        .optional()
-                        .describe("6-digit passcode for EraseDevice on Apple Silicon Macs"),
-                },
-                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
-            },
-            async ({ computerNameOrSerial, command, unlockUsername, erasurePasscode }) => {
-                try {
-                    assertRole(roles, JAMF_WRITE);
-                    const result = await client.sendComputerMdmCommand(
-                        computerNameOrSerial,
-                        command,
-                        { unlockUsername, erasurePasscode }
-                    );
-                    const text = `MDM command **${command}** sent successfully to computer ID ${result.computerId}.`;
-                    return { content: [{ type: "text", text }] };
-                } catch (err) {
-                    return errorResult(err);
-                }
-            }
-        );
-    }
-
     // ── 15. jamf_update_computer ─────────────────────────────────────────────
     if (hasRole(roles, JAMF_WRITE)) {
         server.registerTool(
