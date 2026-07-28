@@ -2,7 +2,7 @@
   "title": "Desktop Management MCP",
   "uid": "desktop-management-mcp",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 4,
   "editable": true,
   "timezone": "browser",
   "time": {
@@ -34,14 +34,161 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": "label_values(up{job=~\"desktop-mcp-.*\"}, job)",
-        "current": {},
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
         "refresh": 2,
-        "includeAll": false,
-        "multi": false
+        "includeAll": true,
+        "multi": true
       }
     ]
   },
   "panels": [
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "Target up",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "up{job=~\"desktop-mcp-jamf|desktop-mcp-intune|caddy\"}",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "MCP tool call success rate",
+      "description": "Share of MCP tool calls that did NOT error, across all tools/servers selected by the job filter. Complements the per-tool error-rate panel below with a single at-a-glance health number.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "(1 - (sum(rate(mcp_tool_calls_total{job=~\"$job\",status=\"error\"}[30m])) or vector(0)) / sum(rate(mcp_tool_calls_total{job=~\"$job\"}[30m]))) and sum(rate(mcp_tool_calls_total{job=~\"$job\"}[30m])) > 0",
+          "legendFormat": "success rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.95
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "HTTP (jamf-mcp / intune-mcp)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false
+    },
     {
       "id": 1,
       "title": "Request rate by route",
@@ -50,7 +197,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 0
+        "y": 10
       },
       "datasource": {
         "type": "prometheus",
@@ -94,7 +241,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 0
+        "y": 10
       },
       "datasource": {
         "type": "prometheus",
@@ -142,7 +289,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 18
       },
       "datasource": {
         "type": "prometheus",
@@ -202,7 +349,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 18
       },
       "datasource": {
         "type": "prometheus",
@@ -230,6 +377,18 @@
       ]
     },
     {
+      "id": 22,
+      "type": "row",
+      "title": "External APIs (JAMF / Microsoft Graph)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "collapsed": false
+    },
+    {
       "id": 5,
       "title": "External API (Jamf/Graph) request rate by target",
       "type": "timeseries",
@@ -237,7 +396,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 27
       },
       "datasource": {
         "type": "prometheus",
@@ -281,7 +440,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 27
       },
       "datasource": {
         "type": "prometheus",
@@ -319,7 +478,8 @@
           "expr": "sum by (target) (rate(external_api_errors_total{job=~\"$job\"}[5m]))",
           "legendFormat": "{{target}}"
         }
-      ]
+      ],
+      "description": "external_api_errors_total is only incremented on some error paths today (graph-api.ts covers several but not all; jamf-api.ts's catch blocks mostly don't call logApiCall with an error argument yet \u2014 see CLAUDE.md's Metrics section). An empty graph here does NOT mean zero external API errors; check logs and the JAMF/Intune 5xx behavior directly until this instrumentation gap is closed."
     },
     {
       "id": 7,
@@ -329,7 +489,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 35
       },
       "datasource": {
         "type": "prometheus",
@@ -366,14 +526,26 @@
       ]
     },
     {
+      "id": 23,
+      "type": "row",
+      "title": "Process health",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "collapsed": false
+    },
+    {
       "id": 8,
       "title": "Process memory (RSS)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 24
+        "w": 12,
+        "x": 0,
+        "y": 44
       },
       "datasource": {
         "type": "prometheus",
@@ -405,9 +577,9 @@
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 24
+        "w": 12,
+        "x": 12,
+        "y": 44
       },
       "datasource": {
         "type": "prometheus",
@@ -434,261 +606,16 @@
       ]
     },
     {
-      "id": 10,
-      "title": "Target up",
-      "type": "stat",
+      "id": 24,
+      "type": "row",
+      "title": "MCP tool calls",
       "gridPos": {
-        "h": 4,
+        "h": 1,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 52
       },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "DOWN",
-                  "color": "red"
-                },
-                "1": {
-                  "text": "UP",
-                  "color": "green"
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "textMode": "value_and_name"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "up{job=~\"desktop-mcp-jamf|desktop-mcp-intune|caddy\"}",
-          "legendFormat": "{{job}}"
-        }
-      ]
-    },
-    {
-      "id": 11,
-      "title": "Caddy request rate by status code",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 36
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "sum by (code) (rate(caddy_http_requests_total[5m]))",
-          "legendFormat": "{{code}}"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "title": "Caddy error rate (4xx/5xx)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 36
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "fillOpacity": 10,
-            "showPoints": "never"
-          },
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "red"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "sum by (code) (rate(caddy_http_requests_total{code=~\"4..|5..\"}[5m]))",
-          "legendFormat": "{{code}}"
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "title": "Caddy request latency (p50 / p95 / p99)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 44
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "fillOpacity": 5,
-            "showPoints": "never"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p50"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p99"
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "title": "Caddy requests in flight",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 44
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "caddy_http_requests_in_flight",
-          "legendFormat": "{{server}}"
-        }
-      ]
+      "collapsed": false
     },
     {
       "id": 15,
@@ -698,7 +625,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 53
       },
       "datasource": {
         "type": "prometheus",
@@ -742,7 +669,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 53
       },
       "datasource": {
         "type": "prometheus",
@@ -790,7 +717,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 60
+        "y": 61
       },
       "datasource": {
         "type": "prometheus",
@@ -825,7 +752,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 60
+        "y": 61
       },
       "datasource": {
         "type": "prometheus",
@@ -833,7 +760,8 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "decimals": 0
         },
         "overrides": []
       },
@@ -849,6 +777,220 @@
           },
           "expr": "sum by (caller) (increase(mcp_tool_calls_total{job=~\"$job\"}[1h]))",
           "legendFormat": "{{caller}}"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Caddy (shared instance \u2014 see panel descriptions)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 11,
+          "title": "Caddy request rate by status code",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "sum by (code) (rate(caddy_http_requests_total[5m]))",
+              "legendFormat": "{{code}}"
+            }
+          ],
+          "description": "This Caddy instance is shared across multiple apps on podman02 (jamf-mcp, intune-mcp, jamf-prestage-tool, logdeck, open-artifact, ...). Caddy's Prometheus metrics carry no per-site/per-host label (confirmed live \u2014 only `handler` and `server`, Caddy's internal server-block name), so these panels reflect ALL traffic through this Caddy instance, not just Desktop Management MCP."
+        },
+        {
+          "id": 12,
+          "title": "Caddy error rate (4xx/5xx)",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never"
+              },
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "red"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "sum by (code) (rate(caddy_http_requests_total{code=~\"4..|5..\"}[5m]))",
+              "legendFormat": "{{code}}"
+            }
+          ],
+          "description": "This Caddy instance is shared across multiple apps on podman02 (jamf-mcp, intune-mcp, jamf-prestage-tool, logdeck, open-artifact, ...). Caddy's Prometheus metrics carry no per-site/per-host label (confirmed live \u2014 only `handler` and `server`, Caddy's internal server-block name), so these panels reflect ALL traffic through this Caddy instance, not just Desktop Management MCP."
+        },
+        {
+          "id": 13,
+          "title": "Caddy request latency (p50 / p95 / p99)",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p99"
+            }
+          ],
+          "description": "This Caddy instance is shared across multiple apps on podman02 (jamf-mcp, intune-mcp, jamf-prestage-tool, logdeck, open-artifact, ...). Caddy's Prometheus metrics carry no per-site/per-host label (confirmed live \u2014 only `handler` and `server`, Caddy's internal server-block name), so these panels reflect ALL traffic through this Caddy instance, not just Desktop Management MCP."
+        },
+        {
+          "id": 14,
+          "title": "Caddy requests in flight",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "caddy_http_requests_in_flight",
+              "legendFormat": "{{server}}"
+            }
+          ],
+          "description": "This Caddy instance is shared across multiple apps on podman02 (jamf-mcp, intune-mcp, jamf-prestage-tool, logdeck, open-artifact, ...). Caddy's Prometheus metrics carry no per-site/per-host label (confirmed live \u2014 only `handler` and `server`, Caddy's internal server-block name), so these panels reflect ALL traffic through this Caddy instance, not just Desktop Management MCP."
         }
       ]
     }
