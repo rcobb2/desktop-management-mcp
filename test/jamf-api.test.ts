@@ -238,6 +238,68 @@ describe("JamfClient", () => {
         });
     });
 
+    // ── Computer policy logs ──────────────────────────────────────────────────
+    describe("Computer policy logs", () => {
+
+        test("get computer policy logs returns entries sorted most-recent-first", async () => {
+            const data = await client.getComputerPolicyLogs(TEST_COMPUTER_NAME, { limit: 10 });
+            assert.ok(Array.isArray(data.logs), "logs should be an array");
+            assert.ok(data.summary.totalLogs >= data.logs.length, "totalLogs should be >= returned logs");
+            for (let i = 1; i < data.logs.length; i++) {
+                assert.ok(
+                    (data.logs[i - 1].date_completed_epoch ?? 0) >= (data.logs[i].date_completed_epoch ?? 0),
+                    "logs should be sorted by date_completed_epoch descending"
+                );
+            }
+        });
+
+        test("get computer policy logs filtered by status narrows results", async () => {
+            const all = await client.getComputerPolicyLogs(TEST_COMPUTER_NAME, { limit: 50 });
+            if (all.logs.length === 0) return;
+            const status = all.logs[0].status;
+            const filtered = await client.getComputerPolicyLogs(TEST_COMPUTER_NAME, { status, limit: 50 });
+            assert.ok(filtered.logs.every((l: any) => l.status === status), "all results should match the status filter");
+        });
+
+        test("get computer policy logs throws for unknown computer", async () => {
+            await assert.rejects(
+                () => client.getComputerPolicyLogs("zzz-definitely-not-a-real-computer-name"),
+                /not found/i
+            );
+        });
+    });
+
+    // ── Policy fleet status ───────────────────────────────────────────────────
+    describe("Policy fleet status", () => {
+
+        test("get policy fleet status caps checked computers and reports droppedCount", async (t: any) => {
+            const fixtureName = process.env.TEST_POLICY_NAME;
+            if (!fixtureName) {
+                t.skip("set TEST_POLICY_NAME to a policy name that already exists in JAMF Pro to exercise this test");
+                return;
+            }
+            const data: any = await client.getPolicyFleetStatus(fixtureName, { maxComputers: 3 });
+            if (data.allComputers) {
+                assert.equal(data.computers.length, 0, "an All Computers policy should refuse to enumerate");
+                return;
+            }
+            assert.ok(data.summary.checked <= 3, "checked should respect maxComputers");
+            assert.equal(data.summary.checked, data.computers.length, "checked count should match returned computers");
+            assert.equal(
+                data.summary.totalTargeted - data.summary.checked,
+                data.summary.droppedCount,
+                "droppedCount should account for the remainder"
+            );
+        });
+
+        test("get policy fleet status throws for unknown policy", async () => {
+            await assert.rejects(
+                () => client.getPolicyFleetStatus("zzz-definitely-not-a-real-policy-name"),
+                /not found/i
+            );
+        });
+    });
+
     // ── Configuration profiles ────────────────────────────────────────────────
     describe("Configuration profiles", () => {
 
@@ -302,6 +364,36 @@ describe("JamfClient", () => {
             if (packages.length > 0) {
                 assert.ok(packages[0].id !== undefined, "package should have an id");
             }
+        });
+
+        // Regression test: getPackages/getScripts used to fetch only the caller's
+        // requested page before filtering by name, silently missing matches that sat
+        // beyond that page — confirmed live with a real tenant's 110-package catalog
+        // and the tool's default page-size of 100.
+        test("list packages filtered by name finds matches beyond the first default-size page", async () => {
+            const all = await client.getPackages(undefined, 0, 200);
+            const packages: any[] = (all as any).results ?? [];
+            if (packages.length < 101) return;
+            const target = packages[100];
+            const filtered = await client.getPackages(target.packageName, 0, 100);
+            const filteredPackages: any[] = (filtered as any).results ?? [];
+            assert.ok(
+                filteredPackages.some((p: any) => p.id === target.id),
+                "name search should find packages beyond the first default-size page"
+            );
+        });
+
+        test("list scripts filtered by name finds matches beyond the first default-size page", async () => {
+            const all = await client.getScripts(undefined, 0, 200);
+            const scripts: any[] = (all as any).results ?? [];
+            if (scripts.length < 101) return;
+            const target = scripts[100];
+            const filtered = await client.getScripts(target.name, 0, 100);
+            const filteredScripts: any[] = (filtered as any).results ?? [];
+            assert.ok(
+                filteredScripts.some((s: any) => s.id === target.id),
+                "name search should find scripts beyond the first default-size page"
+            );
         });
     });
 

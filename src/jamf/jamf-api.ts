@@ -644,6 +644,38 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Fetching JAMF scripts', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100 });
         try {
+            if (name) {
+                // Same fix as getPackages: the API has no server-side name filter, so
+                // filtering only the caller's requested page silently missed matches
+                // sitting on other pages. Page through the whole catalog first, then
+                // filter, then paginate the filtered set.
+                const FETCH_PAGE_SIZE = 200;
+                const MAX_PAGES = 20; // 20 * 200 = 4k scripts — far above any real tenant size here
+                const all: any[] = [];
+                let fetchPage = 0;
+                let totalCount = 0;
+                while (fetchPage < MAX_PAGES) {
+                    const apiStart = Date.now();
+                    const response = await this.client.get('/api/v1/scripts', {
+                        params: { page: fetchPage, 'page-size': FETCH_PAGE_SIZE }
+                    });
+                    logApiCall(this.logger, 'GET', '/api/v1/scripts', response.status, Date.now() - apiStart);
+                    const pageResults: any[] = response.data.results ?? [];
+                    totalCount = response.data.totalCount ?? totalCount;
+                    all.push(...pageResults);
+                    if (pageResults.length === 0 || all.length >= totalCount) break;
+                    fetchPage++;
+                }
+                const nameLower = name.toLowerCase();
+                const filtered = all.filter((script: any) =>
+                    script.name && script.name.toLowerCase().includes(nameLower)
+                );
+                const start = (page || 0) * (pageSize || 100);
+                const paged = filtered.slice(start, start + (pageSize || 100));
+                this.logger.info('Scripts retrieved successfully', { name, page: page || 0, pageSize: pageSize || 100, filteredCount: filtered.length });
+                return { totalCount: filtered.length, results: paged };
+            }
+
             const params: any = {
                 page: page || 0,
                 'page-size': pageSize || 100
@@ -652,23 +684,8 @@ export class JamfClient {
             const response = await this.client.get('/api/v1/scripts', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/scripts', response.status, apiDuration);
-
-            // Client-side filtering by name if provided (case-insensitive substring match).
-            // The real v1 response's array is under `results`, not `scripts` — reading the
-            // latter silently produced an always-empty filtered list (confirmed live).
-            let scripts = response.data.results || [];
-            if (name) {
-                const nameLower = name.toLowerCase();
-                scripts = scripts.filter((script: any) =>
-                    script.name && script.name.toLowerCase().includes(nameLower)
-                );
-            }
-
-            this.logger.info('Scripts retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: scripts.length, totalInPage: response.data.results?.length || 0 });
-            return {
-                ...response.data,
-                results: scripts
-            };
+            this.logger.info('Scripts retrieved successfully', { name: '(all)', page: page || 0, pageSize: pageSize || 100, totalInPage: response.data.results?.length || 0 });
+            return response.data;
         } catch (error) {
             if (axios.isAxiosError(error)) {
                 if (error.response?.status === 403) {
@@ -689,6 +706,40 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Fetching JAMF packages', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100 });
         try {
+            if (name) {
+                // The API has no server-side name filter, and filtering only the caller's
+                // requested page silently missed matches sitting elsewhere in the full
+                // catalog — confirmed live: with the default page-size (100), a 110th
+                // package was invisible to every name search regardless of substring.
+                // Page through the whole catalog first (same fix already applied to
+                // getSmartComputerGroups), then filter, then paginate the filtered set.
+                const FETCH_PAGE_SIZE = 200;
+                const MAX_PAGES = 20; // 20 * 200 = 4k packages — far above any real tenant size here
+                const all: any[] = [];
+                let fetchPage = 0;
+                let totalCount = 0;
+                while (fetchPage < MAX_PAGES) {
+                    const apiStart = Date.now();
+                    const response = await this.client.get('/api/v1/packages', {
+                        params: { page: fetchPage, 'page-size': FETCH_PAGE_SIZE }
+                    });
+                    logApiCall(this.logger, 'GET', '/api/v1/packages', response.status, Date.now() - apiStart);
+                    const pageResults: any[] = response.data.results ?? [];
+                    totalCount = response.data.totalCount ?? totalCount;
+                    all.push(...pageResults);
+                    if (pageResults.length === 0 || all.length >= totalCount) break;
+                    fetchPage++;
+                }
+                const nameLower = name.toLowerCase();
+                const filtered = all.filter((pkg: any) =>
+                    pkg.packageName && pkg.packageName.toLowerCase().includes(nameLower)
+                );
+                const start = (page || 0) * (pageSize || 100);
+                const paged = filtered.slice(start, start + (pageSize || 100));
+                this.logger.info('Packages retrieved successfully', { name, page: page || 0, pageSize: pageSize || 100, filteredCount: filtered.length });
+                return { totalCount: filtered.length, results: paged };
+            }
+
             const params: any = {
                 page: page || 0,
                 'page-size': pageSize || 100
@@ -697,23 +748,8 @@ export class JamfClient {
             const response = await this.client.get('/api/v1/packages', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/packages', response.status, apiDuration);
-
-            // Client-side filtering by name if provided (case-insensitive substring match).
-            // The real v1 response's array is under `results`, not `packages` — reading the
-            // latter silently produced an always-empty filtered list (confirmed live).
-            let packages = response.data.results || [];
-            if (name) {
-                const nameLower = name.toLowerCase();
-                packages = packages.filter((pkg: any) =>
-                    pkg.packageName && pkg.packageName.toLowerCase().includes(nameLower)
-                );
-            }
-
-            this.logger.info('Packages retrieved successfully', { name: name || '(all)', page: page || 0, pageSize: pageSize || 100, filteredCount: packages.length, totalInPage: response.data.results?.length || 0 });
-            return {
-                ...response.data,
-                results: packages
-            };
+            this.logger.info('Packages retrieved successfully', { name: '(all)', page: page || 0, pageSize: pageSize || 100, totalInPage: response.data.results?.length || 0 });
+            return response.data;
         } catch (error) {
             if (axios.isAxiosError(error)) {
                 if (error.response?.status === 403) {
@@ -1882,6 +1918,202 @@ export class JamfClient {
         }
     }
 
+    /**
+     * Get policy execution history for a single computer — JAMF Pro's computer History >
+     * Policy Logs view. Classic-API-only (no v1/v3 equivalent), via the `Policy_Logs` subset of
+     * `/JSSResource/computerhistory` — confirmed live that this subset name (with underscore)
+     * correctly narrows the response to just `policy_logs` (an invalid subset silently returns an
+     * empty object rather than erroring, so the subset name matters). Results come back from JAMF
+     * in an arbitrary (not date-sorted) order — confirmed live against a real computer with 71
+     * entries — so this always sorts by `date_completed_epoch` descending before returning.
+     * Extracted as `fetchPolicyLogsForComputerId` so getPolicyFleetStatus can reuse the same
+     * fetch/sort/filter logic against computer IDs it already has from scope resolution, without
+     * paying for `resolveComputerId`'s extra name/serial lookup round-trip per computer.
+     */
+    private async fetchPolicyLogsForComputerId(
+        computerId: string,
+        options?: { policyId?: string | number; policyName?: string; status?: string; limit?: number }
+    ) {
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(
+                `/JSSResource/computerhistory/id/${computerId}/subset/Policy_Logs`,
+                { headers: { Accept: 'application/json' } }
+            );
+            logApiCall(this.logger, 'GET', `/JSSResource/computerhistory/id/${computerId}/subset/Policy_Logs`, response.status, Date.now() - apiStart);
+
+            const allLogs: any[] = response.data.computer_history?.policy_logs ?? [];
+            const sorted = [...allLogs].sort((a, b) => (b.date_completed_epoch ?? 0) - (a.date_completed_epoch ?? 0));
+
+            const policyId = options?.policyId !== undefined ? String(options.policyId) : undefined;
+            const policyName = options?.policyName?.trim().toLowerCase();
+            const status = options?.status?.trim().toLowerCase();
+            let filtered = sorted;
+            if (policyId !== undefined) {
+                filtered = filtered.filter((l: any) => String(l.policy_id) === policyId);
+            }
+            if (policyName) {
+                filtered = filtered.filter((l: any) => String(l.policy_name || '').toLowerCase().includes(policyName));
+            }
+            if (status) {
+                filtered = filtered.filter((l: any) => String(l.status || '').toLowerCase() === status);
+            }
+
+            const limit = options?.limit ?? 100;
+            const limited = filtered.slice(0, limit);
+
+            return {
+                computerId,
+                logs: limited,
+                summary: {
+                    totalLogs: allLogs.length,
+                    filteredLogs: filtered.length,
+                    returnedLogs: limited.length,
+                    truncated: filtered.length > limited.length
+                }
+            };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read' permissions for Computer History in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Computer with ID ${computerId} not found.`);
+            }
+            this.logger.error('Error fetching computer policy logs', { computerId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    public async getComputerPolicyLogs(
+        computerNameOrSerial: string,
+        options?: { policyName?: string; status?: string; limit?: number }
+    ) {
+        await this.ensureAuthenticated();
+        const computerId = await this.resolveComputerId(computerNameOrSerial);
+        this.logger.info('Fetching computer policy logs', { computerNameOrSerial, computerId });
+        const result = await this.fetchPolicyLogsForComputerId(computerId, options);
+        this.logger.info('Computer policy logs retrieved', {
+            computerId, totalLogs: result.summary.totalLogs, filteredLogs: result.summary.filteredLogs, returnedLogs: result.summary.returnedLogs
+        });
+        return result;
+    }
+
+    /**
+     * Get fleet-wide rollout status for a single policy: resolves its scope (direct computers plus
+     * computer groups, minus exclusions), then checks each scoped computer's policy history for its
+     * most recent run of this specific policy. Answers "is this policy actually rolling out /
+     * failing broadly?" — the harder question `jamf_get_policy` (scope definition) and
+     * `jamf_get_computer_policy_logs` (single computer) can't answer alone.
+     *
+     * `scope.limitations` (network segments, LDAP users/groups) are NOT resolved — those narrow
+     * scope in ways this method can't cheaply cross-reference (they gate on session context, not a
+     * static computer list), so a computer matched via computers/computer_groups may still be
+     * excluded by a limitation in ways this result won't reflect. Known simplification, not a bug.
+     *
+     * Group membership is resolved via `getSmartGroupDetail`, which — confirmed live — embeds the
+     * current `computers` array in its Classic API response for BOTH smart and static groups (the
+     * same call already used for `jamf_get_smart_group`), so no separate static-group-membership
+     * method is needed.
+     *
+     * Scoped-to-"All Computers" policies are refused rather than enumerated — checking history for
+     * the entire fleet one-by-one isn't practical as a single call. Sequential (not parallel)
+     * per-computer history fetches, matching `listSelfServicePolicies`'s existing convention of not
+     * hammering JAMF with concurrent requests; `maxComputers` (default 100) caps how many are
+     * checked, with `droppedCount` reporting how many scoped computers were left unchecked rather
+     * than silently truncating.
+     */
+    public async getPolicyFleetStatus(policyIdentifier: string, options?: { maxComputers?: number }) {
+        await this.ensureAuthenticated();
+        const { id: policyId, name: policyName } = await this.resolvePolicyId(policyIdentifier);
+        this.logger.info('Fetching policy fleet status', { policyId, policyName });
+
+        const policy = await this.getPolicyDetail(policyId);
+        const scope = policy.scope ?? {};
+
+        if (scope.all_computers) {
+            return {
+                policyId,
+                policyName,
+                allComputers: true,
+                computers: [],
+                summary: { totalTargeted: 0, checked: 0, droppedCount: 0, byStatus: {} },
+                note: 'This policy is scoped to All Computers — checking every computer\'s history individually isn\'t practical as a single call. Narrow the policy\'s scope, or check specific computers via jamf_get_computer_policy_logs.'
+            };
+        }
+
+        const targets = new Map<number, { id: number; name: string; serial: string | null }>();
+        const addComputer = (c: any) => {
+            if (c?.id !== undefined) targets.set(c.id, { id: c.id, name: c.name, serial: c.serial_number ?? null });
+        };
+        const addGroup = async (g: any) => {
+            const detail = await this.getSmartGroupDetail(String(g.id));
+            for (const c of detail.computers ?? []) addComputer(c);
+        };
+
+        for (const c of scope.computers ?? []) addComputer(c);
+        for (const g of scope.computer_groups ?? []) await addGroup(g);
+
+        const exclusions = scope.exclusions ?? {};
+        for (const c of exclusions.computers ?? []) targets.delete(c.id);
+        for (const g of exclusions.computer_groups ?? []) {
+            const detail = await this.getSmartGroupDetail(String(g.id));
+            for (const c of detail.computers ?? []) targets.delete(c.id);
+        }
+
+        const allTargets = Array.from(targets.values());
+        const maxComputers = options?.maxComputers ?? 100;
+        const toCheck = allTargets.slice(0, maxComputers);
+        const droppedCount = allTargets.length - toCheck.length;
+
+        this.logger.info('Checking scoped computers for policy fleet status', {
+            policyId, totalTargeted: allTargets.length, checking: toCheck.length, droppedCount
+        });
+
+        const results: any[] = [];
+        for (const target of toCheck) {
+            try {
+                const logResult = await this.fetchPolicyLogsForComputerId(String(target.id), { policyId, limit: 1 });
+                const latest = logResult.logs[0];
+                results.push({
+                    id: target.id,
+                    name: target.name,
+                    serial: target.serial,
+                    status: latest?.status ?? 'Never run',
+                    lastRun: latest?.date_completed ?? null
+                });
+            } catch (error) {
+                results.push({
+                    id: target.id,
+                    name: target.name,
+                    serial: target.serial,
+                    status: 'Error',
+                    lastRun: null,
+                    error: (error as Error).message
+                });
+            }
+        }
+
+        const byStatus: Record<string, number> = {};
+        for (const r of results) {
+            byStatus[r.status] = (byStatus[r.status] ?? 0) + 1;
+        }
+
+        this.logger.info('Policy fleet status retrieved', { policyId, checked: results.length, byStatus });
+
+        return {
+            policyId,
+            policyName,
+            allComputers: false,
+            computers: results,
+            summary: {
+                totalTargeted: allTargets.length,
+                checked: toCheck.length,
+                droppedCount,
+                byStatus
+            }
+        };
+    }
+
     // Narrows the full policy list down to real Self Service catalog entries.
     // The Classic API's bulk /JSSResource/policies list only ever returns
     // id+name (confirmed — no self_service field, no query-param filter for
@@ -2259,6 +2491,60 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating policy scope', { id, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Adds/removes scripts on an EXISTING policy without touching anything else —
+    // there was no safe way to do this before: jamf_update_policy deliberately never
+    // touches scripts, and upsertPolicy reconstructs the ENTIRE policy from whatever
+    // params are passed, silently resetting scope/triggers/frequency/etc. to defaults
+    // for any field the caller doesn't re-specify (fine for its own upsert-by-name use
+    // case, unsafe for "just add one script to an existing policy"). Mirrors
+    // updatePolicyScope exactly: read current, merge only `scripts`, PUT back that one
+    // section alone — never the full policy object (same `printers`-409 reasoning).
+    // NOT YET CONFIRMED LIVE (unlike updatePolicyScope) — built by direct analogy
+    // to it since the Classic API's policy.scripts write shape is otherwise identical
+    // to what upsertPolicy already sends successfully; verify against a low-risk
+    // policy before relying on it in an incident.
+    public async updatePolicyScripts(nameOrId: string, changes: {
+        addScripts?: { name: string; priority?: 'Before' | 'After'; parameter4?: string }[];
+        removeScriptNames?: string[];
+    }) {
+        await this.ensureAuthenticated();
+        const { id, name } = await this.resolvePolicyId(nameOrId);
+        this.logger.info('Updating policy scripts', { id, name, changes });
+        try {
+            const current = await this.getPolicyDetail(id);
+            const existingScripts: any[] = Array.isArray(current.scripts) ? current.scripts : [];
+
+            const toAdd = await Promise.all((changes.addScripts ?? []).map(async (s) => {
+                const found = await this.findScriptByName(s.name);
+                if (!found) throw new Error(`Script not found: "${s.name}"`);
+                return { id: String(found.id), name: found.name, priority: s.priority ?? 'After', parameter4: s.parameter4 };
+            }));
+
+            const removeLower = new Set((changes.removeScriptNames ?? []).map((n) => n.toLowerCase()));
+            const addIds = new Set(toAdd.map((s) => s.id));
+            const kept = existingScripts.filter((s: any) =>
+                !removeLower.has(String(s.name).toLowerCase()) && !addIds.has(String(s.id))
+            );
+            const mergedScripts = [...kept, ...toAdd];
+
+            const sectionXml = buildXmlDocument('policy', { scripts: mergedScripts });
+            const apiStart = Date.now();
+            const response = await this.client.put(`/JSSResource/policies/id/${id}`, sectionXml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (scripts)`, response.status, Date.now() - apiStart);
+
+            this.logger.info('Policy scripts updated', { id, name, scripts: mergedScripts.map((s: any) => s.name) });
+            return { success: true, id, name, scripts: mergedScripts.map((s: any) => ({ name: s.name, priority: s.priority })) };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Update Policies' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error updating policy scripts', { id, error: (error as Error).message });
             throw error;
         }
     }
@@ -2658,6 +2944,51 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Categories' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching categories', { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Flush a policy's execution history, making it eligible to run again on every computer in its
+     * scope — needed for a "once per computer" frequency policy that already ran (successfully or
+     * not) and needs to retry, e.g. after fixing a broken package. Flushes ALL computers' history
+     * for the policy, not just one — there's no reliable way to scope a flush to a single policy +
+     * single computer combination via the Classic API's `/JSSResource/logflush` resource (the
+     * alternative XML-body form takes both a `log_id` and a `<computers>` list, but its `log_id`
+     * filter is reported to be ignored when a computers list is also given, silently flushing that
+     * computer's history for every policy instead of just the one requested — not worth the risk of
+     * wiping unrelated policy history to avoid it). This uses the plain per-policy path instead,
+     * which only takes an interval.
+     *
+     * Confirmed live (2026-07-28) against policy 3381 ("BeyondTrust Jump Client - Bernstein (Mac)",
+     * scoped to 8 computers via the "Classrooms - Bernstein" smart group): the `interval` value
+     * `"Zero Day"` is accepted as-is (no URL-encoding surprises beyond the space), the endpoint
+     * returns `201` on success (not `204`), and a before/after check on 5 sampled scoped computers'
+     * policy logs (via getComputerPolicyLogs) went from 1 log entry each for this policy to 0 —
+     * confirming the flush actually took effect, not just that the call returned success.
+     */
+    public async flushPolicyLogs(policyNameOrId: string, interval: string = 'Zero Day') {
+        await this.ensureAuthenticated();
+        this.logger.info('Flushing policy logs', { policyNameOrId, interval });
+        try {
+            const { id: policyId, name: policyName } = await this.resolvePolicyId(policyNameOrId);
+            const apiStart = Date.now();
+            const response = await this.client.delete(
+                `/JSSResource/logflush/policy/id/${policyId}/interval/${encodeURIComponent(interval)}`
+            );
+            logApiCall(this.logger, 'DELETE', `/JSSResource/logflush/policy/id/${policyId}/interval/${interval}`, response.status, Date.now() - apiStart);
+            this.logger.info('Policy logs flushed', { policyId, policyName, interval });
+            return { success: true, policyId, policyName, interval };
+        } catch (error) {
+            if (axios.isAxiosError(error)) {
+                if (error.response?.status === 403) {
+                    throw new Error(`Permission denied (403). The API client may be missing 'Flush Policy Logs' permissions in JAMF Pro.`);
+                }
+                if (error.response?.status === 404) {
+                    throw new Error(`Log flush endpoint rejected the request (404) for policy "${policyNameOrId}" — the endpoint path or interval value may be wrong.`);
+                }
+            }
+            this.logger.error('Error flushing policy logs', { policyNameOrId, interval, error: (error as Error).message });
             throw error;
         }
     }

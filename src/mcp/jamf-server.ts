@@ -1288,6 +1288,44 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 22b. jamf_flush_policy_logs ───────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_flush_policy_logs",
+            {
+                description:
+                    "Flush a policy's execution history in JAMF Pro, making it eligible to run again on every " +
+                    "computer in its scope — needed for a 'once per computer' frequency policy that already ran " +
+                    "(successfully or not) and needs to retry, e.g. after fixing a broken package. " +
+                    "WARNING: this deletes history for ALL computers in the policy's scope, not just one, and " +
+                    "cannot be undone — there's no reliable way to scope a flush to a single policy + single " +
+                    "computer combination via JAMF's Classic API. Double-check the policy before calling this. " +
+                    "Confirmed live with interval=\"Zero Day\" (verified via before/after computer policy log " +
+                    "checks); the other interval values are accepted by the same endpoint per JAMF's Classic API " +
+                    "but have not themselves been exercised live. Accepts a policy name or numeric ID.",
+                inputSchema: {
+                    policyNameOrId: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
+                    interval: z
+                        .enum(["Zero Day", "One Day Away", "One Week Away", "One Month Away", "Three Months Away", "Six Months Away", "One Year Away"])
+                        .default("Zero Day")
+                        .describe('How far back to flush. "Zero Day" (default, confirmed live) flushes all history immediately. Other values not yet confirmed live.'),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+            },
+            async ({ policyNameOrId, interval = "Zero Day" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.flushPolicyLogs(policyNameOrId, interval);
+                    const text = `Successfully flushed logs for policy **${result.policyName}** (ID: ${result.policyId}), interval "${interval}". ` +
+                        `It's now eligible to run again on every computer in its scope.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 23. jamf_get_filevault_status ────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(
@@ -1798,6 +1836,51 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                         `- **Target groups:** ${result.targetGroups.join(", ") || "none"}`,
                         `- **Exclusion groups:** ${result.exclusionGroups.join(", ") || "none"}`,
                     ].join("\n"));
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 29a2. jamf_update_policy_scripts ─────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_update_policy_scripts",
+            {
+                description:
+                    "Add or remove scripts on an existing JAMF Pro policy without touching anything else about " +
+                    "it (scope, triggers, frequency, packages, Self Service). Unlike jamf_update_policy (which " +
+                    "deliberately never touches scripts) or a naive re-upsert (which resets every other field to " +
+                    "a default unless re-specified), this reads the policy's current script list, merges in just " +
+                    "the requested add/remove, and writes back only the scripts section. Useful for e.g. attaching " +
+                    "a pre-install cleanup script ahead of a package install (priority \"Before\").",
+                inputSchema: {
+                    policy: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
+                    addScripts: z
+                        .array(z.object({
+                            name: z.string().describe("Script name — use jamf_list_scripts to find one"),
+                            priority: z.enum(["Before", "After"]).default("After").describe("Run before or after package installs"),
+                            parameter4: z.string().optional().describe("Value for the script's parameter 4 (Jamf reserves 1-3), if it takes one"),
+                        }))
+                        .default([])
+                        .describe("Scripts to add. If a script with the same name is already on the policy, it's replaced (not duplicated)."),
+                    removeScriptNames: z.array(z.string()).default([]).describe("Script names to remove from the policy"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ policy, addScripts = [], removeScriptNames = [], response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.updatePolicyScripts(policy, { addScripts, removeScriptNames });
+                    const text = toText(result, response_format, () =>
+                        `## Policy **${result.name}** scripts updated\n\n` +
+                        (result.scripts.length
+                            ? result.scripts.map((s: any) => `- **${s.name}** (${s.priority})`).join("\n")
+                            : "_No scripts attached._")
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);
@@ -2327,6 +2410,116 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     const text = toText(result, response_format, () =>
                         `Updated app installer deployment **${result.name}** (ID ${result.id}).`
                     );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 41. jamf_get_computer_policy_logs ────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_computer_policy_logs",
+            {
+                description:
+                    "Get policy execution history for a single computer — JAMF Pro's computer History > Policy Logs " +
+                    "view. Shows every policy that's run on this machine: policy name/ID, status (Completed/Failed/" +
+                    "Pending), the user it ran as (if any), and completion time. Sorted most-recent-first. " +
+                    "Useful for troubleshooting \"did policy X actually run on this machine, and did it succeed?\"",
+                inputSchema: {
+                    computer: z.string().describe("Computer name or serial number"),
+                    policyName: z.string().optional().describe("Optional filter: policy name (case-insensitive substring match)"),
+                    status: z.string().optional().describe('Optional filter: exact status match, e.g. "Completed", "Failed", "Pending"'),
+                    limit: z.number().int().min(1).max(1000).optional().describe("Max log entries to return (default 100, most recent first)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ computer, policyName, status, limit, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getComputerPolicyLogs(computer, { policyName, status, limit });
+
+                    const text = toText(data, response_format, () => {
+                        const logs: any[] = data.logs ?? [];
+                        if (logs.length === 0) {
+                            const filters = [policyName && `policy: "${policyName}"`, status && `status: "${status}"`].filter(Boolean).join(", ");
+                            return `No policy log entries found for "${computer}"${filters ? ` matching ${filters}` : ""}.`;
+                        }
+                        const rows = logs
+                            .map((l: any) =>
+                                `- **${l.policy_name}** (ID: ${l.policy_id}) | ${l.status} | ${l.date_completed ?? "—"}${l.username ? ` | as ${l.username}` : ""}`
+                            )
+                            .join("\n");
+                        const truncNote = data.summary.truncated
+                            ? `\n\n_Showing ${data.summary.returnedLogs} of ${data.summary.filteredLogs} matching entries — increase \`limit\` to see more._`
+                            : "";
+                        return `## Policy Logs — "${computer}" (${data.summary.filteredLogs} of ${data.summary.totalLogs} total)\n\n${rows}${truncNote}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 42. jamf_get_policy_fleet_status ─────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_policy_fleet_status",
+            {
+                description:
+                    "Get fleet-wide rollout status for a single policy: resolves its scope (direct computers plus " +
+                    "computer groups, minus exclusions), then checks each scoped computer's most recent run of this " +
+                    "specific policy. Answers \"is this policy actually rolling out / failing broadly?\" — heavier " +
+                    "than jamf_get_computer_policy_logs (single computer) since it has to check every scoped " +
+                    "computer's history individually. Refuses policies scoped to All Computers (too broad to check " +
+                    "one-by-one) — narrow the scope first, or use jamf_get_computer_policy_logs for specific " +
+                    "machines. Does NOT account for scope limitations (network segments, LDAP users/groups) — only " +
+                    "direct computers and computer groups (smart or static), minus exclusions.",
+                inputSchema: {
+                    policy: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
+                    maxComputers: z.number().int().min(1).max(1000).optional().describe(
+                        "Max scoped computers to check (default 100) — each check is its own API call, so large " +
+                        "scopes are capped rather than checked exhaustively. See droppedCount in the result."
+                    ),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ policy, maxComputers, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getPolicyFleetStatus(policy, { maxComputers });
+
+                    const text = toText(data, response_format, () => {
+                        if (data.allComputers) {
+                            return `## Policy Fleet Status — "${data.policyName}"\n\n${(data as any).note}`;
+                        }
+                        const computers: any[] = data.computers ?? [];
+                        if (computers.length === 0) {
+                            return `## Policy Fleet Status — "${data.policyName}"\n\nThis policy has no computers or computer groups directly in scope (${data.summary.totalTargeted} targeted).`;
+                        }
+                        const statusRows = Object.entries(data.summary.byStatus)
+                            .map(([status, count]) => `- **${status}:** ${count}`)
+                            .join("\n");
+                        const computerRows = computers
+                            .map((c: any) => `- **${c.name}** (${c.serial ?? "no serial"}) | ${c.status}${c.lastRun ? ` | ${c.lastRun}` : ""}${c.error ? ` | ${c.error}` : ""}`)
+                            .join("\n");
+                        const droppedNote = data.summary.droppedCount > 0
+                            ? `\n\n_${data.summary.droppedCount} scoped computers not checked — increase \`maxComputers\` to see more (${data.summary.totalTargeted} total targeted)._`
+                            : "";
+                        return [
+                            `## Policy Fleet Status — "${data.policyName}"`,
+                            `Checked ${data.summary.checked} of ${data.summary.totalTargeted} scoped computers.`,
+                            `\n### By Status\n${statusRows}`,
+                            `\n### Computers\n${computerRows}`,
+                            droppedNote,
+                        ].filter(Boolean).join("\n");
+                    });
+
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

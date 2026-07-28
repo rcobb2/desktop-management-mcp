@@ -121,6 +121,34 @@ async function resolvePolicyByName(
     return { policyId: match.id, policyName: match.name, source: match.source };
 }
 
+async function resolveCompliancePolicyByName(
+    client: IntuneClient,
+    policyName: string
+): Promise<{ policyId: string; policyName: string } | null> {
+    const result = await client.getCompliancePolicies({ policyName });
+    const policies: any[] = Array.isArray(result.policies) ? result.policies : [];
+    if (policies.length === 0) return null;
+
+    const lower = policyName.toLowerCase();
+    const exact = policies.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
+    const match = exact ?? policies[0];
+    return { policyId: match.id, policyName: match.name };
+}
+
+async function resolveAppConfigurationPolicyByName(
+    client: IntuneClient,
+    name: string
+): Promise<{ id: string; name: string } | null> {
+    const result = await client.getAppConfigurationPolicies({ name });
+    const policies: any[] = Array.isArray(result.policies) ? result.policies : [];
+    if (policies.length === 0) return null;
+
+    const lower = name.toLowerCase();
+    const exact = policies.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
+    const match = exact ?? policies[0];
+    return { id: match.id, name: match.name };
+}
+
 const DeviceIdentifierSchema = {
     deviceName: z.string().optional().describe("Device display name in Intune"),
     deviceId: z.string().optional().describe("Intune managed device ID (GUID)"),
@@ -477,7 +505,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             const rows = policies
                                 .map(
                                     (p: any) =>
-                                        `- **${p.name}** (ID: ${p.id}) | Platform: ${p.platform ?? "—"} | Modified: ${p.lastModifiedDateTime ?? "—"}`
+                                        `- **${p.name}** (ID: ${p.id}) | Platform: ${p.platforms || "—"} | Modified: ${p.lastModifiedDateTime ?? "—"}`
                                 )
                                 .join("\n");
                             return `### ${label} (${policies.length})\n${rows}`;
@@ -1547,6 +1575,671 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         ].filter(Boolean).join("\n");
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 23. intune_get_configuration_profile ─────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_configuration_profile",
+            {
+                description:
+                    "Get the full detail of a single Intune configuration policy — classic device configuration " +
+                    "or Settings Catalog — by ID or name. Unlike intune_list_configuration_policies (metadata only), " +
+                    "this returns the actual policy body: every type-specific property for classic profiles, or the " +
+                    "full settings array (settingDefinitionId + value for each configured setting) for Settings " +
+                    "Catalog policies. Use response_format=\"json\" to get the raw settings array as a template " +
+                    "before calling intune_create_android_configuration_profile or intune_update_configuration_profile.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Intune policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    source: z
+                        .enum(["classic", "settingsCatalog", "auto"])
+                        .default("auto")
+                        .describe('Policy type: "classic" for device configuration profiles, "settingsCatalog" for Settings Catalog, "auto" to detect (default)'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ policyId, policyName, source = "auto", response_format = "markdown" }) => {
+                try {
+                    let resolvedPolicyId = policyId;
+                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
+                    let resolvedName = policyName;
+
+                    if (!resolvedPolicyId && policyName) {
+                        const resolved = await resolvePolicyByName(client, policyName, source);
+                        if (!resolved) return notFound(`policy "${policyName}"`);
+                        resolvedPolicyId = resolved.policyId;
+                        resolvedSource = resolved.source;
+                        resolvedName = resolved.policyName;
+                    }
+
+                    if (!resolvedPolicyId) {
+                        return {
+                            isError: true,
+                            content: [{ type: "text", text: "Error: provide policyId or policyName." }],
+                        };
+                    }
+
+                    if (!resolvedSource) {
+                        if (source === "auto") {
+                            return {
+                                isError: true,
+                                content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }],
+                            };
+                        }
+                        resolvedSource = source;
+                    }
+
+                    const detail = await client.getConfigurationPolicyDetail(resolvedPolicyId, resolvedSource);
+
+                    const text = toText(detail, response_format, () => {
+                        const label = resolvedName ?? resolvedPolicyId;
+                        const d = detail as any;
+
+                        if (d.source === "classic") {
+                            const raw = d.raw ?? {};
+                            const skipKeys = new Set(["id", "displayName", "description", "@odata.type", "createdDateTime", "lastModifiedDateTime", "version", "roleScopeTagIds", "supportsScopeTags"]);
+                            const propRows = Object.entries(raw)
+                                .filter(([k]) => !skipKeys.has(k))
+                                .map(([k, v]) => `- **${k}**: ${JSON.stringify(v)}`)
+                                .join("\n");
+                            return [
+                                `## Configuration Profile — "${label}" (classic)`,
+                                `Type: ${raw["@odata.type"] ?? "—"}`,
+                                d.description ? `Description: ${d.description}` : "",
+                                `Modified: ${raw.lastModifiedDateTime ?? "—"}`,
+                                `\n### Properties\n${propRows || "_None_"}`,
+                            ].filter(Boolean).join("\n");
+                        }
+
+                        const settings: any[] = d.settings ?? [];
+                        const preview = settings.slice(0, 20)
+                            .map((s: any) => `- ${s.settingInstance?.settingDefinitionId ?? "(unknown setting)"}`)
+                            .join("\n");
+                        const truncatedNote = settings.length > 20 ? `\n_...and ${settings.length - 20} more (use response_format="json" to see all)_` : "";
+                        return [
+                            `## Configuration Profile — "${label}" (Settings Catalog)`,
+                            `Platform: ${d.platforms || "—"} | Technologies: ${d.technologies || "—"}`,
+                            d.description ? `Description: ${d.description}` : "",
+                            `Settings: ${d.settingsCount}`,
+                            `\n### Configured settings\n${preview || "_None_"}${truncatedNote}`,
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 24. intune_list_compliance_policies ──────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_compliance_policies",
+            {
+                description:
+                    "List device compliance policies in Microsoft Intune. Optionally filter by name or platform " +
+                    "(e.g. \"androidWorkProfile\", \"androidDeviceOwner\", \"windows10\", \"ios\", \"macos\"). " +
+                    "Returns policy ID, name, inferred platform, and last modified date.",
+                inputSchema: {
+                    policyName: z.string().optional().describe("Optional name filter (case-insensitive substring match)"),
+                    platform: z.string().optional().describe('Optional platform filter (e.g. "android", "androidWorkProfile", "androidDeviceOwner")'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ policyName, platform, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getCompliancePolicies({ policyName, platform });
+
+                    const text = toText(data, response_format, () => {
+                        const policies: any[] = (data as any).policies ?? [];
+                        if (policies.length === 0) {
+                            const filters = [policyName && `name: "${policyName}"`, platform && `platform: "${platform}"`].filter(Boolean).join(", ");
+                            return `No compliance policies found${filters ? ` matching ${filters}` : ""}.`;
+                        }
+                        const rows = policies
+                            .map((p: any) => `- **${p.name}** (ID: ${p.id}) | Platform: ${p.platformHint} | Modified: ${p.lastModifiedDateTime ?? "—"}`)
+                            .join("\n");
+                        return `## Compliance Policies — ${policies.length} total\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 25. intune_get_compliance_policy ─────────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_compliance_policy",
+            {
+                description:
+                    "Get the full detail and group assignments of a single Intune compliance policy, by ID or name.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Compliance policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ policyId, policyName, response_format = "markdown" }) => {
+                try {
+                    let resolvedId = policyId;
+                    let resolvedName = policyName;
+                    if (!resolvedId && policyName) {
+                        const resolved = await resolveCompliancePolicyByName(client, policyName);
+                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
+                        resolvedId = resolved.policyId;
+                        resolvedName = resolved.policyName;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
+                    }
+
+                    const detail = await client.getCompliancePolicyDetail(resolvedId);
+
+                    const text = toText(detail, response_format, () => {
+                        const d = detail as any;
+                        const label = resolvedName ?? resolvedId;
+                        const targetRows = (d.resolvedTargets ?? [])
+                            .map((t: any) => `- ${t.type === "includeGroup" ? "Include" : t.type === "excludeGroup" ? "Exclude" : t.type}: **${t.displayName ?? t.id}**`)
+                            .join("\n");
+                        return [
+                            `## Compliance Policy — "${label}"`,
+                            `Type: ${d.odataType ?? "—"}`,
+                            d.description ? `Description: ${d.description}` : "",
+                            `\n### Assignments (${d.summary?.totalAssignments ?? 0})\n${targetRows || "_None_"}`,
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 26. intune_create_android_compliance_policy ─────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_android_compliance_policy",
+            {
+                description:
+                    "Create an Android compliance policy (work profile or device owner variant). `settings` is a " +
+                    "passthrough object of Graph's own androidWorkProfileCompliancePolicy/androidDeviceOwnerCompliancePolicy " +
+                    "property names (e.g. passwordRequired, passwordMinimumLength, securityBlockJailbrokenDevices, " +
+                    "storageRequireEncryption, minAndroidSecurityPatchLevel, securityPreventInstallAppsFromUnknownSources) — " +
+                    "consult Microsoft Graph's deviceCompliancePolicy documentation for the full property list per variant. " +
+                    "A default \"mark noncompliant immediately\" scheduled action is attached if scheduledActionsForRule is omitted.",
+                inputSchema: {
+                    name: z.string().describe("Display name for the new compliance policy"),
+                    description: z.string().optional(),
+                    androidVariant: z.enum(["workProfile", "deviceOwner"]).describe("Android Enterprise enrollment variant this policy targets"),
+                    settings: z.record(z.any()).optional().describe("Passthrough compliance settings, using Graph's own property names for the chosen variant"),
+                    scheduledActionsForRule: z.array(z.record(z.any())).optional().describe("Advanced: override the default scheduled noncompliance action(s)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, description, androidVariant, settings, scheduledActionsForRule, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createAndroidCompliancePolicy({ name, description, androidVariant, settings, scheduledActionsForRule });
+
+                    const text = toText(result, response_format, () =>
+                        `## Compliance policy created — "${result.name}"\n- ID: ${result.id}\n- Variant: ${result.androidVariant}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 27. intune_update_compliance_policy ──────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_update_compliance_policy",
+            {
+                description:
+                    "Update fields on an existing compliance policy, by ID or name. `updates` is a passthrough " +
+                    "object merged into the policy (use \"name\"/\"description\" for those two; any other key is " +
+                    "sent verbatim as a Graph property name for the policy's existing @odata.type).",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Compliance policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    updates: z.record(z.any()).describe("Fields to update, using Graph's own property names (plus \"name\" for displayName)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ policyId, policyName, updates, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedId = policyId;
+                    let resolvedName = policyName;
+                    if (!resolvedId && policyName) {
+                        const resolved = await resolveCompliancePolicyByName(client, policyName);
+                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
+                        resolvedId = resolved.policyId;
+                        resolvedName = resolved.policyName;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
+                    }
+
+                    const result = await client.updateAndroidCompliancePolicy(resolvedId, updates);
+
+                    const text = toText(result, response_format, () =>
+                        `## Compliance policy updated — "${resolvedName ?? resolvedId}"\n- Updated fields: ${result.updatedFields.join(", ")}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 28. intune_assign_compliance_policy ──────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_compliance_policy",
+            {
+                description:
+                    "Add (or move) a group assignment on an Intune compliance policy, by ID or name. " +
+                    "IMPORTANT: Graph's assign action REPLACES the entire assignment set rather than appending " +
+                    "to it, so this tool always reads the policy's current assignments first, removes any " +
+                    "existing assignment for the same group, adds the new one, and posts the full set back — " +
+                    "other groups' assignments are preserved untouched.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Compliance policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    group: z.string().describe("Azure AD group display name or object ID (GUID) to assign"),
+                    exclude: z.boolean().optional().describe("If true, EXCLUDE this group from the policy's scope instead of including it"),
+                    filterId: z.string().optional().describe("Optional assignment filter ID to attach to this assignment"),
+                    filterType: z.enum(["include", "exclude"]).optional().describe('How the filter narrows scope (default "include"). Only used if filterId is set.'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ policyId, policyName, group, exclude, filterId, filterType, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedId = policyId;
+                    let resolvedName = policyName;
+                    if (!resolvedId && policyName) {
+                        const resolved = await resolveCompliancePolicyByName(client, policyName);
+                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
+                        resolvedId = resolved.policyId;
+                        resolvedName = resolved.policyName;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
+                    }
+
+                    const result = await client.assignCompliancePolicyToGroup(resolvedId, group, { exclude, filterId, filterType });
+
+                    const text = toText(result, response_format, () => {
+                        const label = resolvedName ?? resolvedId;
+                        const direction = exclude ? "excluded from" : "included in";
+                        return [
+                            `## Assignment updated — "${label}"`,
+                            `Group **${result.group.displayName}** is now ${direction} this policy's scope.`,
+                            `- Total assignments on policy: ${result.totalAssignments}`,
+                            result.replacedExistingForGroup ? `- This replaced a prior assignment for the same group.` : "",
+                        ].filter(Boolean).join("\n");
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 29. intune_create_android_configuration_profile ──────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_android_configuration_profile",
+            {
+                description:
+                    "Create an Android configuration profile as a Settings Catalog policy — this tenant's actual " +
+                    "Android config-profile model (there are no classic Android device-config objects here). " +
+                    "`settings` is a raw passthrough array of Graph settingInstance objects (advanced — construct " +
+                    "it by reading an existing similar policy via intune_get_configuration_profile with " +
+                    "response_format=\"json\" and using its `settings` array as a copy-and-modify template).",
+                inputSchema: {
+                    name: z.string().describe("Display name for the new configuration profile"),
+                    description: z.string().optional(),
+                    settings: z.array(z.record(z.any())).describe("Raw Settings Catalog settingInstance objects"),
+                    platforms: z.string().optional().describe('Defaults to "androidEnterprise"'),
+                    technologies: z.string().optional().describe('Defaults to "android"'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, description, settings, platforms, technologies, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createSettingsCatalogPolicy({ name, description, settings, platforms, technologies });
+
+                    const text = toText(result, response_format, () =>
+                        `## Configuration profile created — "${result.name}"\n- ID: ${result.id}\n- Platform: ${result.platforms} | Technologies: ${result.technologies}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 30. intune_update_configuration_profile ──────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_update_configuration_profile",
+            {
+                description:
+                    "Update a configuration profile's name, description, or (Settings Catalog only) settings array, " +
+                    "by ID or name. For classic device configuration profiles, only name/description are supported " +
+                    "here (other type-specific fields aren't modeled); for Settings Catalog, `settings` fully " +
+                    "replaces the existing settings array if provided.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    source: z
+                        .enum(["classic", "settingsCatalog", "auto"])
+                        .default("auto")
+                        .describe('Policy type: "classic" for device configuration profiles, "settingsCatalog" for Settings Catalog, "auto" to detect (default)'),
+                    name: z.string().optional().describe("New display name"),
+                    description: z.string().optional().describe("New description"),
+                    settings: z.array(z.record(z.any())).optional().describe("Settings Catalog only: full replacement settings array"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ policyId, policyName, source = "auto", name, description, settings, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedId = policyId;
+                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
+                    let resolvedName = policyName;
+
+                    if (!resolvedId && policyName) {
+                        const resolved = await resolvePolicyByName(client, policyName, source);
+                        if (!resolved) return notFound(`policy "${policyName}"`);
+                        resolvedId = resolved.policyId;
+                        resolvedSource = resolved.source;
+                        resolvedName = resolved.policyName;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
+                    }
+                    if (!resolvedSource) {
+                        if (source === "auto") {
+                            return { isError: true, content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }] };
+                        }
+                        resolvedSource = source;
+                    }
+
+                    if (resolvedSource === "classic" && settings !== undefined) {
+                        return { isError: true, content: [{ type: "text", text: "Error: settings updates are only supported for Settings Catalog policies." }] };
+                    }
+
+                    const updates: Record<string, any> = {};
+                    if (name !== undefined) updates.name = name;
+                    if (description !== undefined) updates.description = description;
+                    if (settings !== undefined) updates.settings = settings;
+
+                    const result = resolvedSource === "classic"
+                        ? await client.updateClassicConfigurationProfile(resolvedId, updates)
+                        : await client.updateSettingsCatalogPolicy(resolvedId, updates);
+
+                    const text = toText(result, response_format, () =>
+                        `## Configuration profile updated — "${resolvedName ?? resolvedId}"\n- Updated fields: ${result.updatedFields.join(", ")}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 31. intune_list_app_configuration_policies ───────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_app_configuration_policies",
+            {
+                description:
+                    "List Intune app configuration policies (mobileAppConfigurations), which carry regular managed-app " +
+                    "config and OEMConfig payloads for Android Enterprise apps. Optionally filter by name.",
+                inputSchema: {
+                    name: z.string().optional().describe("Optional name filter (case-insensitive substring match)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ name, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getAppConfigurationPolicies({ name });
+
+                    const text = toText(data, response_format, () => {
+                        const policies: any[] = (data as any).policies ?? [];
+                        if (policies.length === 0) {
+                            return `No app configuration policies found${name ? ` matching name: "${name}"` : ""}.`;
+                        }
+                        const rows = policies
+                            .map((p: any) => `- **${p.name}** (ID: ${p.id}) | Targeted apps: ${p.targetedMobileApps.length} | Modified: ${p.lastModifiedDateTime ?? "—"}`)
+                            .join("\n");
+                        return `## App Configuration Policies — ${policies.length} total\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 32. intune_get_app_configuration_policy ──────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_app_configuration_policy",
+            {
+                description:
+                    "Get the full detail (including decoded OEMConfig payload, if present) and group assignments " +
+                    "of a single app configuration policy, by ID or name.",
+                inputSchema: {
+                    id: z.string().optional().describe("App configuration policy ID (GUID). Use if you already have it."),
+                    name: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ id, name, response_format = "markdown" }) => {
+                try {
+                    let resolvedId = id;
+                    let resolvedName = name;
+                    if (!resolvedId && name) {
+                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
+                        if (!resolved) return notFound(`app configuration policy "${name}"`);
+                        resolvedId = resolved.id;
+                        resolvedName = resolved.name;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
+                    }
+
+                    const detail = await client.getAppConfigurationPolicyDetail(resolvedId);
+
+                    const text = toText(detail, response_format, () => {
+                        const d = detail as any;
+                        const label = resolvedName ?? resolvedId;
+                        return [
+                            `## App Configuration Policy — "${label}"`,
+                            `Type: ${d.odataType ?? "—"}`,
+                            d.description ? `Description: ${d.description}` : "",
+                            `Targeted apps: ${d.targetedMobileApps.length}`,
+                            `Assignments: ${d.assignments.length}`,
+                            d.decodedPayload ? `\n### Decoded payload\n\`\`\`json\n${JSON.stringify(d.decodedPayload, null, 2)}\n\`\`\`` : "",
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 33. intune_create_android_app_configuration_policy ───────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_android_app_configuration_policy",
+            {
+                description:
+                    "Create an Android app configuration policy (OEMConfig or regular managed-app config — both use " +
+                    "the same Graph type). NOT LIVE-VERIFIED: this tenant has no Android app in its Intune catalog " +
+                    "today to test end-to-end, so this path is built to Graph's documented shape but unconfirmed — " +
+                    "validate carefully against a real Managed Google Play app before relying on it in production.",
+                inputSchema: {
+                    name: z.string().describe("Display name for the new app configuration policy"),
+                    description: z.string().optional(),
+                    targetedAppId: z.string().describe("Intune mobile app ID (GUID) of the Android Managed Store app this config targets"),
+                    payloadJson: z.record(z.any()).optional().describe("OEMConfig/managed-app JSON payload (encoded to base64 automatically)"),
+                    permissionActions: z.array(z.record(z.any())).optional().describe("Advanced: runtime permission grant/deny actions"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, description, targetedAppId, payloadJson, permissionActions, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createAndroidAppConfigurationPolicy({ name, description, targetedAppId, payloadJson, permissionActions });
+
+                    const text = toText(result, response_format, () =>
+                        `## App configuration policy created — "${result.name}"\n- ID: ${result.id}\n- Targeted app: ${result.targetedAppId}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 34. intune_update_app_configuration_policy ───────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_update_app_configuration_policy",
+            {
+                description:
+                    "Update an app configuration policy's name, description, or payload, by ID or name. " +
+                    "NOT LIVE-VERIFIED — see intune_create_android_app_configuration_policy.",
+                inputSchema: {
+                    id: z.string().optional().describe("App configuration policy ID (GUID). Use if you already have it."),
+                    name: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    newName: z.string().optional().describe("New display name"),
+                    description: z.string().optional().describe("New description"),
+                    payloadJson: z.record(z.any()).optional().describe("New OEMConfig/managed-app JSON payload (encoded to base64 automatically)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ id, name, newName, description, payloadJson, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedId = id;
+                    let resolvedName = name;
+                    if (!resolvedId && name) {
+                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
+                        if (!resolved) return notFound(`app configuration policy "${name}"`);
+                        resolvedId = resolved.id;
+                        resolvedName = resolved.name;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
+                    }
+
+                    const result = await client.updateAndroidAppConfigurationPolicy(resolvedId, { name: newName, description, payloadJson });
+
+                    const text = toText(result, response_format, () =>
+                        `## App configuration policy updated — "${resolvedName ?? resolvedId}"\n- Updated fields: ${result.updatedFields.join(", ")}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 35. intune_assign_app_configuration_policy ───────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_app_configuration_policy",
+            {
+                description:
+                    "Add (or move) a group assignment on an app configuration policy, by ID or name. Same " +
+                    "replace-the-whole-set /assign semantics as the other assignment tools. " +
+                    "NOT LIVE-VERIFIED — see intune_create_android_app_configuration_policy.",
+                inputSchema: {
+                    id: z.string().optional().describe("App configuration policy ID (GUID). Use if you already have it."),
+                    name: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    group: z.string().describe("Azure AD group display name or object ID (GUID) to assign"),
+                    exclude: z.boolean().optional().describe("If true, EXCLUDE this group from the policy's scope instead of including it"),
+                    filterId: z.string().optional().describe("Optional assignment filter ID to attach to this assignment"),
+                    filterType: z.enum(["include", "exclude"]).optional().describe('How the filter narrows scope (default "include"). Only used if filterId is set.'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ id, name, group, exclude, filterId, filterType, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    let resolvedId = id;
+                    let resolvedName = name;
+                    if (!resolvedId && name) {
+                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
+                        if (!resolved) return notFound(`app configuration policy "${name}"`);
+                        resolvedId = resolved.id;
+                        resolvedName = resolved.name;
+                    }
+                    if (!resolvedId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
+                    }
+
+                    const result = await client.assignAppConfigurationPolicyToGroup(resolvedId, group, { exclude, filterId, filterType });
+
+                    const text = toText(result, response_format, () => {
+                        const label = resolvedName ?? resolvedId;
+                        const direction = exclude ? "excluded from" : "included in";
+                        return [
+                            `## Assignment updated — "${label}"`,
+                            `Group **${result.group.displayName}** is now ${direction} this policy's scope.`,
+                            `- Total assignments on policy: ${result.totalAssignments}`,
+                            result.replacedExistingForGroup ? `- This replaced a prior assignment for the same group.` : "",
+                        ].filter(Boolean).join("\n");
+                    });
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

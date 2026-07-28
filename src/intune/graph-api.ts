@@ -938,19 +938,22 @@ export class IntuneClient {
                 id: policy.id,
                 name: policy.displayName,
                 description: policy.description,
-                platforms: [],
-                technologies: [],
+                platforms: '',
+                technologies: '',
                 createdDateTime: policy.createdDateTime,
                 lastModifiedDateTime: policy.lastModifiedDateTime
             }));
 
+            // Graph returns `platforms`/`technologies` as a single string for Settings Catalog
+            // policies (e.g. "androidEnterprise", "mdm,endpointPrivilegeManagement"), not an array —
+            // confirmed live against real Android Settings Catalog policies in this tenant.
             const normalizedSettingsCatalog = result.settingsCatalogPolicies.map((policy: any) => ({
                 source: 'settingsCatalog',
                 id: policy.id,
                 name: policy.name,
                 description: policy.description,
-                platforms: Array.isArray(policy.platforms) ? policy.platforms : [],
-                technologies: Array.isArray(policy.technologies) ? policy.technologies : [],
+                platforms: policy.platforms ?? '',
+                technologies: policy.technologies ?? '',
                 createdDateTime: policy.createdDateTime,
                 lastModifiedDateTime: policy.lastModifiedDateTime
             }));
@@ -962,10 +965,9 @@ export class IntuneClient {
             }
 
             if (platform) {
-                combined = combined.filter((policy: any) => {
-                    const platforms = Array.isArray(policy.platforms) ? policy.platforms : [];
-                    return platforms.some((value: string) => value.toLowerCase().includes(platform));
-                });
+                combined = combined.filter((policy: any) =>
+                    String(policy.platforms || '').toLowerCase().includes(platform)
+                );
             }
 
             result.combined = combined;
@@ -978,6 +980,97 @@ export class IntuneClient {
             return result;
         } catch (error) {
             this.logger.error('Error fetching configuration policies', { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Fetch the actual setting values ("settingInstance" objects) for a Settings Catalog policy —
+     * the bulk list endpoint only returns metadata (name/platforms/technologies), never the
+     * settings body itself. Pages through @odata.nextLink like listManagedDevices.
+     */
+    public async getConfigurationPolicySettings(policyId: string) {
+        this.logger.info('Fetching configuration policy settings', { policyId });
+        await this.trackAuthAttempt();
+
+        const MAX_PAGES = 20;
+        const path = `/deviceManagement/configurationPolicies/${policyId}/settings`;
+
+        try {
+            const settings: any[] = [];
+            let apiStart = Date.now();
+            let response = await this.client.api(path).version('beta').top(999).get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+            settings.push(...(response.value || []));
+
+            let page = 1;
+            while (response['@odata.nextLink'] && page < MAX_PAGES) {
+                apiStart = Date.now();
+                response = await this.client.api(response['@odata.nextLink']).get();
+                logApiCall(this.logger, 'GET', `${path} (nextLink)`, 200, Date.now() - apiStart);
+                settings.push(...(response.value || []));
+                page++;
+            }
+
+            return settings;
+        } catch (error) {
+            this.logger.error('Error fetching configuration policy settings', { policyId, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Get the full detail of a single configuration policy — unlike getConfigurationPolicies
+     * (metadata-only list), this returns the actual policy body: for classic device configurations,
+     * a single GET already returns every type-specific property inline (it's one polymorphic
+     * resource, no separate call needed); for Settings Catalog, metadata plus the settings array
+     * fetched separately via getConfigurationPolicySettings, since Settings Catalog policies don't
+     * embed their settings in the metadata GET.
+     */
+    public async getConfigurationPolicyDetail(policyId: string, source: 'classic' | 'settingsCatalog') {
+        this.logger.info('Fetching configuration policy detail', { policyId, source });
+        await this.trackAuthAttempt();
+
+        try {
+            if (source === 'classic') {
+                const path = `/deviceManagement/deviceConfigurations/${policyId}`;
+                const apiStart = Date.now();
+                const policy = await this.client.api(path).version('v1.0').get();
+                logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+                return {
+                    source: 'classic' as const,
+                    id: policy.id,
+                    name: policy.displayName,
+                    description: policy.description,
+                    platforms: '',
+                    technologies: '',
+                    settingsCount: null,
+                    settings: null,
+                    raw: policy
+                };
+            }
+
+            const path = `/deviceManagement/configurationPolicies/${policyId}`;
+            const apiStart = Date.now();
+            const policy = await this.client.api(path).version('beta').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const settings = await this.getConfigurationPolicySettings(policyId);
+
+            return {
+                source: 'settingsCatalog' as const,
+                id: policy.id,
+                name: policy.name,
+                description: policy.description,
+                platforms: policy.platforms ?? '',
+                technologies: policy.technologies ?? '',
+                settingsCount: settings.length,
+                settings,
+                raw: { ...policy, settings }
+            };
+        } catch (error) {
+            this.logger.error('Error fetching configuration policy detail', { policyId, source, error: (error as Error).message, stack: (error as Error).stack });
             throw error;
         }
     }
@@ -1340,6 +1433,186 @@ export class IntuneClient {
                 error: (error as Error).message,
                 stack: (error as Error).stack
             });
+            throw error;
+        }
+    }
+
+    // ─── Compliance policies ──────────────────────────────────────────────────
+    //
+    // Unlike configuration policies, this tenant's Android compliance still runs on the classic
+    // `deviceCompliancePolicies` polymorphic collection (androidWorkProfileCompliancePolicy /
+    // androidDeviceOwnerCompliancePolicy) rather than a Settings Catalog equivalent — there is no
+    // dual-source split to handle here.
+
+    /**
+     * List device compliance policies, optionally filtered by name or platform (derived from
+     * @odata.type the same way getAppDeployments derives platformHint for apps).
+     */
+    public async getCompliancePolicies(options?: { policyName?: string; platform?: string }) {
+        const policyName = options?.policyName?.trim().toLowerCase();
+        const platform = options?.platform?.trim().toLowerCase();
+
+        this.logger.info('Fetching compliance policies', { policyName: options?.policyName, platform: options?.platform });
+        await this.trackAuthAttempt();
+
+        try {
+            const path = '/deviceManagement/deviceCompliancePolicies';
+            const apiStart = Date.now();
+            const response = await this.client
+                .api(path)
+                .version('v1.0')
+                .top(999)
+                .get();
+
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const normalized = (response.value || []).map((policy: any) => {
+                const odataType = String(policy['@odata.type'] || '').toLowerCase();
+                return {
+                    id: policy.id,
+                    name: policy.displayName,
+                    description: policy.description,
+                    odataType: policy['@odata.type'],
+                    platformHint: odataType.includes('androidworkprofile')
+                        ? 'androidWorkProfile'
+                        : odataType.includes('androiddeviceowner')
+                            ? 'androidDeviceOwner'
+                            : odataType.includes('android')
+                                ? 'android'
+                                : odataType.includes('windows10mobile') || odataType.includes('windows10')
+                                    ? 'windows10'
+                                    : odataType.includes('ios')
+                                        ? 'ios'
+                                        : odataType.includes('macos')
+                                            ? 'macos'
+                                            : 'unknown',
+                    createdDateTime: policy.createdDateTime,
+                    lastModifiedDateTime: policy.lastModifiedDateTime
+                };
+            });
+
+            let filtered = normalized;
+            if (policyName) {
+                filtered = filtered.filter((p: any) => String(p.name || '').toLowerCase().includes(policyName));
+            }
+            if (platform) {
+                filtered = filtered.filter((p: any) => String(p.platformHint || '').toLowerCase().includes(platform));
+            }
+
+            this.logger.info('Compliance policies retrieved', { total: normalized.length, filtered: filtered.length });
+
+            return {
+                policies: filtered,
+                summary: { totalPolicies: normalized.length, filteredPolicies: filtered.length }
+            };
+        } catch (error) {
+            this.logger.error('Error fetching compliance policies', { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Get the full detail and assignments of a single compliance policy. Mirrors
+     * getConfigurationPolicyAssignments's combined shape, minus the classic/settingsCatalog split
+     * since compliance policies here are single-source.
+     */
+    public async getCompliancePolicyDetail(policyId: string) {
+        this.logger.info('Fetching compliance policy detail', { policyId });
+        await this.trackAuthAttempt();
+
+        const mapAssignment = (assignment: any) => {
+            const target = assignment?.target || {};
+            const targetType = String(target['@odata.type'] || '').toLowerCase();
+            return {
+                id: assignment.id,
+                source: assignment.source,
+                sourceId: assignment.sourceId,
+                targetType: target['@odata.type'] || 'unknown',
+                groupId: target.groupId,
+                deviceAndAppManagementAssignmentFilterId: target.deviceAndAppManagementAssignmentFilterId,
+                deviceAndAppManagementAssignmentFilterType: target.deviceAndAppManagementAssignmentFilterType,
+                isExclude: targetType.includes('exclusion')
+            };
+        };
+
+        const resolveTargetName = async (assignment: any) => {
+            if (assignment.groupId) {
+                try {
+                    const apiStart = Date.now();
+                    const group = await this.client
+                        .api(`/groups/${assignment.groupId}`)
+                        .version('v1.0')
+                        .select('id,displayName,description')
+                        .get();
+                    logApiCall(this.logger, 'GET', `/groups/${assignment.groupId}`, 200, Date.now() - apiStart);
+                    return {
+                        assignmentId: assignment.id,
+                        type: assignment.isExclude ? 'excludeGroup' : 'includeGroup',
+                        id: group.id,
+                        displayName: group.displayName,
+                        filterId: assignment.deviceAndAppManagementAssignmentFilterId,
+                        filterType: assignment.deviceAndAppManagementAssignmentFilterType
+                    };
+                } catch (error) {
+                    this.logger.warn('Failed to resolve compliance assignment group target', {
+                        groupId: assignment.groupId,
+                        error: (error as Error).message
+                    });
+                    return {
+                        assignmentId: assignment.id,
+                        type: assignment.isExclude ? 'excludeGroup' : 'includeGroup',
+                        id: assignment.groupId,
+                        displayName: null,
+                        error: (error as Error).message
+                    };
+                }
+            }
+
+            const targetType = String(assignment.targetType || '').toLowerCase();
+            if (targetType.includes('alldevicesassignmenttarget')) {
+                return { assignmentId: assignment.id, type: 'allDevices', displayName: 'All Devices' };
+            }
+            if (targetType.includes('alllicensedusersassignmenttarget')) {
+                return { assignmentId: assignment.id, type: 'allLicensedUsers', displayName: 'All Licensed Users' };
+            }
+            return { assignmentId: assignment.id, type: 'other', displayName: assignment.targetType };
+        };
+
+        try {
+            const path = `/deviceManagement/deviceCompliancePolicies/${policyId}`;
+            const apiStart = Date.now();
+            const policy = await this.client.api(path).version('v1.0').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const assignmentsPath = `${path}/assignments`;
+            const assignmentsStart = Date.now();
+            const assignmentsResponse = await this.client.api(assignmentsPath).version('v1.0').top(999).get();
+            logApiCall(this.logger, 'GET', assignmentsPath, 200, Date.now() - assignmentsStart);
+
+            const assignments = (assignmentsResponse.value || []).map(mapAssignment);
+            const resolvedTargets = [];
+            for (const assignment of assignments) {
+                resolvedTargets.push(await resolveTargetName(assignment));
+            }
+
+            this.logger.info('Compliance policy detail retrieved', { policyId, assignmentCount: assignments.length });
+
+            return {
+                id: policy.id,
+                name: policy.displayName,
+                description: policy.description,
+                odataType: policy['@odata.type'],
+                raw: policy,
+                assignments,
+                resolvedTargets,
+                summary: {
+                    totalAssignments: assignments.length,
+                    includeAssignments: assignments.filter((a: any) => !a.isExclude).length,
+                    excludeAssignments: assignments.filter((a: any) => a.isExclude).length
+                }
+            };
+        } catch (error) {
+            this.logger.error('Error fetching compliance policy detail', { policyId, error: (error as Error).message, stack: (error as Error).stack });
             throw error;
         }
     }
@@ -2529,5 +2802,544 @@ export class IntuneClient {
             });
             throw error;
         }
+    }
+
+    /**
+     * Create an Android compliance policy (work profile or device owner variant). `settings` is a
+     * passthrough bag of Graph's own property names for the chosen @odata.type (e.g.
+     * passwordRequired, passwordMinimumLength, securityBlockJailbrokenDevices,
+     * storageRequireEncryption, minAndroidSecurityPatchLevel) rather than a hand-modeled schema —
+     * Android compliance policies expose 40+ possible properties per variant, and mirroring Graph's
+     * own property names directly avoids reinventing that schema.
+     *
+     * NOT YET CONFIRMED LIVE: Graph is expected to require a non-empty `scheduledActionsForRule` on
+     * create (the Intune admin console always attaches a "mark noncompliant" action), so a minimal
+     * default is supplied when the caller omits one. Verify this against a real create call before
+     * treating the default as final — adjust to whatever the live response actually requires.
+     */
+    public async createAndroidCompliancePolicy(input: {
+        name: string;
+        description?: string;
+        androidVariant: 'workProfile' | 'deviceOwner';
+        settings?: Record<string, any>;
+        scheduledActionsForRule?: any[];
+    }) {
+        this.logger.info('Creating Android compliance policy', { name: input.name, androidVariant: input.androidVariant });
+        await this.trackAuthAttempt();
+
+        const odataType = input.androidVariant === 'workProfile'
+            ? '#microsoft.graph.androidWorkProfileCompliancePolicy'
+            : '#microsoft.graph.androidDeviceOwnerCompliancePolicy';
+
+        const defaultScheduledActions = [
+            {
+                ruleName: null,
+                scheduledActionConfigurations: [
+                    { actionType: 'block', gracePeriodHours: 0, notificationTemplateId: '', notificationMessageCCList: [] }
+                ]
+            }
+        ];
+
+        const body: Record<string, any> = {
+            '@odata.type': odataType,
+            displayName: input.name,
+            description: input.description ?? '',
+            ...(input.settings ?? {}),
+            scheduledActionsForRule: input.scheduledActionsForRule ?? defaultScheduledActions
+        };
+
+        try {
+            const path = '/deviceManagement/deviceCompliancePolicies';
+            const apiStart = Date.now();
+            const created = await this.client.api(path).version('v1.0').post(body);
+            logApiCall(this.logger, 'POST', path, 201, Date.now() - apiStart);
+
+            this.logger.info('Android compliance policy created', { id: created.id, name: input.name });
+            return { id: created.id, name: input.name, androidVariant: input.androidVariant, odataType };
+        } catch (error) {
+            this.logger.error('Error creating Android compliance policy', {
+                name: input.name, androidVariant: input.androidVariant, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Update an existing compliance policy. NOT YET CONFIRMED LIVE whether this PATCH is a clean
+     * partial merge (expected, based on how Graph resources generally behave) — verify against a
+     * real update before relying on partial-field updates leaving other fields untouched.
+     */
+    public async updateAndroidCompliancePolicy(policyId: string, updates: Record<string, any>) {
+        this.logger.info('Updating Android compliance policy', { policyId, fields: Object.keys(updates) });
+        await this.trackAuthAttempt();
+
+        const body: Record<string, any> = { ...updates };
+        if (body.name !== undefined) {
+            body.displayName = body.name;
+            delete body.name;
+        }
+
+        try {
+            const path = `/deviceManagement/deviceCompliancePolicies/${policyId}`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('v1.0').patch(body);
+            logApiCall(this.logger, 'PATCH', path, 204, Date.now() - apiStart);
+
+            this.logger.info('Android compliance policy updated', { policyId, fields: Object.keys(updates) });
+            return { policyId, updatedFields: Object.keys(updates) };
+        } catch (error) {
+            this.logger.error('Error updating Android compliance policy', { policyId, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Add (or move) a group assignment on a compliance policy. Same read-modify-write /assign
+     * pattern as assignConfigurationPolicyToGroup/assignAppToGroup (Graph's /assign replaces the
+     * whole set) — reuses resolveGroupId/sanitizeAssignmentTarget as-is. NOT YET CONFIRMED LIVE:
+     * the exact assignment @odata.type (expected #microsoft.graph.deviceCompliancePolicyAssignment).
+     */
+    public async assignCompliancePolicyToGroup(
+        policyId: string,
+        groupNameOrId: string,
+        options?: { exclude?: boolean; filterId?: string; filterType?: 'include' | 'exclude' }
+    ) {
+        this.logger.info('Assigning compliance policy to group', { policyId, groupNameOrId, ...options });
+        await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
+        const base = `/deviceManagement/deviceCompliancePolicies/${policyId}`;
+        const assignmentODataType = '#microsoft.graph.deviceCompliancePolicyAssignment';
+
+        try {
+            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
+            const existing: any[] = existingResponse.value || [];
+            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
+            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
+
+            const retained = directOnly
+                .filter((a: any) => a.target?.groupId !== group.id)
+                .map((a: any) => ({
+                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
+                    target: this.sanitizeAssignmentTarget(a.target)
+                }));
+
+            const newTarget: any = {
+                '@odata.type': options?.exclude
+                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
+                    : '#microsoft.graph.groupAssignmentTarget',
+                groupId: group.id
+            };
+            if (options?.filterId) {
+                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
+                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
+            }
+
+            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
+
+            const apiStart = Date.now();
+            await this.client.api(`${base}/assign`).version('v1.0').post({ assignments: updatedAssignments });
+            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
+
+            this.logger.info('Compliance policy assignment updated', { policyId, groupId: group.id, totalAssignments: updatedAssignments.length });
+
+            return {
+                policyId,
+                group,
+                exclude: Boolean(options?.exclude),
+                totalAssignments: updatedAssignments.length,
+                previousAssignmentCount: existing.length,
+                replacedExistingForGroup: hadExistingForGroup
+            };
+        } catch (error) {
+            this.logger.error('Error assigning compliance policy to group', {
+                policyId, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Delete a compliance policy. Test-only — not exposed as an MCP tool (no delete tools exist
+     * anywhere in this codebase's MCP surface); used solely so the integration test suite can
+     * self-clean policies it creates, the same way the JAMF package upsert test does.
+     */
+    public async deleteCompliancePolicy(policyId: string) {
+        this.logger.info('Deleting compliance policy (test cleanup)', { policyId });
+        await this.trackAuthAttempt();
+
+        const path = `/deviceManagement/deviceCompliancePolicies/${policyId}`;
+        const apiStart = Date.now();
+        await this.client.api(path).version('v1.0').delete();
+        logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
+    }
+
+    /**
+     * Create a Settings Catalog configuration policy. Defaults to Android Enterprise
+     * (platforms: 'androidEnterprise', technologies: 'android') since that's this tenant's actual
+     * Android config-profile model — confirmed live, no classic Android device-config objects exist
+     * here. `settings` is a raw passthrough array of Graph settingInstance objects — not modeled,
+     * since the Settings Catalog schema has hundreds of Android setting definitions. Use
+     * intune_get_configuration_profile (response_format="json") on an existing similar policy as a
+     * copy-and-modify starting point for constructing this array.
+     */
+    public async createSettingsCatalogPolicy(input: {
+        name: string;
+        description?: string;
+        platforms?: string;
+        technologies?: string;
+        settings: any[];
+    }) {
+        this.logger.info('Creating settings catalog policy', { name: input.name, platforms: input.platforms ?? 'androidEnterprise' });
+        await this.trackAuthAttempt();
+
+        const body = {
+            name: input.name,
+            description: input.description ?? '',
+            platforms: input.platforms ?? 'androidEnterprise',
+            technologies: input.technologies ?? 'android',
+            settings: input.settings
+        };
+
+        try {
+            const path = '/deviceManagement/configurationPolicies';
+            const apiStart = Date.now();
+            const created = await this.client.api(path).version('beta').post(body);
+            logApiCall(this.logger, 'POST', path, 201, Date.now() - apiStart);
+
+            this.logger.info('Settings catalog policy created', { id: created.id, name: input.name });
+            return { id: created.id, name: input.name, platforms: body.platforms, technologies: body.technologies };
+        } catch (error) {
+            this.logger.error('Error creating settings catalog policy', { name: input.name, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Update a Settings Catalog policy's name/description/settings. NOT YET CONFIRMED LIVE: the
+     * exact update mechanism for the `settings` array — expected to be a PATCH to the policy
+     * resource carrying the full replacement `settings` array (Settings Catalog settings aren't a
+     * separately-addressable sub-resource for writes the way getConfigurationPolicySettings reads
+     * them), but verify against a real update before relying on this.
+     */
+    public async updateSettingsCatalogPolicy(policyId: string, updates: { name?: string; description?: string; settings?: any[] }) {
+        this.logger.info('Updating settings catalog policy', { policyId, fields: Object.keys(updates) });
+        await this.trackAuthAttempt();
+
+        const body: Record<string, any> = {};
+        if (updates.name !== undefined) body.name = updates.name;
+        if (updates.description !== undefined) body.description = updates.description;
+        if (updates.settings !== undefined) body.settings = updates.settings;
+
+        try {
+            const path = `/deviceManagement/configurationPolicies/${policyId}`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('beta').patch(body);
+            logApiCall(this.logger, 'PATCH', path, 204, Date.now() - apiStart);
+
+            this.logger.info('Settings catalog policy updated', { policyId, fields: Object.keys(updates) });
+            return { policyId, updatedFields: Object.keys(updates) };
+        } catch (error) {
+            this.logger.error('Error updating settings catalog policy', { policyId, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Update a classic device configuration profile's name/description (or other type-specific
+     * properties via passthrough). Generic — not Android-specific, since classic device
+     * configurations support a plain partial PATCH regardless of platform.
+     */
+    public async updateClassicConfigurationProfile(policyId: string, updates: Record<string, any>) {
+        this.logger.info('Updating classic configuration profile', { policyId, fields: Object.keys(updates) });
+        await this.trackAuthAttempt();
+
+        const body: Record<string, any> = { ...updates };
+        if (body.name !== undefined) {
+            body.displayName = body.name;
+            delete body.name;
+        }
+
+        try {
+            const path = `/deviceManagement/deviceConfigurations/${policyId}`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('v1.0').patch(body);
+            logApiCall(this.logger, 'PATCH', path, 204, Date.now() - apiStart);
+
+            this.logger.info('Classic configuration profile updated', { policyId, fields: Object.keys(updates) });
+            return { policyId, updatedFields: Object.keys(updates) };
+        } catch (error) {
+            this.logger.error('Error updating classic configuration profile', { policyId, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Delete a configuration profile (classic or settings catalog). Test-only — not exposed as an
+     * MCP tool, used solely for integration test self-cleanup.
+     */
+    public async deleteConfigurationProfile(policyId: string, source: 'classic' | 'settingsCatalog') {
+        this.logger.info('Deleting configuration profile (test cleanup)', { policyId, source });
+        await this.trackAuthAttempt();
+
+        const path = source === 'classic'
+            ? `/deviceManagement/deviceConfigurations/${policyId}`
+            : `/deviceManagement/configurationPolicies/${policyId}`;
+        const version = source === 'classic' ? 'v1.0' : 'beta';
+
+        const apiStart = Date.now();
+        await this.client.api(path).version(version).delete();
+        logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
+    }
+
+    // ─── App configuration policies (OEMConfig) ───────────────────────────────
+    //
+    // NOT LIVE-VERIFIED: this tenant has zero Android apps in its Intune app catalog today, so
+    // there is no OEMConfig-capable target app to exercise create/update/assign against end-to-end.
+    // These methods are built to Microsoft Graph's documented androidManagedStoreAppConfiguration
+    // shape but have only been checked for correct request construction, not a live round-trip —
+    // unlike every other "confirmed live" method in this file. Validate carefully against a real
+    // Managed Google Play app before relying on the write paths in production.
+
+    /**
+     * List Intune app configuration policies (mobileAppConfigurations), which carry both regular
+     * managed-app config and OEMConfig payloads for Android Enterprise apps.
+     */
+    public async getAppConfigurationPolicies(options?: { name?: string }) {
+        const name = options?.name?.trim().toLowerCase();
+        this.logger.info('Fetching app configuration policies', { name: options?.name });
+        await this.trackAuthAttempt();
+
+        try {
+            const path = '/deviceAppManagement/mobileAppConfigurations';
+            const apiStart = Date.now();
+            const response = await this.client.api(path).version('v1.0').top(999).get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const normalized = (response.value || []).map((policy: any) => ({
+                id: policy.id,
+                name: policy.displayName,
+                description: policy.description,
+                odataType: policy['@odata.type'],
+                targetedMobileApps: policy.targetedMobileApps ?? [],
+                createdDateTime: policy.createdDateTime,
+                lastModifiedDateTime: policy.lastModifiedDateTime
+            }));
+
+            const filtered = name
+                ? normalized.filter((p: any) => String(p.name || '').toLowerCase().includes(name))
+                : normalized;
+
+            this.logger.info('App configuration policies retrieved', { total: normalized.length, filtered: filtered.length });
+
+            return {
+                policies: filtered,
+                summary: { totalPolicies: normalized.length, filteredPolicies: filtered.length }
+            };
+        } catch (error) {
+            this.logger.error('Error fetching app configuration policies', { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Get the full detail and assignments of a single app configuration policy.
+     */
+    public async getAppConfigurationPolicyDetail(id: string) {
+        this.logger.info('Fetching app configuration policy detail', { id });
+        await this.trackAuthAttempt();
+
+        try {
+            const path = `/deviceAppManagement/mobileAppConfigurations/${id}`;
+            const apiStart = Date.now();
+            const policy = await this.client.api(path).version('v1.0').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const assignmentsPath = `${path}/assignments`;
+            const assignmentsStart = Date.now();
+            const assignmentsResponse = await this.client.api(assignmentsPath).version('v1.0').top(999).get();
+            logApiCall(this.logger, 'GET', assignmentsPath, 200, Date.now() - assignmentsStart);
+
+            let decodedPayload: any = null;
+            if (typeof policy.payloadJson === 'string') {
+                try {
+                    decodedPayload = JSON.parse(Buffer.from(policy.payloadJson, 'base64').toString('utf-8'));
+                } catch (error) {
+                    this.logger.warn('Failed to decode app configuration payloadJson', { id, error: (error as Error).message });
+                }
+            }
+
+            return {
+                id: policy.id,
+                name: policy.displayName,
+                description: policy.description,
+                odataType: policy['@odata.type'],
+                targetedMobileApps: policy.targetedMobileApps ?? [],
+                decodedPayload,
+                raw: policy,
+                assignments: assignmentsResponse.value || []
+            };
+        } catch (error) {
+            this.logger.error('Error fetching app configuration policy detail', { id, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Create an Android app configuration policy (OEMConfig or regular managed-app config — both
+     * use the same androidManagedStoreAppConfiguration type in Graph, distinguished only by whether
+     * the targeted app itself is an OEMConfig app). `payloadJson` is base64-encoded per Graph's
+     * documented shape. NOT LIVE-VERIFIED — see the section comment above.
+     */
+    public async createAndroidAppConfigurationPolicy(input: {
+        name: string;
+        description?: string;
+        targetedAppId: string;
+        payloadJson?: Record<string, any>;
+        permissionActions?: any[];
+    }) {
+        this.logger.info('Creating Android app configuration policy', { name: input.name, targetedAppId: input.targetedAppId });
+        await this.trackAuthAttempt();
+
+        const body: Record<string, any> = {
+            '@odata.type': '#microsoft.graph.androidManagedStoreAppConfiguration',
+            displayName: input.name,
+            description: input.description ?? '',
+            targetedMobileApps: [input.targetedAppId]
+        };
+        if (input.payloadJson) {
+            body.payloadJson = Buffer.from(JSON.stringify(input.payloadJson), 'utf-8').toString('base64');
+        }
+        if (input.permissionActions) {
+            body.permissionActions = input.permissionActions;
+        }
+
+        try {
+            const path = '/deviceAppManagement/mobileAppConfigurations';
+            const apiStart = Date.now();
+            const created = await this.client.api(path).version('v1.0').post(body);
+            logApiCall(this.logger, 'POST', path, 201, Date.now() - apiStart);
+
+            this.logger.info('Android app configuration policy created', { id: created.id, name: input.name });
+            return { id: created.id, name: input.name, targetedAppId: input.targetedAppId };
+        } catch (error) {
+            this.logger.error('Error creating Android app configuration policy', {
+                name: input.name, targetedAppId: input.targetedAppId, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Update an app configuration policy's name/description/payload. NOT LIVE-VERIFIED — see the
+     * section comment above.
+     */
+    public async updateAndroidAppConfigurationPolicy(id: string, updates: { name?: string; description?: string; payloadJson?: Record<string, any> }) {
+        this.logger.info('Updating Android app configuration policy', { id, fields: Object.keys(updates) });
+        await this.trackAuthAttempt();
+
+        const body: Record<string, any> = {};
+        if (updates.name !== undefined) body.displayName = updates.name;
+        if (updates.description !== undefined) body.description = updates.description;
+        if (updates.payloadJson !== undefined) {
+            body.payloadJson = Buffer.from(JSON.stringify(updates.payloadJson), 'utf-8').toString('base64');
+        }
+
+        try {
+            const path = `/deviceAppManagement/mobileAppConfigurations/${id}`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('v1.0').patch(body);
+            logApiCall(this.logger, 'PATCH', path, 204, Date.now() - apiStart);
+
+            this.logger.info('Android app configuration policy updated', { id, fields: Object.keys(updates) });
+            return { id, updatedFields: Object.keys(updates) };
+        } catch (error) {
+            this.logger.error('Error updating Android app configuration policy', { id, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Add (or move) a group assignment on an app configuration policy. Same read-modify-write
+     * /assign pattern as the other assignment methods in this file. NOT LIVE-VERIFIED — see the
+     * section comment above.
+     */
+    public async assignAppConfigurationPolicyToGroup(
+        id: string,
+        groupNameOrId: string,
+        options?: { exclude?: boolean; filterId?: string; filterType?: 'include' | 'exclude' }
+    ) {
+        this.logger.info('Assigning app configuration policy to group', { id, groupNameOrId, ...options });
+        await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
+        const base = `/deviceAppManagement/mobileAppConfigurations/${id}`;
+        const assignmentODataType = '#microsoft.graph.managedDeviceMobileAppConfigurationAssignment';
+
+        try {
+            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
+            const existing: any[] = existingResponse.value || [];
+            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
+            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
+
+            const retained = directOnly
+                .filter((a: any) => a.target?.groupId !== group.id)
+                .map((a: any) => ({
+                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
+                    target: this.sanitizeAssignmentTarget(a.target)
+                }));
+
+            const newTarget: any = {
+                '@odata.type': options?.exclude
+                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
+                    : '#microsoft.graph.groupAssignmentTarget',
+                groupId: group.id
+            };
+            if (options?.filterId) {
+                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
+                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
+            }
+
+            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
+
+            const apiStart = Date.now();
+            await this.client.api(`${base}/assign`).version('v1.0').post({ assignments: updatedAssignments });
+            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
+
+            this.logger.info('App configuration policy assignment updated', { id, groupId: group.id, totalAssignments: updatedAssignments.length });
+
+            return {
+                id,
+                group,
+                exclude: Boolean(options?.exclude),
+                totalAssignments: updatedAssignments.length,
+                previousAssignmentCount: existing.length,
+                replacedExistingForGroup: hadExistingForGroup
+            };
+        } catch (error) {
+            this.logger.error('Error assigning app configuration policy to group', {
+                id, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Delete an app configuration policy. Test-only — not exposed as an MCP tool.
+     */
+    public async deleteAppConfigurationPolicy(id: string) {
+        this.logger.info('Deleting app configuration policy (test cleanup)', { id });
+        await this.trackAuthAttempt();
+
+        const path = `/deviceAppManagement/mobileAppConfigurations/${id}`;
+        const apiStart = Date.now();
+        await this.client.api(path).version('v1.0').delete();
+        logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
     }
 }
