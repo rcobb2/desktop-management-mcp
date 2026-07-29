@@ -370,10 +370,12 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching computer', { computerName: name });
+                logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
                 // Adjust error message for detail endpoint if necessary, or keep general
                 throw new Error(`Permission denied (403). The API client may be missing necessary 'Read' permissions for 'Computer Inventory' and 'Computer Inventory Details' in JAMF Pro.`);
             }
             this.logger.error(`Error fetching computer ${name}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -432,9 +434,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching mobile device', { deviceName: name });
+                logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Mobile Devices' permissions in JAMF Pro.`);
             }
             this.logger.error(`Error fetching mobile device ${name}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -524,9 +528,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied listing mobile devices');
+                logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Mobile Devices' permissions in JAMF Pro.`);
             }
             this.logger.error('Error listing mobile devices', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -561,9 +567,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching smart computer groups');
+                logApiCall(this.logger, 'GET', '/api/v2/computer-groups/smart-groups', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Computer Groups' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching smart computer groups", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v2/computer-groups/smart-groups', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -582,9 +590,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching smart mobile device groups');
+                logApiCall(this.logger, 'GET', '/api/v1/mobile-device-groups/smart-groups', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Mobile Device Groups' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching smart mobile device groups", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/mobile-device-groups/smart-groups', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -617,6 +627,7 @@ export class JamfClient {
                         };
                     } catch (error) {
                         this.logger.error(`Error fetching details for computer ID ${id}`, { error: (error as Error).message });
+                        logApiCall(this.logger, 'GET', `/api/v3/computers-inventory/${id}`, undefined, undefined, error as Error);
                         return {
                             id: id,
                             name: 'Error fetching name'
@@ -633,6 +644,7 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching smart computer group members', { groupId });
+                logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Computer Groups' and/or 'Read Computers' permissions in JAMF Pro.`);
             }
             if (axios.isAxiosError(error) && error.response?.status === 404) {
@@ -640,6 +652,7 @@ export class JamfClient {
                 throw new Error(`Smart Computer Group with ID ${groupId} not found.`);
             }
             this.logger.error(`Error fetching smart computer group members for group ${groupId}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -688,9 +701,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching computers', { assetTag });
+                logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Computers' permissions in JAMF Pro.`);
             }
             this.logger.error(`Error fetching computers`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -760,9 +775,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching computers by user identifier', { userIdentifier });
+                logApiCall(this.logger, 'GET', '/api/v1/computers-inventory', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Computers' permissions in JAMF Pro.`);
             }
             this.logger.error(`Error fetching computers by user identifier ${identifier}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -780,9 +797,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching sites');
+                logApiCall(this.logger, 'GET', '/api/v1/sites', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Sites' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching sites", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/sites', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -837,14 +856,17 @@ export class JamfClient {
             if (axios.isAxiosError(error)) {
                 if (error.response?.status === 403) {
                     this.logger.error('Permission denied fetching scripts');
+                    logApiCall(this.logger, 'GET', '/api/v1/scripts', undefined, undefined, error as Error);
                     throw new Error(`Permission denied (403). The API client may be missing 'Read Scripts' permissions in JAMF Pro.`);
                 }
                 if (error.response?.status === 400) {
                     this.logger.error('Bad request fetching scripts', { status: error.response.status, data: error.response.data, config: { url: error.config?.url, params: error.config?.params } });
+                    logApiCall(this.logger, 'GET', '/api/v1/scripts', undefined, undefined, error as Error);
                     throw new Error(`Bad request (400). ${error.response.data?.message || 'Invalid filter or parameter format'}`);
                 }
             }
             this.logger.error("Error fetching scripts", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/scripts', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -901,14 +923,17 @@ export class JamfClient {
             if (axios.isAxiosError(error)) {
                 if (error.response?.status === 403) {
                     this.logger.error('Permission denied fetching packages');
+                    logApiCall(this.logger, 'GET', '/api/v1/packages', undefined, undefined, error as Error);
                     throw new Error(`Permission denied (403). The API client may be missing 'Read Packages' permissions in JAMF Pro.`);
                 }
                 if (error.response?.status === 400) {
                     this.logger.error('Bad request fetching packages', { status: error.response.status, data: error.response.data, config: { url: error.config?.url, params: error.config?.params } });
+                    logApiCall(this.logger, 'GET', '/api/v1/packages', undefined, undefined, error as Error);
                     throw new Error(`Bad request (400). ${error.response.data?.message || 'Invalid filter or parameter format'}`);
                 }
             }
             this.logger.error("Error fetching packages", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/packages', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -928,6 +953,7 @@ export class JamfClient {
                 throw new Error(`Script with ID ${id} not found.`);
             }
             this.logger.error('Error fetching script by id', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/api/v1/scripts/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -955,6 +981,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create Scripts' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating script', { error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/api/v1/scripts', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -971,6 +998,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Scripts' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating script', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/api/v1/scripts/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1043,6 +1071,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create Packages' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating package metadata', { error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/api/v1/packages', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1059,6 +1088,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Packages' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating package metadata', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/api/v1/packages/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1239,6 +1269,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Delete Packages' permissions in JAMF Pro.`);
             }
             this.logger.error('Error deleting package', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `/api/v1/packages/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1266,6 +1297,7 @@ export class JamfClient {
                 throw new Error(`Computer group with ID ${groupId} not found.`);
             }
             this.logger.error('Error fetching smart group detail', { groupId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/computergroups/id/${groupId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1296,6 +1328,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create Smart Computer Groups' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating smart group', { error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/computergroups/id/0', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1314,6 +1347,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Smart Computer Groups' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating smart group', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/JSSResource/computergroups/id/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1417,6 +1451,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read User Groups' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching user groups', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/JSSResource/usergroups', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1439,6 +1474,7 @@ export class JamfClient {
                 throw new Error(`User group with ID ${groupId} not found.`);
             }
             this.logger.error('Error fetching user group detail', { groupId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/usergroups/id/${groupId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1489,6 +1525,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create User Groups' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating user group', { error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/usergroups/id/0', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1507,6 +1544,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update User Groups' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating user group', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/JSSResource/usergroups/id/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1587,9 +1625,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching inventory preload records');
+                logApiCall(this.logger, 'GET', '/api/v1/inventory-preload', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Inventory Preload Records' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching inventory preload records", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/inventory-preload', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1645,6 +1685,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create Inventory Preload Records' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating inventory preload record', { serialNumber: record.serialNumber, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/api/v1/inventory-preload', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1671,6 +1712,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Inventory Preload Records' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating inventory preload record', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/api/v1/inventory-preload/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1725,9 +1767,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching prestage assignments');
+                logApiCall(this.logger, 'GET', '/api/v3/computer-prestages', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Prestage Assignments' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching prestage assignments", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v3/computer-prestages', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1745,6 +1789,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Prestage Assignments' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching prestage scope', { prestageId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/api/v2/computer-prestages/${prestageId}/scope`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1850,9 +1895,11 @@ export class JamfClient {
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching computer groups');
+                logApiCall(this.logger, 'GET', '/api/v1/computer-groups', undefined, undefined, error as Error);
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Computer Groups' permissions in JAMF Pro.`);
             }
             this.logger.error("Error fetching static computer groups", { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/api/v1/computer-groups', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1952,6 +1999,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Computers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching computer by serial', { serial, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1997,6 +2045,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Computers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating computer record', { nameOrSerial, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${nameOrSerial}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2038,6 +2087,7 @@ export class JamfClient {
                 throw new Error(`No category named "${options.categoryName}" found (or it has no policies) — use jamf_list_categories to see valid names.`);
             }
             this.logger.error('Error fetching policies', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', options?.categoryName ? `/JSSResource/policies/category/${encodeURIComponent(options.categoryName)}` : '/JSSResource/policies', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2061,6 +2111,7 @@ export class JamfClient {
                 throw new Error(`Policy with ID ${policyId} not found.`);
             }
             this.logger.error('Error fetching policy detail', { policyId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/policies/id/${policyId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2127,6 +2178,7 @@ export class JamfClient {
                 throw new Error(`Computer with ID ${computerId} not found.`);
             }
             this.logger.error('Error fetching computer policy logs', { computerId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/computerhistory/id/${computerId}/subset/Policy_Logs`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2511,6 +2563,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error upserting policy', { name: params.name, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/policies/id/0', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2638,6 +2691,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating policy scope', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2692,6 +2746,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating policy scripts', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (scripts)`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2785,6 +2840,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read macOS Configuration Profiles' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching configuration profiles', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/JSSResource/osxconfigurationprofiles', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2805,6 +2861,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Patch Policies' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching patch policies', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v3/patch-policies', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2832,6 +2889,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read LDAP Servers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching LDAP servers', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/JSSResource/ldapservers', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2855,6 +2913,7 @@ export class JamfClient {
                 throw new Error(`LDAP server with ID ${serverId} not found.`);
             }
             this.logger.error('Error searching LDAP users', { serverId, username, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/user/${username}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2878,6 +2937,7 @@ export class JamfClient {
                 throw new Error(`LDAP server with ID ${serverId} not found.`);
             }
             this.logger.error('Error searching LDAP groups', { serverId, groupName, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/group/${groupName}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2901,6 +2961,7 @@ export class JamfClient {
                 throw new Error(`LDAP server with ID ${serverId} not found.`);
             }
             this.logger.error('Error checking LDAP group membership', { serverId, groupName, username, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/ldapservers/id/${serverId}/group/${groupName}/user/${username}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -2922,6 +2983,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create Users' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating Jamf user', { error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/users/id/0', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3011,6 +3073,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read User' (Cloud Identity Provider) permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching Cloud Identity Providers', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/cloud-idp', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3051,6 +3114,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read User' (Cloud Identity Provider) permissions in JAMF Pro.`);
             }
             this.logger.error('Error testing Cloud Identity Provider lookup', { idpId, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', params.username ? `/api/v1/cloud-idp/${idpId}/test-user-membership` : `/api/v1/cloud-idp/${idpId}/test-group`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3071,6 +3135,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Departments' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching departments', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/departments', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3091,6 +3156,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Categories' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching categories', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/categories', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3136,6 +3202,7 @@ export class JamfClient {
                 }
             }
             this.logger.error('Error flushing policy logs', { policyNameOrId, interval, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `/JSSResource/logflush/policy/id/${policyNameOrId}/interval/${interval}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3157,6 +3224,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Flush MDM Commands' permissions in JAMF Pro.`);
             }
             this.logger.error('Error flushing MDM commands', { nameOrSerial, status, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `/JSSResource/commandflush/computers/id/${nameOrSerial}/status/${status}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3187,6 +3255,7 @@ export class JamfClient {
             };
         } catch (error) {
             this.logger.error('Error fetching FileVault status', { nameOrSerial, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3223,6 +3292,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (${status}). The Platform API Gateway credential (JAMF_PLATFORM_CLIENT_ID) may be missing the 'read:env:filevault' privilege on its account.jamf.com Integration.`);
             }
             this.logger.error('Error fetching bulk FileVault status', { page, pageSize, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/pro/v4/tenant/${tenantId}/computers-inventory/filevault`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3258,6 +3328,7 @@ export class JamfClient {
             return { totalCount: baselines.length, results: baselines };
         } catch (error) {
             this.logger.error('Error fetching Compliance Benchmarks baselines', { tenantId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/compliance-benchmarks/v1/tenant/${tenantId}/baselines`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3281,6 +3352,7 @@ export class JamfClient {
             return { totalCount: benchmarks.length, results: benchmarks };
         } catch (error) {
             this.logger.error('Error fetching Compliance Benchmarks list', { tenantId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3330,6 +3402,7 @@ export class JamfClient {
                 return null;
             }
             this.logger.error('Error fetching Compliance Benchmark detail', { tenantId, benchmarkId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks/${benchmarkId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3367,6 +3440,7 @@ export class JamfClient {
             return { totalCount: response.data.totalCount ?? results.length, results };
         } catch (error) {
             this.logger.error('Error fetching Compliance Benchmark rule devices', { tenantId, benchmarkId, ruleId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks/${benchmarkId}/devices`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3405,6 +3479,7 @@ export class JamfClient {
             return { totalCount: response.data.totalCount ?? results.length, results };
         } catch (error) {
             this.logger.error('Error fetching Blueprints list', { tenantId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/blueprints/v1/tenant/${tenantId}/blueprints`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3443,6 +3518,7 @@ export class JamfClient {
                 return null;
             }
             this.logger.error('Error fetching Blueprint detail', { tenantId, blueprintId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/blueprints/v1/tenant/${tenantId}/blueprints/${blueprintId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3468,6 +3544,7 @@ export class JamfClient {
             return { totalCount: response.data.totalCount ?? results.length, results };
         } catch (error) {
             this.logger.error('Error fetching Blueprint components', { tenantId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/blueprints/v1/tenant/${tenantId}/blueprint-components`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3488,6 +3565,7 @@ export class JamfClient {
             return response.data;
         } catch (error) {
             this.logger.error('Error fetching auth details', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/auth', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3513,6 +3591,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Disk Encryption Configurations' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching disk encryption configurations', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/JSSResource/diskencryptionconfigurations', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3566,6 +3645,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create/Update Disk Encryption Configurations' permissions in JAMF Pro.`);
             }
             this.logger.error('Error upserting disk encryption configuration', { name: params.name, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/diskencryptionconfigurations/id/0', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3591,6 +3671,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read App Installers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching app installer titles', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/app-installers/titles', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3625,6 +3706,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read App Installers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error fetching app installer deployments', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/app-installers/deployments', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3646,6 +3728,7 @@ export class JamfClient {
                 throw new Error(`App installer deployment with ID ${deploymentId} not found.`);
             }
             this.logger.error('Error fetching app installer deployment detail', { deploymentId, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/api/v1/app-installers/deployments/${deploymentId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3733,6 +3816,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Create App Installers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error creating app installer deployment', { name: params.name, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/api/v1/app-installers/deployments', undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3793,6 +3877,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Update App Installers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error updating app installer deployment', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'PUT', `/api/v1/app-installers/deployments/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3813,6 +3898,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (403). The API client may be missing 'Delete App Installers' permissions in JAMF Pro.`);
             }
             this.logger.error('Error deleting app installer deployment', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `/api/v1/app-installers/deployments/${id}`, undefined, undefined, error as Error);
             throw error;
         }
     }
