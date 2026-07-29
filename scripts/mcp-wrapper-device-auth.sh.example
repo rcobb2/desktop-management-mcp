@@ -3,11 +3,27 @@
 # localhost-callback OAuth flow can't complete (no local browser, and setting
 # up SSH port forwarding for every session is a hassle).
 #
-# Fetches a fresh Entra access token via the device code flow (see
-# src/cli/entra-device-auth.ts — run its `login` subcommand once, interactively,
-# before wiring this up) and hands it to mcp-remote via --header, which
-# bypasses mcp-remote's own OAuth entirely (its documented "Custom Headers"
-# bypass-auth mechanism).
+# Uses the device code flow (see src/cli/entra-device-auth.ts — run its
+# `login` subcommand once, interactively, before wiring this up) to obtain a
+# token, then seeds it directly into mcp-remote's OWN on-disk token cache
+# rather than bypassing mcp-remote's OAuth via --header.
+#
+# Why not --header: confirmed by reading mcp-remote 0.1.38's source directly
+# — a --header value is parsed once at process startup into a fixed in-memory
+# object and never re-read, so a long-running mcp-remote process (and the
+# long MCP client session riding on its stdio pipe) goes stale once that
+# token expires (~60-90min) and every request 401s until the client restarts.
+# Seeding mcp-remote's own cache instead lets its native OAuth machinery
+# refresh transparently on a 401 and retry the same request automatically —
+# see entra-device-auth.ts's file header comment for the full trace through
+# mcp-remote's source confirming this.
+#
+# For that to keep working long-term (not just at this wrapper's launch),
+# pair this with a periodic `entra-device-auth keepalive --profile ...
+# --server-url ...` process (e.g. a systemd --user service) that proactively
+# reseeds the cache well before real expiry — see that subcommand's own doc
+# comment for why a purely-reactive refresh-on-401 isn't quite enough on a
+# box that might sit idle for a long time.
 #
 # Copy this file to e.g. ~/.claude/mcp-wrappers/intune-mcp-device.sh, chmod +x
 # it, set PROFILE below (or pass it as $1), and point your MCP client config's
@@ -17,8 +33,15 @@ set -euo pipefail
 DESKTOP_MCP_DIR="/home/ad/cobbr/desktop-management-mcp"
 PROFILE="${1:-intune}"          # matches the --profile used with `entra-device-auth login`
 MCP_URL="${2:-https://intune-mcp.colgate.edu/mcp}"
-CALLBACK_PORT="${3:-3335}"      # unused by mcp-remote once --header bypasses OAuth, but it still binds this port
+CALLBACK_PORT="${3:-3335}"      # unused once mcp-remote finds cached tokens, but it still binds this port at startup
 
-TOKEN=$(node "${DESKTOP_MCP_DIR}/dist/src/cli/entra-device-auth.js" token --profile "${PROFILE}")
+node "${DESKTOP_MCP_DIR}/dist/src/cli/entra-device-auth.js" seed-mcp-remote --profile "${PROFILE}" --server-url "${MCP_URL}"
 
-exec mcp-remote "${MCP_URL}" "${CALLBACK_PORT}" --header "Authorization:Bearer ${TOKEN}"
+# --static-oauth-client-info skips Entra's lack of Dynamic Client Registration
+# (RFC 7591) support entirely — mcp-remote never needs to register a client,
+# it just uses this one, matching the public client entra-device-auth.ts
+# already authenticated against. --static-oauth-client-metadata's scope must
+# match what was used for login (see entra-device-auth.ts's DEFAULT_SCOPE).
+exec mcp-remote "${MCP_URL}" "${CALLBACK_PORT}" \
+  --static-oauth-client-info '{"client_id":"6ec0e521-9e10-44cb-b767-7806f365c8df"}' \
+  --static-oauth-client-metadata '{"scope":"openid profile offline_access api://colgate.edu/desktop-mgmt-mcp/access_as_user"}'
