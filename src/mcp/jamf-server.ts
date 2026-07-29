@@ -28,6 +28,16 @@
  *   JAMF_PACKAGE_UPLOAD_DIR    Directory jamf_upload_package is allowed to read files from on this
  *                              server's own filesystem (not the MCP client's). Required for that tool —
  *                              it refuses every call if unset, and rejects any localFilePath outside it.
+ *   JAMF_PLATFORM_CLIENT_ID     OAuth2 client-credentials ID for the Jamf Platform API Gateway — a separate
+ *   JAMF_PLATFORM_CLIENT_SECRET account.jamf.com Integration credential, NOT the same as JAMF_CLIENT_ID/SECRET
+ *                               above. Required only by jamf_list_filevault_status, the jamf_*_compliance_*
+ *                               tools, and the jamf_*_blueprint* tools. See jamf-api.ts for details.
+ *   JAMF_PLATFORM_URL           Token endpoint for the above credential (e.g. https://us.apigw.jamf.com/auth/token
+ *                               — NOT the /oauth2/token path Jamf's own OpenAPI spec documents; the real deployed
+ *                               endpoint differs from the spec, confirmed live).
+ *   JAMF_PLATFORM_TENANT_ID     Tenant UUID for the Platform API Gateway — distinct from JAMF_URL/this tenant's
+ *                               own Jamf Pro instance.
+ *   JAMF_PLATFORM_REGION        Optional. Platform API Gateway region: "us" (default), "eu", "apac".
  *   PORT                       HTTP port to listen on (default: 3001)
  */
 
@@ -1372,6 +1382,53 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 23b. jamf_list_filevault_status ──────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_filevault_status",
+            {
+                description:
+                    "Bulk FileVault escrow/status read across the whole JAMF Pro fleet, one page per call " +
+                    "(GET .../computers-inventory/filevault) — the bulk equivalent of jamf_get_filevault_status " +
+                    "for auditing escrow validity fleet-wide without one API call per machine. Routed through the " +
+                    "Jamf Platform API Gateway (JAMF_PLATFORM_* env vars), which was granted the 'View Disk " +
+                    "Encryption Recovery Key' privilege this tenant's own direct API client lacks — confirmed " +
+                    "live 2026-07-29.",
+                inputSchema: {
+                    page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                    pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ page = 0, pageSize = 100, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getFilevaultStatusBulk(page, pageSize);
+                    const results: any[] = data.results ?? [];
+
+                    const text = toText(data, response_format, () => {
+                        if (results.length === 0) return `No FileVault status records found (page ${page}).`;
+                        // Deliberately omits personalRecoveryKey from the markdown view — the actual
+                        // escrowed recovery key is sensitive and shouldn't be bulk-rendered into a chat
+                        // transcript; json response_format still returns it (full API fidelity), matching
+                        // jamf_get_filevault_status's existing markdown output, which also omits it.
+                        const rows = results
+                            .map((r: any) => {
+                                const boot = r.bootPartitionEncryptionDetails ?? {};
+                                return `- **${r.name ?? "Unknown"}** (ID ${r.computerId ?? "—"}) | State: ${boot.partitionFileVault2State ?? "—"} (${boot.partitionFileVault2Percent ?? "?"}%) | Individual Key: ${r.individualRecoveryKeyValidityStatus ?? "—"} | Institutional Key: ${r.institutionalRecoveryKeyPresent ? "Yes" : "No"} | Config: ${r.diskEncryptionConfigurationName ?? "—"}`;
+                            })
+                            .join("\n");
+                        return `## FileVault Status — page ${page} (${results.length} of ${data.totalCount} total)\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 24. jamf_list_mobile_devices ─────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(
@@ -2520,6 +2577,310 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                         ].filter(Boolean).join("\n");
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 43. jamf_list_compliance_baselines ───────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_compliance_baselines",
+            {
+                description:
+                    "List the mSCP (macOS Security Compliance Project) baselines available for Jamf Pro's " +
+                    "Compliance Benchmarks feature — CIS Level 1/2, NIST, etc. This is Jamf's baseline catalog, " +
+                    "not this tenant's own configured benchmarks (see jamf_list_compliance_benchmarks for those); " +
+                    "it should return results even for a tenant with zero benchmarks configured yet. Read-only — " +
+                    "this codebase does not expose creating or deleting a benchmark, since that's a fleet-wide " +
+                    "security-posture change requiring an explicit human decision in the JAMF Pro console. " +
+                    "Confirmed live 2026-07-29 (all 14 real catalog baselines returned). Requires " +
+                    "JAMF_PLATFORM_* env vars to be configured (see src/jamf/jamf-api.ts).",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getComplianceBaselines();
+                    const baselines: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (baselines.length === 0) return "No mSCP baselines returned.";
+                        const rows = baselines
+                            .map((b: any) => `- **${b.title}** (\`${b.baselineId}\`) — ${b.ruleCount} rules. ${b.description ?? ""}`)
+                            .join("\n");
+                        return `## mSCP Baselines (${baselines.length})\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 44. jamf_list_compliance_benchmarks ──────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_compliance_benchmarks",
+            {
+                description:
+                    "List this tenant's own configured Compliance Benchmarks (baselines actually built/deployed " +
+                    "here, as opposed to jamf_list_compliance_baselines' catalog of what's available to build). " +
+                    "An empty result may simply mean this tenant hasn't configured any Compliance Benchmarks yet, " +
+                    "not that something is broken. Use jamf_get_compliance_benchmark for one benchmark's full " +
+                    "detail (rules, scope, enforcement mode, compliance percentage).",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getComplianceBenchmarks();
+                    const benchmarks: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (benchmarks.length === 0) return "No Compliance Benchmarks configured for this tenant.";
+                        const rows = benchmarks
+                            .map((b: any) => `- **${b.title}** (ID \`${b.id}\`) — sync: ${b.syncState ?? "—"}${b.updateAvailable ? " (update available)" : ""}${b.modified ? " (locally modified)" : ""}`)
+                            .join("\n");
+                        return `## Compliance Benchmarks (${benchmarks.length})\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 45. jamf_get_compliance_benchmark ────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_compliance_benchmark",
+            {
+                description:
+                    "Get full detail for a single Compliance Benchmark: its target device groups, enforcement " +
+                    "mode (monitor-only vs. monitor-and-enforce), every rule (embedded inline — no separate call " +
+                    "needed), and overall compliance percentage (best-effort — null if the benchmark has no " +
+                    "reportable rules yet, which is a valid state, not an error). Use jamf_list_compliance_benchmarks " +
+                    "to find a benchmark ID. For per-rule device pass/fail drill-down, see " +
+                    "jamf_get_compliance_benchmark_devices.",
+                inputSchema: {
+                    benchmarkId: z.string().describe("Benchmark ID — see jamf_list_compliance_benchmarks"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ benchmarkId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getComplianceBenchmarkDetail(benchmarkId);
+                    if (!data) return notFound(`Compliance Benchmark "${benchmarkId}"`);
+
+                    const text = toText(data, response_format, () => {
+                        const d: any = data;
+                        const rules: any[] = d.rules ?? [];
+                        const ruleRows = rules
+                            .map((r: any) => `  - \`${r.id}\` ${r.title}${r.enabled === false ? " (disabled)" : ""} — ${r.sectionName ?? "—"}`)
+                            .join("\n");
+                        return [
+                            `## Compliance Benchmark — ${d.title ?? benchmarkId}`,
+                            `- **ID:** ${d.benchmarkId ?? benchmarkId}`,
+                            `- **Baseline:** ${d.baselineId ?? "—"}`,
+                            `- **Enforcement Mode:** ${d.enforcementMode ?? "—"}`,
+                            `- **Target Device Groups:** ${(d.target?.deviceGroups ?? []).join(", ") || "—"}`,
+                            `- **Compliance:** ${d.compliancePercentage != null ? `${d.compliancePercentage}%` : "— (no reportable rules yet)"}`,
+                            `- **Update Available:** ${d.updateAvailable ? "Yes" : "No"}`,
+                            `- **Last Updated:** ${d.lastUpdatedAt ?? "—"}`,
+                            `\n### Rules (${rules.length})\n${ruleRows || "—"}`,
+                        ].join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 46. jamf_get_compliance_benchmark_devices ────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_compliance_benchmark_devices",
+            {
+                description:
+                    "Per-rule device drill-down for one Compliance Benchmark: which devices passed, failed, or " +
+                    "are unknown for a single rule. Use jamf_get_compliance_benchmark first to find the benchmark's " +
+                    "rule IDs (in its rules array), then pass one here as ruleId. Paginated.",
+                inputSchema: {
+                    benchmarkId: z.string().describe("Benchmark ID — see jamf_list_compliance_benchmarks"),
+                    ruleId: z.string().describe("Rule ID within the benchmark — see jamf_get_compliance_benchmark's rules array"),
+                    deviceSearch: z.string().optional().describe("Filter by matching device name or device ID"),
+                    ruleResult: z.enum(["PASSED", "FAILED", "UNKNOWN"]).optional().describe("Filter to devices with this rule result"),
+                    page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                    pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ benchmarkId, ruleId, deviceSearch, ruleResult, page = 0, pageSize = 100, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getComplianceBenchmarkDevices(benchmarkId, ruleId, {
+                        page, pageSize, deviceSearch, ruleResult,
+                    });
+                    const results: any[] = data.results ?? [];
+
+                    const text = toText(data, response_format, () => {
+                        if (results.length === 0) return `No devices found for rule "${ruleId}" (page ${page}).`;
+                        const rows = results
+                            .map((d: any) => `- **${d.deviceName ?? d.deviceId}** — ${d.state}`)
+                            .join("\n");
+                        return `## Devices for rule \`${ruleId}\` — page ${page} (${results.length} of ${data.totalCount} total)\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 47. jamf_list_blueprints ─────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_blueprints",
+            {
+                description:
+                    "List Blueprints — Jamf Pro's declarative-device-management workflows (name, deployment " +
+                    "state, last deployment result). Optional `search` matches against name/description " +
+                    "server-side. Read-only; write tools (create/update/deploy/undeploy/delete) are not exposed " +
+                    "here since deploying or undeploying a blueprint changes real devices' management state " +
+                    "fleet-wide — that needs a deliberate human decision, not implicit exposure via a read tool. " +
+                    "Confirmed live 2026-07-29 (4 real blueprints returned). Requires JAMF_PLATFORM_* env vars " +
+                    "(see src/jamf/jamf-api.ts).",
+                inputSchema: {
+                    search: z.string().optional().describe("Search against blueprint name/description"),
+                    page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                    pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ search, page = 0, pageSize = 100, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getBlueprints({ search, page, pageSize });
+                    const blueprints: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (blueprints.length === 0) return "No blueprints found.";
+                        const rows = blueprints
+                            .map((b: any) => {
+                                const state = b.deploymentState?.state ?? "—";
+                                const last = b.deploymentState?.lastDeployment;
+                                const lastNote = last ? ` | Last deployment: ${last.state} (${last.started})` : "";
+                                return `- **${b.name ?? "(unnamed)"}** (\`${b.id}\`) — ${state}${lastNote}`;
+                            })
+                            .join("\n");
+                        return `## Blueprints (${blueprints.length} of ${data.totalCount})\n\n${rows}`;
+                    });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 48. jamf_get_blueprint ───────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_blueprint",
+            {
+                description:
+                    "Get full detail for a single Blueprint: scope (target device groups), steps and their " +
+                    "component configuration, deployment state, and a status report (succeeded/failed/pending " +
+                    "device counts for its last deployment). Use jamf_list_blueprints to find a blueprint ID. " +
+                    "Confirmed live 2026-07-29 (real detail + report for a deployed blueprint). Requires " +
+                    "JAMF_PLATFORM_* env vars (see src/jamf/jamf-api.ts).",
+                inputSchema: {
+                    blueprintId: z.string().describe("Blueprint ID (UUID) — see jamf_list_blueprints"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ blueprintId, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getBlueprintDetail(blueprintId);
+                    if (!data) return notFound(`Blueprint "${blueprintId}"`);
+
+                    const text = toText(data, response_format, () => {
+                        const d: any = data;
+                        const deviceGroups: string[] = d.scope?.deviceGroups ?? [];
+                        const steps: any[] = d.steps ?? [];
+                        const stepRows = steps
+                            .map((s: any) => {
+                                const components: any[] = s.components ?? [];
+                                const componentNames = components.map((c: any) => c.identifier).join(", ") || "—";
+                                return `  - **${s.name ?? "Step"}**: ${componentNames}`;
+                            })
+                            .join("\n");
+                        const report = d.report;
+                        const reportLine = report
+                            ? `- **Report:** ${report.succeeded ?? 0} succeeded, ${report.failed ?? 0} failed, ${report.pending ?? 0} pending`
+                            : "- **Report:** unavailable";
+
+                        return [
+                            `## Blueprint — ${d.name ?? blueprintId}`,
+                            `- **ID:** ${d.id ?? blueprintId}`,
+                            `- **Deployment State:** ${d.deploymentState?.state ?? "—"}`,
+                            `- **Target Device Groups:** ${deviceGroups.join(", ") || "—"}`,
+                            reportLine,
+                            `\n### Steps (${steps.length})\n${stepRows || "—"}`,
+                        ].join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 49. jamf_list_blueprint_components ───────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_list_blueprint_components",
+            {
+                description:
+                    "List the catalog of components (payload types) available to build blueprints from — " +
+                    "Software Updates, Configuration Profile, Custom Declarations, etc. This is the catalog of " +
+                    "what's available, not any particular blueprint's chosen components (see jamf_get_blueprint " +
+                    "for those). Confirmed live 2026-07-29 (16 real components returned). Requires " +
+                    "JAMF_PLATFORM_* env vars (see src/jamf/jamf-api.ts).",
+                inputSchema: {
+                    page: z.number().int().min(0).default(0).describe("Page number (0-indexed, default: 0)"),
+                    pageSize: z.number().int().min(1).max(200).default(100).describe("Results per page (default: 100, max: 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ page = 0, pageSize = 100, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getBlueprintComponents({ page, pageSize });
+                    const components: any[] = data.results ?? [];
+                    const text = toText(data, response_format, () => {
+                        if (components.length === 0) return "No blueprint components found.";
+                        const rows = components
+                            .map((c: any) => `- **${c.name ?? c.identifier}** (\`${c.identifier}\`) — ${c.description ?? ""}`)
+                            .join("\n");
+                        return `## Blueprint Components (${components.length} of ${data.totalCount})\n\n${rows}`;
+                    });
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

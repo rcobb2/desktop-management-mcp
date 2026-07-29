@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "jamf-remote": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR:-.}/scripts/mcp-wrappers/jamf-mcp-device.sh",
+      "args": []
+    },
+    "intune-remote": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR:-.}/scripts/mcp-wrappers/intune-mcp-device.sh",
+      "args": []
+    },
+    "microsoft-learn": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "jamf-docs": {
+      "type": "http",
+      "url": "https://developer.jamf.com/mcp"
+    }
+  }
+}

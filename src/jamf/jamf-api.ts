@@ -112,13 +112,68 @@ function buildXmlDocument(rootTag: string, body: any): string {
     return `<?xml version="1.0" encoding="UTF-8"?><${rootTag}>${serializeXmlObjectBody(body)}</${rootTag}>`;
 }
 
+// Jamf's Platform API Gateway proxies most of Jamf Pro's own REST API (v1/v2/v3/v4,
+// NOT Classic API) plus platform-native features (Compliance Benchmarks, Blueprints)
+// that don't exist on the tenant's own Jamf Pro instance at all — a distinct host from
+// every other endpoint in this file, and a GENUINELY SEPARATE OAuth2 client-credentials
+// credential from JAMF_CLIENT_ID/SECRET above, not a token-reuse situation. Confirmed
+// live 2026-07-29 against a real account.jamf.com Integration credential
+// (JAMF_PLATFORM_CLIENT_ID/SECRET, exchanged at JAMF_PLATFORM_URL — NOT the
+// `/oauth2/token` path the OpenAPI spec documents; the real deployed token endpoint
+// differs from the spec):
+//   - It has privileges the tenant's own JAMF_CLIENT_ID/SECRET role does NOT: bulk
+//     FileVault (`read:env:filevault`) 403s directly but returns real data through
+//     this Gateway credential.
+//   - Its REST API coverage is broad, not narrow as first assumed — direct live testing
+//     of every non-Classic REST resource this file uses (computers-inventory + detail,
+//     categories, departments, sites, scripts, packages, computer-groups, mobile-devices,
+//     computer-prestages, app-installers, cloud-idp, inventory-preload) all returned 200.
+//     The ONLY confirmed exceptions are Classic API (GET .../api/proclassic/JSSResource/
+//     categories returned a clean 403 BAD_PERMISSIONS) and patch-policies specifically
+//     (GET .../api/pro/v3/tenant/{id}/patch-policies also 403s) — every other REST
+//     resource tested is reachable. restGet(), below, is the shared entry point that
+//     routes a direct-API GET through this Gateway when JAMF_PLATFORM_* is configured,
+//     falling back to the direct client otherwise (so this stays a zero-config-required
+//     optimization, not a new hard dependency).
+// Base host per Jamf's spec (confirmed via jamf-docs MCP's get-server-variables):
+// https://{region}.apigw.jamf.com/api, region defaulting to "us" (also "eu"/"apac").
+// JAMF_PLATFORM_REGION overrides the default for tenants outside the US.
+function platformApiBaseUrl(): string {
+    const region = process.env.JAMF_PLATFORM_REGION || 'us';
+    return `https://${region}.apigw.jamf.com/api`;
+}
+
+// Maps a direct Jamf Pro REST path like "/api/v3/computers-inventory" (or with a
+// trailing segment, e.g. "/api/v3/computers-inventory-detail/123") to its Platform API
+// Gateway mirror, e.g. "/pro/v3/tenant/{tenantId}/computers-inventory-detail/123" —
+// confirmed live 2026-07-29 this is the exact shape the Gateway expects (tenantId
+// inserted immediately after the version segment). Only handles versioned REST paths
+// (`/api/v{n}/...`); Classic API paths (`/JSSResource/...`) are never passed here since
+// the Gateway doesn't have Classic API access at all (see the section comment above).
+function toGatewayProPath(directPath: string, tenantId: string): string {
+    const match = directPath.match(/^\/api(\/v\d+)(\/.*)$/);
+    if (!match) {
+        throw new Error(`toGatewayProPath: cannot map non-versioned-REST path "${directPath}" to the Platform API Gateway`);
+    }
+    return `/pro${match[1]}/tenant/${tenantId}${match[2]}`;
+}
+
 export class JamfClient {
     private client: AxiosInstance;
+    // Platform API Gateway client (see platformApiBaseUrl, above) — used for bulk
+    // FileVault, Compliance Benchmarks, and Blueprints. Authenticated independently of
+    // `client` via ensurePlatformAuthenticated(), its own token, its own lifecycle.
+    private platformClient: AxiosInstance;
     private token: string | null = null;
     private tokenExpiresAt: number = 0;
+    private platformToken: string | null = null;
+    private platformTokenExpiresAt: number = 0;
     private jamfUrl: string;
     private jamfClientId: string;
     private jamfClientSecret: string;
+    private platformClientId: string;
+    private platformClientSecret: string;
+    private platformTokenUrl: string;
     private logger = createLogger('jamf-api');
 
     constructor() {
@@ -136,6 +191,20 @@ export class JamfClient {
                 'Accept': 'application/json',
                 'Content-Type': 'application/json',
             },
+        });
+
+        // Platform Gateway credentials are optional — only jamf_list_filevault_status,
+        // the Compliance Benchmarks tools, and the Blueprints tools need them; every
+        // other tool in this file works without them. Missing/empty values are caught
+        // lazily in ensurePlatformAuthenticated(), not here, so a client without them
+        // configured can still be constructed and used for everything else.
+        this.platformClientId = process.env.JAMF_PLATFORM_CLIENT_ID ?? '';
+        this.platformClientSecret = process.env.JAMF_PLATFORM_CLIENT_SECRET ?? '';
+        this.platformTokenUrl = process.env.JAMF_PLATFORM_URL ?? '';
+
+        this.platformClient = axios.create({
+            baseURL: platformApiBaseUrl(),
+            headers: { 'Accept': 'application/json' },
         });
     }
 
@@ -161,7 +230,7 @@ export class JamfClient {
         this.logger.info("JAMF Authentication successful");
             logAuth(this.logger, 'success', 'jamf');
             logApiCall(this.logger, 'POST', '/api/v1/oauth/token', response.status, apiDuration);
-            
+
             this.token = response.data.access_token;
             // Set expiration time (subtracting a small buffer like 60 seconds)
             this.tokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
@@ -180,13 +249,91 @@ export class JamfClient {
         }
     }
 
+    // Separate OAuth2 client-credentials flow for the Platform API Gateway — confirmed
+    // live 2026-07-29 that this is a genuinely distinct token exchange from the tenant's
+    // own /api/v1/oauth/token above (this Gateway rejects that token, and this token
+    // isn't valid against the tenant's own Jamf Pro API either). Token TTL was 900s (15
+    // min) on a live response — shorter than the tenant token's — so this uses the same
+    // 60s-buffer lazy-refresh pattern as ensureAuthenticated() but on its own schedule.
+    private async ensurePlatformAuthenticated() {
+        if (!this.platformClientId || !this.platformClientSecret || !this.platformTokenUrl) {
+            throw new Error(
+                "JAMF_PLATFORM_CLIENT_ID, JAMF_PLATFORM_CLIENT_SECRET, and JAMF_PLATFORM_URL must all be set " +
+                "to use Platform API Gateway tools (bulk FileVault, Compliance Benchmarks, Blueprints) — these " +
+                "come from a separate account.jamf.com Integration credential, not the tenant's own " +
+                "JAMF_CLIENT_ID/JAMF_CLIENT_SECRET."
+            );
+        }
+        if (this.platformToken && Date.now() < this.platformTokenExpiresAt) return;
+
+        this.logger.info("Authenticating with Jamf Platform API Gateway");
+        try {
+            const apiStart = Date.now();
+            const response = await axios.post(this.platformTokenUrl,
+                new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: this.platformClientId,
+                    client_secret: this.platformClientSecret
+                }), {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                }
+            );
+            logApiCall(this.logger, 'POST', this.platformTokenUrl, response.status, Date.now() - apiStart);
+            this.platformToken = response.data.access_token;
+            this.platformTokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
+            this.platformClient.defaults.headers.common['Authorization'] = `Bearer ${this.platformToken}`;
+            this.logger.info("Jamf Platform API Gateway authentication successful");
+        } catch (error) {
+            this.logger.error("Failed to authenticate with Jamf Platform API Gateway", { error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Reads JAMF_PLATFORM_TENANT_ID — the Platform API Gateway's tenant UUID, distinct
+    // from JAMF_URL/this tenant's own Jamf Pro instance.
+    private getPlatformTenantId(): string {
+        const tenantId = process.env.JAMF_PLATFORM_TENANT_ID;
+        if (!tenantId) {
+            throw new Error(
+                "JAMF_PLATFORM_TENANT_ID is not set. Platform API Gateway tools need this tenant UUID " +
+                "(distinct from JAMF_URL/this tenant's Jamf Pro instance) — see the Platform API Gateway " +
+                "section of src/jamf/jamf-api.ts for details."
+            );
+        }
+        return tenantId;
+    }
+
+    // Whether all four Platform API Gateway env vars are configured — used by restGet(),
+    // below, to decide per-call whether the Gateway is even an option, rather than a
+    // try-then-catch-and-retry pattern that would silently mask a genuinely broken Gateway
+    // credential as "just fall back."
+    private hasPlatformGateway(): boolean {
+        return !!(this.platformClientId && this.platformClientSecret && this.platformTokenUrl && process.env.JAMF_PLATFORM_TENANT_ID);
+    }
+
+    // Shared entry point for every non-Classic REST GET in this file (see the Platform
+    // API Gateway section comment near the top of this file for what's confirmed to work
+    // through it). Routes through the Gateway when JAMF_PLATFORM_* is configured, else
+    // uses the direct client — a static per-call decision based on config presence, not a
+    // silent runtime fallback-on-error, so a genuinely broken Gateway credential still
+    // surfaces as a real error instead of being masked.
+    private async restGet(directPath: string, config?: { params?: Record<string, any> }) {
+        if (this.hasPlatformGateway()) {
+            await this.ensurePlatformAuthenticated();
+            const tenantId = this.getPlatformTenantId();
+            const gatewayPath = toGatewayProPath(directPath, tenantId);
+            return this.platformClient.get(gatewayPath, config);
+        }
+        return this.client.get(directPath, config);
+    }
+
     public async getComputerByName(name: string) {
         await this.ensureAuthenticated();
         this.logger.info('Fetching computer by name', { computerName: name });
         try {
             // First, get the computer's ID using the computers-inventory endpoint
             const apiStart = Date.now();
-            const inventoryResponse = await this.client.get('/api/v3/computers-inventory', {
+            const inventoryResponse = await this.restGet('/api/v3/computers-inventory', {
                 params: {
                     filter: `general.name=="${escapeRsqlValue(name)}"`,
                     'page-size': 1
@@ -208,7 +355,7 @@ export class JamfClient {
 
             // Now, use the ID to get detailed information from computers-inventory-detail
             const apiStart2 = Date.now();
-            const detailResponse = await this.client.get(`/api/v3/computers-inventory-detail/${computerId}`);
+            const detailResponse = await this.restGet(`/api/v3/computers-inventory-detail/${computerId}`);
             apiDuration = Date.now() - apiStart2;
             logApiCall(this.logger, 'GET', `/api/v3/computers-inventory-detail/${computerId}`, detailResponse.status, apiDuration);
             
@@ -239,7 +386,7 @@ export class JamfClient {
             // device from the list endpoint first, then fetch its /detail record below — the list
             // endpoint alone lacks osVersion, managed/supervised, and assigned-user fields.
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v2/mobile-devices', {
+            const response = await this.restGet('/api/v2/mobile-devices', {
                 params: {
                     'page-size': 1000 // Ensure we get enough devices to find the one we need
                 }
@@ -261,7 +408,7 @@ export class JamfClient {
             }
 
             const detailStart = Date.now();
-            const detailResponse = await this.client.get(`/api/v2/mobile-devices/${foundDevice.id}/detail`);
+            const detailResponse = await this.restGet(`/api/v2/mobile-devices/${foundDevice.id}/detail`);
             logApiCall(this.logger, 'GET', `/api/v2/mobile-devices/${foundDevice.id}/detail`, detailResponse.status, Date.now() - detailStart);
 
             // Model/modelIdentifier/supervised live under a type-specific section (ios/tvos/watchos/
@@ -314,7 +461,7 @@ export class JamfClient {
 
             while (page < MAX_PAGES) {
                 const apiStart = Date.now();
-                const response = await this.client.get('/api/v2/mobile-devices', {
+                const response = await this.restGet('/api/v2/mobile-devices', {
                     params: { page, 'page-size': PAGE_SIZE }
                 });
                 logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, Date.now() - apiStart);
@@ -395,7 +542,7 @@ export class JamfClient {
             let totalCount = 0;
             while (page < MAX_PAGES) {
                 const apiStart = Date.now();
-                const response = await this.client.get('/api/v2/computer-groups/smart-groups', {
+                const response = await this.restGet('/api/v2/computer-groups/smart-groups', {
                     params: { page, 'page-size': PAGE_SIZE }
                 });
                 logApiCall(this.logger, 'GET', '/api/v2/computer-groups/smart-groups', response.status, Date.now() - apiStart);
@@ -427,7 +574,7 @@ export class JamfClient {
         try {
             // Using Jamf Pro API v1
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/mobile-device-groups/smart-groups');
+            const response = await this.restGet('/api/v1/mobile-device-groups/smart-groups');
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/mobile-device-groups/smart-groups', response.status, apiDuration);
             this.logger.info('Smart mobile device groups retrieved successfully');
@@ -448,7 +595,7 @@ export class JamfClient {
         try {
             // Using Jamf Pro API v2 to get member IDs
             const apiStart = Date.now();
-            const response = await this.client.get(`/api/v2/computer-groups/smart-group-membership/${groupId}`);
+            const response = await this.restGet(`/api/v2/computer-groups/smart-group-membership/${groupId}`);
             let apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, response.status, apiDuration);
             
@@ -459,7 +606,7 @@ export class JamfClient {
                 memberIds.map(async (id: number) => {
                     try {
                         const apiStart2 = Date.now();
-                        const computerResponse = await this.client.get(`/api/v3/computers-inventory/${id}`, {
+                        const computerResponse = await this.restGet(`/api/v3/computers-inventory/${id}`, {
                             params: { section: 'GENERAL' }
                         });
                         apiDuration = Date.now() - apiStart2;
@@ -516,7 +663,7 @@ export class JamfClient {
             }
 
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v3/computers-inventory', { params });
+            const response = await this.restGet('/api/v3/computers-inventory', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', response.status, apiDuration);
 
@@ -562,7 +709,7 @@ export class JamfClient {
 
         const fetchByFilter = async (filter: string) => {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/computers-inventory', {
+            const response = await this.restGet('/api/v1/computers-inventory', {
                 params: {
                     filter,
                     'page-size': 1000,
@@ -625,7 +772,7 @@ export class JamfClient {
         this.logger.info('Fetching JAMF sites');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/sites');
+            const response = await this.restGet('/api/v1/sites');
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/sites', response.status, apiDuration);
             this.logger.info('Sites retrieved successfully');
@@ -656,7 +803,7 @@ export class JamfClient {
                 let totalCount = 0;
                 while (fetchPage < MAX_PAGES) {
                     const apiStart = Date.now();
-                    const response = await this.client.get('/api/v1/scripts', {
+                    const response = await this.restGet('/api/v1/scripts', {
                         params: { page: fetchPage, 'page-size': FETCH_PAGE_SIZE }
                     });
                     logApiCall(this.logger, 'GET', '/api/v1/scripts', response.status, Date.now() - apiStart);
@@ -681,7 +828,7 @@ export class JamfClient {
                 'page-size': pageSize || 100
             };
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/scripts', { params });
+            const response = await this.restGet('/api/v1/scripts', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/scripts', response.status, apiDuration);
             this.logger.info('Scripts retrieved successfully', { name: '(all)', page: page || 0, pageSize: pageSize || 100, totalInPage: response.data.results?.length || 0 });
@@ -720,7 +867,7 @@ export class JamfClient {
                 let totalCount = 0;
                 while (fetchPage < MAX_PAGES) {
                     const apiStart = Date.now();
-                    const response = await this.client.get('/api/v1/packages', {
+                    const response = await this.restGet('/api/v1/packages', {
                         params: { page: fetchPage, 'page-size': FETCH_PAGE_SIZE }
                     });
                     logApiCall(this.logger, 'GET', '/api/v1/packages', response.status, Date.now() - apiStart);
@@ -745,7 +892,7 @@ export class JamfClient {
                 'page-size': pageSize || 100
             };
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/packages', { params });
+            const response = await this.restGet('/api/v1/packages', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/packages', response.status, apiDuration);
             this.logger.info('Packages retrieved successfully', { name: '(all)', page: page || 0, pageSize: pageSize || 100, totalInPage: response.data.results?.length || 0 });
@@ -770,7 +917,7 @@ export class JamfClient {
         await this.ensureAuthenticated();
         try {
             const apiStart = Date.now();
-            const response = await this.client.get(`/api/v1/scripts/${id}`);
+            const response = await this.restGet(`/api/v1/scripts/${id}`);
             logApiCall(this.logger, 'GET', `/api/v1/scripts/${id}`, response.status, Date.now() - apiStart);
             return response.data;
         } catch (error) {
@@ -1432,7 +1579,7 @@ export class JamfClient {
             if (pageSize !== undefined) params['page-size'] = pageSize;
 
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/inventory-preload', { params });
+            const response = await this.restGet('/api/v1/inventory-preload', { params });
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/inventory-preload', response.status, apiDuration);
             this.logger.info('Inventory preload records retrieved successfully');
@@ -1561,7 +1708,7 @@ export class JamfClient {
 
             while (true) {
                 const apiStart = Date.now();
-                const response = await this.client.get('/api/v3/computer-prestages', {
+                const response = await this.restGet('/api/v3/computer-prestages', {
                     params: { page, 'page-size': pageSize, sort: 'id:desc' }
                 });
                 const apiDuration = Date.now() - apiStart;
@@ -1590,7 +1737,7 @@ export class JamfClient {
         this.logger.info('Fetching prestage scope', { prestageId });
         try {
             const apiStart = Date.now();
-            const response = await this.client.get(`/api/v2/computer-prestages/${prestageId}/scope`);
+            const response = await this.restGet(`/api/v2/computer-prestages/${prestageId}/scope`);
             logApiCall(this.logger, 'GET', `/api/v2/computer-prestages/${prestageId}/scope`, response.status, Date.now() - apiStart);
             return response.data;
         } catch (error) {
@@ -1687,7 +1834,7 @@ export class JamfClient {
         this.logger.info('Fetching static computer groups');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/computer-groups');
+            const response = await this.restGet('/api/v1/computer-groups');
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/api/v1/computer-groups', response.status, apiDuration);
 
@@ -1719,7 +1866,7 @@ export class JamfClient {
             `general.name=="${escaped}"`
         ]) {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v3/computers-inventory', {
+            const response = await this.restGet('/api/v3/computers-inventory', {
                 params: { filter, 'page-size': 1, section: 'GENERAL' }
             });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', response.status, Date.now() - apiStart);
@@ -1788,7 +1935,7 @@ export class JamfClient {
         this.logger.info('Fetching computer by serial', { serial });
         try {
             const apiStart = Date.now();
-            const inventoryResponse = await this.client.get('/api/v3/computers-inventory', {
+            const inventoryResponse = await this.restGet('/api/v3/computers-inventory', {
                 params: { filter: `hardware.serialNumber=="${escapeRsqlValue(serial)}"`, 'page-size': 1 }
             });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', inventoryResponse.status, Date.now() - apiStart);
@@ -1796,7 +1943,7 @@ export class JamfClient {
             if (!computerId) return { totalCount: 0, results: [] };
 
             const apiStart2 = Date.now();
-            const detailResponse = await this.client.get(`/api/v3/computers-inventory-detail/${computerId}`);
+            const detailResponse = await this.restGet(`/api/v3/computers-inventory-detail/${computerId}`);
             logApiCall(this.logger, 'GET', `/api/v3/computers-inventory-detail/${computerId}`, detailResponse.status, Date.now() - apiStart2);
             this.logger.info('Computer by serial retrieved', { serial, computerId });
             return { totalCount: 1, results: [detailResponse.data] };
@@ -2854,7 +3001,7 @@ export class JamfClient {
         this.logger.info('Fetching Cloud Identity Providers');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/cloud-idp', {
+            const response = await this.restGet('/api/v1/cloud-idp', {
                 params: { 'page-size': 200 }
             });
             logApiCall(this.logger, 'GET', '/api/v1/cloud-idp', response.status, Date.now() - apiStart);
@@ -2913,7 +3060,7 @@ export class JamfClient {
         this.logger.info('Fetching departments');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/departments', {
+            const response = await this.restGet('/api/v1/departments', {
                 params: { 'page-size': 1000 }
             });
             logApiCall(this.logger, 'GET', '/api/v1/departments', response.status, Date.now() - apiStart);
@@ -2933,7 +3080,7 @@ export class JamfClient {
         this.logger.info('Fetching categories');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/categories', {
+            const response = await this.restGet('/api/v1/categories', {
                 params: { page: page ?? 0, 'page-size': pageSize ?? 200 }
             });
             logApiCall(this.logger, 'GET', '/api/v1/categories', response.status, Date.now() - apiStart);
@@ -3019,7 +3166,7 @@ export class JamfClient {
         this.logger.info('Fetching FileVault status', { nameOrSerial });
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v3/computers-inventory', {
+            const response = await this.restGet('/api/v3/computers-inventory', {
                 params: {
                     filter: nameOrSerial.length <= 12 && /^[A-Z0-9]+$/.test(nameOrSerial)
                         ? `hardware.serialNumber=="${escapeRsqlValue(nameOrSerial)}"`
@@ -3040,6 +3187,287 @@ export class JamfClient {
             };
         } catch (error) {
             this.logger.error('Error fetching FileVault status', { nameOrSerial, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Bulk equivalent of getFilevaultStatus, above — one page of FileVault escrow
+    // status for the whole fleet per call, rather than one API call per machine.
+    // CONFIRMED LIVE 2026-07-29: routed through the Platform API Gateway rather than
+    // the tenant's own direct Jamf Pro API — the tenant's own JAMF_CLIENT_ID/SECRET
+    // role 403s against this exact endpoint (missing 'View Disk Encryption Recovery
+    // Key'), but the Platform Gateway credential's account.jamf.com Integration was
+    // granted that privilege (`read:env:filevault`) and returns real data (confirmed
+    // against this tenant: 49 computers). Same response shape as the direct v4
+    // endpoint, just proxied through a different host/credential.
+    public async getFilevaultStatusBulk(page?: number, pageSize?: number) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching bulk FileVault status via Platform API Gateway', { page: page ?? 0, pageSize: pageSize ?? 100 });
+        try {
+            const apiStart = Date.now();
+            const path = `/pro/v4/tenant/${tenantId}/computers-inventory/filevault`;
+            const response = await this.platformClient.get(path, {
+                params: { page: page ?? 0, 'page-size': pageSize ?? 100 }
+            });
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const results = response.data.results ?? [];
+            this.logger.info('Bulk FileVault status retrieved', { count: results.length, totalCount: response.data.totalCount });
+            return {
+                totalCount: response.data.totalCount ?? results.length,
+                results
+            };
+        } catch (error) {
+            const status = (error as any)?.response?.status;
+            if (status === 403 || status === 401) {
+                throw new Error(`Permission denied (${status}). The Platform API Gateway credential (JAMF_PLATFORM_CLIENT_ID) may be missing the 'read:env:filevault' privilege on its account.jamf.com Integration.`);
+            }
+            this.logger.error('Error fetching bulk FileVault status', { page, pageSize, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // ─── Compliance Benchmarks (Platform API Gateway, Beta) ─────────────────
+    // CONFIRMED LIVE 2026-07-29 against a real account.jamf.com Integration
+    // credential (see the Platform API Gateway section at the top of this file):
+    // getComplianceBaselines returns Jamf's real 14-baseline mSCP catalog (CIS,
+    // NIST, CMMC, DISA-STIG, etc.), and getComplianceBenchmarks returns `{benchmarks:
+    // []}` — real API access confirmed, this tenant simply hasn't configured any
+    // benchmarks yet (resolves the previously-open question of whether Colgate has
+    // Compliance Benchmarks enabled at all: the feature/API access works, there's
+    // just nothing configured). Read-only: create (POST) and delete are deliberately
+    // not implemented — creating/deleting a fleet-wide compliance benchmark is a real
+    // security-posture change that needs an explicit human decision in the JAMF Pro
+    // console, not something to expose as an MCP tool.
+    // GET /v1/tenant/{tenantId}/baselines — Jamf's catalog of available mSCP
+    // baselines (CIS Level 1/2, NIST 800-53/800-171, etc.) a tenant can build a
+    // benchmark from. Not itself tenant-configuration-dependent, so this should
+    // return results even for a tenant with zero benchmarks configured yet.
+    // CONFIRMED LIVE 2026-07-29 — returned all 14 real catalog baselines.
+    public async getComplianceBaselines() {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Compliance Benchmarks baselines', { tenantId });
+        try {
+            const apiStart = Date.now();
+            const path = `/compliance-benchmarks/v1/tenant/${tenantId}/baselines`;
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const baselines = response.data.baselines ?? [];
+            this.logger.info('Compliance Benchmarks baselines retrieved', { count: baselines.length });
+            return { totalCount: baselines.length, results: baselines };
+        } catch (error) {
+            this.logger.error('Error fetching Compliance Benchmarks baselines', { tenantId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // GET /v1/tenant/{tenantId}/benchmarks — this tenant's own configured
+    // benchmarks (if any). No pagination in the documented spec — Jamf returns
+    // the full list in one response, unlike the mobile-device/computer-scale
+    // endpoints elsewhere in this file. CONFIRMED LIVE 2026-07-29 — returns
+    // `{benchmarks: []}` for this tenant (no benchmarks configured yet, not an error).
+    public async getComplianceBenchmarks() {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Compliance Benchmarks list', { tenantId });
+        try {
+            const apiStart = Date.now();
+            const path = `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks`;
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const benchmarks = response.data.benchmarks ?? [];
+            this.logger.info('Compliance Benchmarks list retrieved', { count: benchmarks.length });
+            return { totalCount: benchmarks.length, results: benchmarks };
+        } catch (error) {
+            this.logger.error('Error fetching Compliance Benchmarks list', { tenantId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // GET /v1/tenant/{tenantId}/benchmarks/{id} — a single benchmark's full
+    // detail, including its embedded `rules` array (per Jamf's spec, the detail
+    // response already contains every rule inline — there's no need for a
+    // separate call to the sibling /benchmarks/{id}/rules endpoint just to list
+    // them). Also folds in compliance-percentage as a best-effort extra field:
+    // a benchmark with no reportable rules yet returns 404 for that specific
+    // sub-call ("Benchmark has no applicable rules for reporting calculations"),
+    // which is a valid state, not a failure of the whole detail fetch — caught
+    // and surfaced as `compliancePercentage: null` rather than thrown. Request
+    // construction confirmed live 2026-07-29 (this tenant has zero configured
+    // benchmarks to fetch a real detail for, so the 404 branch is exercised
+    // rather than the success branch — still a real, confirmed round-trip).
+    public async getComplianceBenchmarkDetail(benchmarkId: string) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Compliance Benchmark detail', { tenantId, benchmarkId });
+        try {
+            const apiStart = Date.now();
+            const path = `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks/${benchmarkId}`;
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const benchmark = response.data;
+
+            let compliancePercentage: number | null = null;
+            try {
+                const pctPath = `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks/${benchmarkId}/compliance-percentage`;
+                const pctStart = Date.now();
+                const pctResponse = await this.platformClient.get(pctPath);
+                logApiCall(this.logger, 'GET', pctPath, pctResponse.status, Date.now() - pctStart);
+                compliancePercentage = pctResponse.data?.compliancePercentage ?? null;
+            } catch (pctError) {
+                if (axios.isAxiosError(pctError) && pctError.response?.status === 404) {
+                    this.logger.info('Benchmark has no applicable rules for compliance percentage', { benchmarkId });
+                } else {
+                    this.logger.warn('Error fetching compliance percentage (non-fatal)', { benchmarkId, error: (pctError as Error).message });
+                }
+            }
+
+            this.logger.info('Compliance Benchmark detail retrieved', { benchmarkId });
+            return { ...benchmark, compliancePercentage };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                return null;
+            }
+            this.logger.error('Error fetching Compliance Benchmark detail', { tenantId, benchmarkId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // GET /v1/tenant/{tenantId}/benchmarks/{id}/devices — per-rule device
+    // drill-down (which devices passed/failed one specific rule of one specific
+    // benchmark report). Kept as its own tool/method rather than folded into
+    // getComplianceBenchmarkDetail — it needs an additional required rule ID and
+    // is itself paginated, the same shape as jamf_get_smart_group_members being
+    // split out from jamf_get_policy rather than embedded in it.
+    public async getComplianceBenchmarkDevices(benchmarkId: string, ruleId: string, options?: {
+        page?: number;
+        pageSize?: number;
+        deviceSearch?: string;
+        ruleResult?: 'PASSED' | 'FAILED' | 'UNKNOWN';
+    }) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Compliance Benchmark rule devices', { tenantId, benchmarkId, ruleId });
+        try {
+            const params: Record<string, any> = {
+                'rule-id': ruleId,
+                page: options?.page ?? 0,
+                'page-size': options?.pageSize ?? 100,
+            };
+            if (options?.deviceSearch) params['device-search'] = options.deviceSearch;
+            if (options?.ruleResult) params['rule-result'] = options.ruleResult;
+
+            const apiStart = Date.now();
+            const path = `/compliance-benchmarks/v1/tenant/${tenantId}/benchmarks/${benchmarkId}/devices`;
+            const response = await this.platformClient.get(path, { params });
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const results = response.data.results ?? [];
+            this.logger.info('Compliance Benchmark rule devices retrieved', { count: results.length, totalCount: response.data.totalCount });
+            return { totalCount: response.data.totalCount ?? results.length, results };
+        } catch (error) {
+            this.logger.error('Error fetching Compliance Benchmark rule devices', { tenantId, benchmarkId, ruleId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // ─── Blueprints (Platform API Gateway) ──────────────────────────────────
+    // Jamf's declarative-device-management feature — CONFIRMED LIVE 2026-07-29
+    // against the same Platform API Gateway credential as Compliance Benchmarks
+    // above (real data: 4 blueprints, 16 blueprint components, full detail+report
+    // round-trips). Read-only, matching the Compliance Benchmarks convention:
+    // create/update/delete/deploy/undeploy are NOT implemented here — deploying or
+    // undeploying a blueprint changes real devices' management state fleet-wide,
+    // a decision that needs a deliberate human choice in the JAMF Pro console (or a
+    // future, explicitly-requested write tool), not something to expose implicitly
+    // via a read-tool refactor.
+
+    // GET /v1/tenant/{tenantId}/blueprints — list this tenant's blueprints (name,
+    // deployment state, last deployment result). Optional `search` matches against
+    // name/description server-side.
+    public async getBlueprints(options?: { search?: string; page?: number; pageSize?: number }) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Blueprints list', { tenantId, search: options?.search });
+        try {
+            const params: Record<string, any> = {
+                page: options?.page ?? 0,
+                'page-size': options?.pageSize ?? 100,
+            };
+            if (options?.search) params.search = options.search;
+
+            const apiStart = Date.now();
+            const path = `/blueprints/v1/tenant/${tenantId}/blueprints`;
+            const response = await this.platformClient.get(path, { params });
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const results = response.data.results ?? [];
+            this.logger.info('Blueprints list retrieved', { count: results.length, totalCount: response.data.totalCount });
+            return { totalCount: response.data.totalCount ?? results.length, results };
+        } catch (error) {
+            this.logger.error('Error fetching Blueprints list', { tenantId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // GET /v1/tenant/{tenantId}/blueprints/{id} — full detail (scope, steps,
+    // component configuration). Also folds in the blueprint's status report
+    // (succeeded/failed/pending device counts) as a best-effort extra field, same
+    // pattern as getComplianceBenchmarkDetail folding in compliance-percentage —
+    // a report fetch failure doesn't fail the whole detail call.
+    public async getBlueprintDetail(blueprintId: string) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Blueprint detail', { tenantId, blueprintId });
+        try {
+            const apiStart = Date.now();
+            const path = `/blueprints/v1/tenant/${tenantId}/blueprints/${blueprintId}`;
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const blueprint = response.data;
+
+            let report: any = null;
+            try {
+                const reportPath = `/blueprints/v1/tenant/${tenantId}/blueprints/${blueprintId}/report`;
+                const reportStart = Date.now();
+                const reportResponse = await this.platformClient.get(reportPath);
+                logApiCall(this.logger, 'GET', reportPath, reportResponse.status, Date.now() - reportStart);
+                report = reportResponse.data;
+            } catch (reportError) {
+                this.logger.warn('Error fetching blueprint report (non-fatal)', { blueprintId, error: (reportError as Error).message });
+            }
+
+            this.logger.info('Blueprint detail retrieved', { blueprintId });
+            return { ...blueprint, report };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                return null;
+            }
+            this.logger.error('Error fetching Blueprint detail', { tenantId, blueprintId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // GET /v1/tenant/{tenantId}/blueprint-components — the catalog of components
+    // (payload types) available to build blueprints from (Software Updates,
+    // Configuration Profile, Custom Declarations, etc.), not this tenant's own
+    // blueprints' chosen components — same "catalog vs. configured" split as
+    // getComplianceBaselines vs. getComplianceBenchmarks above.
+    public async getBlueprintComponents(options?: { page?: number; pageSize?: number }) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Fetching Blueprint components catalog', { tenantId });
+        try {
+            const apiStart = Date.now();
+            const path = `/blueprints/v1/tenant/${tenantId}/blueprint-components`;
+            const response = await this.platformClient.get(path, {
+                params: { page: options?.page ?? 0, 'page-size': options?.pageSize ?? 100 }
+            });
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            const results = response.data.results ?? [];
+            this.logger.info('Blueprint components retrieved', { count: results.length, totalCount: response.data.totalCount });
+            return { totalCount: response.data.totalCount ?? results.length, results };
+        } catch (error) {
+            this.logger.error('Error fetching Blueprint components', { tenantId, error: (error as Error).message });
             throw error;
         }
     }
@@ -3152,7 +3580,7 @@ export class JamfClient {
         this.logger.info('Fetching app installer titles');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/app-installers/titles', {
+            const response = await this.restGet('/api/v1/app-installers/titles', {
                 params: { page: page ?? 0, 'page-size': pageSize ?? 200 }
             });
             logApiCall(this.logger, 'GET', '/api/v1/app-installers/titles', response.status, Date.now() - apiStart);
@@ -3186,7 +3614,7 @@ export class JamfClient {
         this.logger.info('Fetching app installer deployments');
         try {
             const apiStart = Date.now();
-            const response = await this.client.get('/api/v1/app-installers/deployments', {
+            const response = await this.restGet('/api/v1/app-installers/deployments', {
                 params: { page: page ?? 0, 'page-size': pageSize ?? 200 }
             });
             logApiCall(this.logger, 'GET', '/api/v1/app-installers/deployments', response.status, Date.now() - apiStart);
@@ -3206,7 +3634,7 @@ export class JamfClient {
         this.logger.info('Fetching app installer deployment detail', { deploymentId });
         try {
             const apiStart = Date.now();
-            const response = await this.client.get(`/api/v1/app-installers/deployments/${deploymentId}`);
+            const response = await this.restGet(`/api/v1/app-installers/deployments/${deploymentId}`);
             logApiCall(this.logger, 'GET', `/api/v1/app-installers/deployments/${deploymentId}`, response.status, Date.now() - apiStart);
             this.logger.info('App installer deployment detail retrieved', { deploymentId });
             return response.data;

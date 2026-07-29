@@ -50,6 +50,18 @@ function permissionAwareTest(name: string, fn: () => Promise<void>) {
     });
 }
 
+// Jamf Platform API Gateway tools (bulk FileVault, Compliance Benchmarks, Blueprints) need a
+// separate account.jamf.com Integration credential from JAMF_CLIENT_ID/SECRET — optional in
+// this environment, hence the early-return rather than a hard requireEnv() at module load.
+function hasPlatformGateway(): boolean {
+    return !!(
+        process.env.JAMF_PLATFORM_CLIENT_ID &&
+        process.env.JAMF_PLATFORM_CLIENT_SECRET &&
+        process.env.JAMF_PLATFORM_URL &&
+        process.env.JAMF_PLATFORM_TENANT_ID
+    );
+}
+
 // ── Suite ─────────────────────────────────────────────────────────────────────
 describe("JamfClient", () => {
     let client: JamfClient;
@@ -135,6 +147,23 @@ describe("JamfClient", () => {
             assert.ok(data !== null, "should return data for known serial");
             assert.ok(data.name, "should include computer name");
             assert.ok(data.diskEncryption !== undefined, "diskEncryption section should be present");
+        });
+
+        // Routes through the Jamf Platform API Gateway (JAMF_PLATFORM_* env vars), a
+        // separate credential from JAMF_CLIENT_ID/SECRET — confirmed live 2026-07-29 to
+        // have the 'View Disk Encryption Recovery Key' privilege the tenant's own API
+        // client lacks. Early-returns (not t.skip()) if the Platform Gateway credential
+        // isn't configured in this environment, same convention as the Compliance
+        // Benchmarks/Blueprints tests below.
+        permissionAwareTest("list bulk FileVault status returns paginated totalCount/results", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getFilevaultStatusBulk(0, 5);
+            assert.equal(typeof data.totalCount, "number");
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.ok(data.results[0].computerId !== undefined);
+                assert.ok("individualRecoveryKeyValidityStatus" in data.results[0]);
+            }
         });
     });
 
@@ -791,6 +820,98 @@ describe("JamfClient", () => {
             const created = await client.upsertPackage({ localFilePath: fixturePath, packageName: testName });
             assert.equal(created.action, "created");
             await client.deletePackage(created.id);
+        });
+    });
+
+    // ── Compliance Benchmarks (Platform API Gateway) ─────────────────────────
+    // Confirmed live 2026-07-29 with a real account.jamf.com Integration credential —
+    // real baselines catalog returned, and `{benchmarks: []}` for this tenant (no
+    // benchmarks configured, not an error). Every test here early-returns (the
+    // "if (!first) return;" convention, not t.skip() — permissionAwareTest's fn
+    // signature has no `t` to call t.skip() with) if the Platform Gateway credential
+    // isn't configured in this environment.
+    describe("Compliance Benchmarks", () => {
+        permissionAwareTest("list compliance baselines returns mSCP catalog", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getComplianceBaselines();
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.equal(typeof data.results[0].baselineId, "string");
+                assert.equal(typeof data.results[0].ruleCount, "number");
+            }
+        });
+
+        permissionAwareTest("list compliance benchmarks returns this tenant's configured benchmarks", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getComplianceBenchmarks();
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.equal(typeof data.results[0].id, "string");
+                assert.equal(typeof data.results[0].title, "string");
+            }
+        });
+
+        permissionAwareTest("get compliance benchmark detail returns rules and enforcement mode", async () => {
+            if (!hasPlatformGateway()) return;
+            const list: any = await client.getComplianceBenchmarks();
+            const first = list.results?.[0];
+            if (!first) return; // no benchmarks configured on this tenant to fetch detail for
+            const detail: any = await client.getComplianceBenchmarkDetail(first.id);
+            assert.ok(detail !== null);
+            assert.ok(Array.isArray(detail.rules));
+            assert.ok("enforcementMode" in detail);
+            assert.ok("compliancePercentage" in detail);
+        });
+
+        permissionAwareTest("get compliance benchmark devices returns rule pass/fail states", async () => {
+            if (!hasPlatformGateway()) return;
+            const list: any = await client.getComplianceBenchmarks();
+            const first = list.results?.[0];
+            if (!first) return; // no benchmarks configured on this tenant to exercise this test
+            const detail: any = await client.getComplianceBenchmarkDetail(first.id);
+            const firstRule = detail?.rules?.[0];
+            if (!firstRule) return; // benchmark has no rules to drill into
+            const data: any = await client.getComplianceBenchmarkDevices(first.id, firstRule.id, { pageSize: 5 });
+            assert.equal(typeof data.totalCount, "number");
+            assert.ok(Array.isArray(data.results));
+        });
+    });
+
+    // ── Blueprints (Platform API Gateway) ────────────────────────────────────
+    // Confirmed live 2026-07-29 with a real account.jamf.com Integration credential —
+    // 4 real blueprints and 16 real components returned for this tenant. Same
+    // early-return convention as Compliance Benchmarks above.
+    describe("Blueprints", () => {
+        permissionAwareTest("list blueprints returns totalCount/results", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getBlueprints();
+            assert.equal(typeof data.totalCount, "number");
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.equal(typeof data.results[0].id, "string");
+                assert.ok("deploymentState" in data.results[0]);
+            }
+        });
+
+        permissionAwareTest("get blueprint detail returns scope/steps and a report", async () => {
+            if (!hasPlatformGateway()) return;
+            const list: any = await client.getBlueprints();
+            const first = list.results?.[0];
+            if (!first) return; // no blueprints configured on this tenant to fetch detail for
+            const detail: any = await client.getBlueprintDetail(first.id);
+            assert.ok(detail !== null);
+            assert.ok(Array.isArray(detail.steps));
+            assert.ok("report" in detail);
+        });
+
+        permissionAwareTest("list blueprint components returns the catalog", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getBlueprintComponents({ pageSize: 5 });
+            assert.equal(typeof data.totalCount, "number");
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.equal(typeof data.results[0].identifier, "string");
+            }
         });
     });
 });

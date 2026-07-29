@@ -223,6 +223,77 @@ export class IntuneClient {
     }
 
     /**
+     * Bulk-list Windows Autopilot device identities (windowsAutopilotDeviceIdentities), distinct from
+     * Intune's managed-device inventory — a device can have an Autopilot record with no Intune enrollment
+     * yet, or vice versa. Uses beta unconditionally rather than v1.0's server-side $filter path used by
+     * getAutopilotProfileStatus above, since v1.0 has been observed to 500 on basic listing in this tenant
+     * (see the fallback comment above). CONFIRMED LIVE (2026-07-28): a `.select()` on this beta endpoint
+     * itself 500s ("An internal server error has occurred") in this tenant, same failure class as the
+     * v1.0 issue — so, like the existing single-serial fallback above, this deliberately omits .select()
+     * and fetches full objects; filters are applied client-side after fetching either way.
+     */
+    public async listAutopilotDevices(options?: {
+        manufacturer?: string;
+        model?: string;
+        groupTag?: string;
+    }) {
+        this.logger.info('Listing Autopilot device identities', options ?? {});
+        await this.trackAuthAttempt();
+
+        const MAX_PAGES = 40; // 40 * 500 = 20k devices — far above any real fleet size here
+
+        try {
+            const devices: any[] = [];
+            let apiStart = Date.now();
+            let response = await this.client
+                .api('/deviceManagement/windowsAutopilotDeviceIdentities')
+                .version('beta')
+                .top(500)
+                .get();
+            logApiCall(this.logger, 'GET', '/deviceManagement/windowsAutopilotDeviceIdentities', 200, Date.now() - apiStart);
+            devices.push(...(response.value || []));
+
+            let page = 1;
+            while (response['@odata.nextLink'] && page < MAX_PAGES) {
+                apiStart = Date.now();
+                response = await this.client.api(response['@odata.nextLink']).get();
+                logApiCall(this.logger, 'GET', '/deviceManagement/windowsAutopilotDeviceIdentities (nextLink)', 200, Date.now() - apiStart);
+                devices.push(...(response.value || []));
+                page++;
+            }
+
+            const truncated = Boolean(response['@odata.nextLink']);
+            if (truncated) {
+                this.logger.warn('listAutopilotDevices hit the pagination safety cap; results are truncated', {
+                    pagesFetched: page,
+                    deviceCount: devices.length
+                });
+            }
+
+            const manufacturerFilter = options?.manufacturer?.toLowerCase();
+            const modelFilter = options?.model?.toLowerCase();
+            const groupTagFilter = options?.groupTag?.toLowerCase();
+            const filteredDevices = devices.filter((d: any) => {
+                if (manufacturerFilter && !String(d.manufacturer ?? '').toLowerCase().includes(manufacturerFilter)) return false;
+                if (modelFilter && !String(d.model ?? '').toLowerCase().includes(modelFilter)) return false;
+                if (groupTagFilter && !String(d.groupTag ?? '').toLowerCase().includes(groupTagFilter)) return false;
+                return true;
+            });
+
+            this.logger.info('Autopilot devices listed', {
+                count: filteredDevices.length,
+                rawCount: devices.length,
+                truncated
+            });
+            return { devices: filteredDevices, totalCount: filteredDevices.length, truncated };
+        } catch (error) {
+            this.logger.error('Error listing Autopilot devices', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/deviceManagement/windowsAutopilotDeviceIdentities', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
      * Get managed device by device name
      */
     public async getManagedDeviceByName(deviceName: string) {
@@ -239,7 +310,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`deviceName eq '${escapedName}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
                 .get();
             
             const apiDuration = Date.now() - apiStart;
@@ -258,7 +329,7 @@ export class IntuneClient {
                     .api('/deviceManagement/managedDevices')
                     .version('v1.0')
                     .filter(`startswith(deviceName,'${escapedName}')`)
-                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
+                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
                     .top(25)
                     .get();
 
@@ -288,7 +359,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
                 .top(999)
                 .get();
 
@@ -342,7 +413,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`serialNumber eq '${escapedSerial}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
                 .get();
 
             const apiDuration = Date.now() - apiStart;
@@ -358,7 +429,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
                 .top(999)
                 .get();
 
@@ -455,7 +526,7 @@ export class IntuneClient {
             }
 
             const dedupedCandidateUpns = Array.from(new Set(candidateUpns.filter(Boolean).map((upn) => String(upn).toLowerCase())));
-            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName';
+            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType';
 
             for (const upnLower of dedupedCandidateUpns) {
                 const escapedUpn = this.escapeODataString(upnLower);
@@ -553,12 +624,13 @@ export class IntuneClient {
         managementState?: string;
         managementAgent?: string;
         intuneManagedOnly?: boolean;
+        ownerType?: string;
     }) {
         this.logger.info('Listing managed devices', options ?? {});
         await this.trackAuthAttempt();
 
         const MAX_PAGES = 20; // 20 * 999 ≈ 20k devices — far above any real fleet size here
-        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName';
+        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType';
 
         const filters: string[] = [];
         if (options?.operatingSystem) {
@@ -572,6 +644,9 @@ export class IntuneClient {
         }
         if (options?.managementAgent) {
             filters.push(`managementAgent eq '${this.escapeODataString(options.managementAgent)}'`);
+        }
+        if (options?.ownerType) {
+            filters.push(`ownerType eq '${this.escapeODataString(options.ownerType)}'`);
         }
 
         try {
@@ -3341,5 +3416,92 @@ export class IntuneClient {
         const apiStart = Date.now();
         await this.client.api(path).version('v1.0').delete();
         logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
+    }
+
+    // ─── Conditional Access & enrollment restrictions ─────────────────────────
+    //
+    // CONFIRMED LIVE 2026-07-28: getEnrollmentRestrictions works today against this tenant/app
+    // registration (returned 8 real deviceEnrollmentConfigurations, e.g. the default device-limit
+    // restriction) — no permission gap on that path. getConditionalAccessPolicies, however,
+    // confirmed-live 403s with "required scopes are missing in the token" — this app registration
+    // needs the Policy.Read.All Graph Application permission granted + admin-consented before it
+    // will work, the same class of gap as RotateFileVaultKey on the JAMF side. Since auth uses the
+    // `.default` scope (see authScopes above), no code change will be needed once that permission
+    // is granted — it'll start working without a redeploy.
+
+    /**
+     * List Conditional Access policies (identity/conditionalAccess/policies) — name, state
+     * (enabled/disabled/reportOnly), targeted apps/platforms, and grant controls. Read-only;
+     * Conditional Access has no create/update tooling here. NOT YET LIVE — see the section
+     * comment above; confirmed-live 403 pending a Graph permission grant.
+     */
+    public async getConditionalAccessPolicies() {
+        this.logger.info('Fetching Conditional Access policies');
+        await this.trackAuthAttempt();
+
+        try {
+            const path = '/identity/conditionalAccess/policies';
+            const apiStart = Date.now();
+            const response = await this.client.api(path).version('v1.0').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const policies = (response.value || []).map((policy: any) => ({
+                id: policy.id,
+                displayName: policy.displayName,
+                state: policy.state,
+                createdDateTime: policy.createdDateTime,
+                modifiedDateTime: policy.modifiedDateTime,
+                conditions: policy.conditions,
+                grantControls: policy.grantControls,
+                sessionControls: policy.sessionControls
+            }));
+
+            this.logger.info('Conditional Access policies retrieved', { count: policies.length });
+            return { policies, totalCount: policies.length };
+        } catch (error) {
+            this.logger.error('Error fetching Conditional Access policies', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/identity/conditionalAccess/policies', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * List device enrollment configurations (deviceManagement/deviceEnrollmentConfigurations) —
+     * backs Devices > Enrollment restrictions in the Intune admin center, including per-platform
+     * device-type restrictions (e.g. blocking personally-owned Windows enrollment) and their
+     * priority order. Read-only; no write tool exists for this since enabling a restriction has
+     * real enrollment-blocking consequences that should go through the admin center deliberately.
+     * CONFIRMED LIVE 2026-07-28 — returned 8 real configurations for this tenant, no permission
+     * gap on this path (see the section comment above for the Conditional Access contrast).
+     */
+    public async getEnrollmentRestrictions() {
+        this.logger.info('Fetching device enrollment configurations');
+        await this.trackAuthAttempt();
+
+        try {
+            const path = '/deviceManagement/deviceEnrollmentConfigurations';
+            const apiStart = Date.now();
+            const response = await this.client.api(path).version('v1.0').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            const configurations = (response.value || []).map((config: any) => ({
+                id: config.id,
+                displayName: config.displayName,
+                description: config.description,
+                priority: config.priority,
+                odataType: config['@odata.type'],
+                createdDateTime: config.createdDateTime,
+                lastModifiedDateTime: config.lastModifiedDateTime,
+                platformType: config.platformType,
+                deviceEnrollmentConfigurationType: config.deviceEnrollmentConfigurationType
+            }));
+
+            this.logger.info('Device enrollment configurations retrieved', { count: configurations.length });
+            return { configurations, totalCount: configurations.length };
+        } catch (error) {
+            this.logger.error('Error fetching device enrollment configurations', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/deviceManagement/deviceEnrollmentConfigurations', undefined, undefined, error as Error);
+            throw error;
+        }
     }
 }

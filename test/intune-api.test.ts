@@ -112,6 +112,44 @@ describe("IntuneClient", () => {
         });
     });
 
+    // ── Autopilot bulk list ────────────────────────────────────────────────────
+    describe("Autopilot devices (bulk)", () => {
+        permissionAwareTest("list Autopilot devices returns an array with pagination metadata", async () => {
+            const data = await client.listAutopilotDevices();
+            assert.ok(Array.isArray(data.devices), "devices should be an array");
+            assert.equal(typeof data.totalCount, "number");
+            assert.equal(typeof data.truncated, "boolean");
+        });
+
+        permissionAwareTest("manufacturer filter narrows to matching devices only", async () => {
+            const all = await client.listAutopilotDevices();
+            const sample = all.devices.find((d: any) => d.manufacturer);
+            if (!sample) return; // nothing to filter on in this tenant
+            const substring = String(sample.manufacturer).slice(0, 3);
+            const filtered = await client.listAutopilotDevices({ manufacturer: substring });
+            assert.ok(filtered.devices.every((d: any) => String(d.manufacturer ?? "").toLowerCase().includes(substring.toLowerCase())));
+        });
+    });
+
+    // ── Conditional Access & enrollment restrictions ───────────────────────────
+    // Confirmed live 2026-07-28: enrollment restrictions work today (8 real configs, no permission
+    // gap); Conditional Access cleanly 403s ("required scopes are missing in the token") pending an
+    // Entra admin granting/consenting Policy.Read.All — permissionAwareTest treats that as an
+    // expected skip rather than a failure.
+    describe("Conditional Access", () => {
+        permissionAwareTest("list Conditional Access policies returns an array", async () => {
+            const data = await client.getConditionalAccessPolicies();
+            assert.ok(Array.isArray(data.policies), "policies should be an array");
+        });
+    });
+
+    describe("Enrollment restrictions", () => {
+        permissionAwareTest("list enrollment restrictions returns an array", async () => {
+            const data = await client.getEnrollmentRestrictions();
+            assert.ok(Array.isArray(data.configurations), "configurations should be an array");
+        });
+    });
+
     // ── Write operations ──────────────────────────────────────────────────────
     describe("Write operations", () => {
         skipWrite("create, update, assign, and delete an Android compliance policy", async (t: any) => {

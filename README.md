@@ -66,6 +66,10 @@ Injected by `bws run` from your BWS project (see `bws-secrets.map`):
 - `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 - `JAMF_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://jamf-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`, used to build RFC 9728 resource metadata)
 - `JAMF_PACKAGE_UPLOAD_DIR` — directory `jamf_upload_package` may read files from on this server's own filesystem. Required for that tool; it refuses every call if unset.
+- `JAMF_PLATFORM_CLIENT_ID` / `JAMF_PLATFORM_CLIENT_SECRET` — OAuth2 client-credentials pair for the Jamf Platform API Gateway, from a separate account.jamf.com Integration (not the same as `JAMF_CLIENT_ID`/`JAMF_CLIENT_SECRET`). Required by `jamf_list_filevault_status`, the `jamf_*_compliance_*` tools, and the `jamf_*_blueprint*` tools; see `src/jamf/jamf-api.ts` for details.
+- `JAMF_PLATFORM_URL` — token endpoint for the above credential (e.g. `https://us.apigw.jamf.com/auth/token`)
+- `JAMF_PLATFORM_TENANT_ID` — tenant UUID for the Platform API Gateway (distinct from `JAMF_URL`)
+- `JAMF_PLATFORM_REGION` — optional, Platform API Gateway region (`"us"` default, `"eu"`, `"apac"`)
 
 **Microsoft Intune:**
 - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — Graph app-only client credentials for device data; unrelated to the Entra auth vars below
@@ -227,6 +231,7 @@ The write tools below require the `Jamf.Write` role under Entra auth. `jamf_crea
 | `jamf_list_categories` | Categories | `page?`, `pageSize?` |
 | `jamf_list_departments` | Departments | — |
 | `jamf_get_filevault_status` | FileVault encryption status | `computerNameOrSerial` |
+| `jamf_list_filevault_status` | Bulk FileVault escrow/status across the fleet, one page per call | `page?`, `pageSize?` |
 | `jamf_update_computer` | Update computer inventory fields | `computerNameOrSerial`, `username?`, `realName?`, `emailAddress?`, `department?`, `building?`, `room?`, `assetTag?` |
 | `jamf_flush_mdm_commands` | Flush pending/failed MDM commands | `computerNameOrSerial`, `status?` |
 | `jamf_create_script` | Create/update a script (upsert by name) | `name`, `scriptContents`, `categoryName?`, `info?`, `notes?`, `priority?`, `osRequirements?`, `parameter4?`...`parameter11?` |
@@ -234,16 +239,28 @@ The write tools below require the `Jamf.Write` role under Entra auth. `jamf_crea
 | `jamf_create_smart_group` | Create/update an Application Title+Version detection smart group (upsert by name) | `name`, `applicationTitle`, `applicationVersion`, `siteId?` |
 | `jamf_create_policy` | Create a policy scoped to smart/static groups; script-only policies supported | `name`, `enabled?`, trigger/frequency fields, `categoryName?`, `targetGroupNames?`, `exclusionGroupNames?`, `scripts?`, `packages?`, `selfService?`, `maintenanceRecon?` |
 | `jamf_update_policy` | Enable/disable + widen/narrow an existing policy's scope | `policy`, `enabled?`, `addTargetGroupNames?`, `removeTargetGroupNames?`, `addExclusionGroupNames?`, `removeExclusionGroupNames?` |
+| `jamf_list_compliance_baselines` | List available mSCP baselines (CIS/NIST) for Compliance Benchmarks | — |
+| `jamf_list_compliance_benchmarks` | List this tenant's configured Compliance Benchmarks | — |
+| `jamf_get_compliance_benchmark` | Benchmark detail: rules, scope, enforcement mode, compliance % | `benchmarkId` |
+| `jamf_get_compliance_benchmark_devices` | Per-rule device pass/fail drill-down for a benchmark | `benchmarkId`, `ruleId`, `deviceSearch?`, `ruleResult?`, `page?`, `pageSize?` |
+| `jamf_list_blueprints` | List Blueprints (declarative device management workflows) | `search?`, `page?`, `pageSize?` |
+| `jamf_get_blueprint` | Blueprint detail: scope, steps/components, deployment state, status report | `blueprintId` |
+| `jamf_list_blueprint_components` | Catalog of component types available to build blueprints from | `page?`, `pageSize?` |
+
+Compliance Benchmarks, Blueprints, and `jamf_list_filevault_status` all hit the Jamf Platform API Gateway — a different host *and* a different OAuth2 credential (`JAMF_PLATFORM_*`) from every other JAMF tool in this file. Confirmed live 2026-07-29 against a real account.jamf.com Integration credential; see `bws-secrets.map` and the "Platform API Gateway" section of `src/jamf/jamf-api.ts` for details.
 
 ### Microsoft Intune Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `intune_get_autopilot_status` | Autopilot profile & status | `serialNumber?`, `deviceName?` |
-| `intune_get_device_by_name` | Managed device by name | `deviceName` |
-| `intune_get_device_by_serial` | Managed device by serial number | `serialNumber` |
+| `intune_list_autopilot_devices` | Bulk-list Windows Autopilot device identities (fleet-wide counts/breakdowns) | `manufacturer?`, `model?`, `groupTag?` |
+| `intune_get_device_by_name` | Managed device by name (includes ownership/`ownerType`) | `deviceName` |
+| `intune_get_device_by_serial` | Managed device by serial number (includes ownership/`ownerType`) | `serialNumber` |
 | `intune_get_devices_by_user` | All devices for a user | `userIdentifier` |
-| `intune_list_devices` | Fleet-wide device list/breakdown (OS, compliance, management agent) — `intuneManagedOnly` excludes Defender-sensor-only/ConfigMgr-only devices | `operatingSystem?`, `complianceState?`, `managementState?`, `managementAgent?`, `intuneManagedOnly?` |
+| `intune_list_devices` | Fleet-wide device list/breakdown (OS, compliance, management agent, ownership) — `intuneManagedOnly` excludes Defender-sensor-only/ConfigMgr-only devices | `operatingSystem?`, `complianceState?`, `managementState?`, `managementAgent?`, `ownerType?`, `intuneManagedOnly?` |
+| `intune_list_conditional_access_policies` | Entra Conditional Access policies (state, grant controls, targeted platforms) — needs `Policy.Read.All` Graph permission, not yet confirmed granted | — |
+| `intune_list_enrollment_restrictions` | Device enrollment configurations (device-type/personal-device platform restrictions) | — |
 | `intune_get_device_groups` | Device group memberships | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_get_device_apps` | Detected & assigned apps | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_list_configuration_policies` | Configuration policies (classic + settings catalog) | `policyName?`, `platform?` |

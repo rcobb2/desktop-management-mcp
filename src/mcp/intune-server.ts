@@ -194,6 +194,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             `- **OS:** ${d.operatingSystem ?? "—"} ${d.osVersion ?? ""}`,
                             `- **Compliance:** ${d.complianceState ?? "—"}`,
                             `- **Management State:** ${d.managementState ?? "—"}`,
+                            `- **Ownership:** ${d.ownerType ?? "—"}`,
                             `- **Last Sync:** ${d.lastSyncDateTime ?? "—"}`,
                             `- **Enrolled:** ${d.enrolledDateTime ?? "—"}`,
                             `- **Assigned User:** ${d.userDisplayName ?? "—"} (${d.userPrincipalName ?? "—"})`,
@@ -238,6 +239,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             `- **OS:** ${d.operatingSystem ?? "—"} ${d.osVersion ?? ""}`,
                             `- **Compliance:** ${d.complianceState ?? "—"}`,
                             `- **Management State:** ${d.managementState ?? "—"}`,
+                            `- **Ownership:** ${d.ownerType ?? "—"}`,
                             `- **Last Sync:** ${d.lastSyncDateTime ?? "—"}`,
                             `- **Assigned User:** ${d.userDisplayName ?? "—"} (${d.userPrincipalName ?? "—"})`,
                             `- **Intune Device ID:** ${d.id ?? "—"}`,
@@ -310,6 +312,85 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── intune_list_autopilot_devices ────────────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_autopilot_devices",
+            {
+                description:
+                    "Bulk-list Windows Autopilot device identities (distinct from Intune's managed-device inventory — " +
+                    "a device can have an Autopilot record with no Intune enrollment yet, or vice versa). Use this for " +
+                    "fleet-wide Autopilot counts/breakdowns (e.g. by manufacturer, whether devices came in pre-registered " +
+                    "via purchaseOrderIdentifier) instead of sending many concurrent intune_get_autopilot_status calls, " +
+                    "which can overload this server — see that tool's description.",
+                inputSchema: {
+                    manufacturer: z.string().optional().describe("Filter by manufacturer, substring match (e.g. \"Dell\")"),
+                    model: z.string().optional().describe("Filter by model, substring match"),
+                    groupTag: z.string().optional().describe("Filter by Autopilot group tag, substring match"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ manufacturer, model, groupTag, response_format = "markdown" }) => {
+                try {
+                    const data = await client.listAutopilotDevices({ manufacturer, model, groupTag });
+
+                    const text = toText(data, response_format, () => {
+                        const devices: any[] = data.devices ?? [];
+                        const filterNote = [
+                            manufacturer && `manufacturer="${manufacturer}"`,
+                            model && `model="${model}"`,
+                            groupTag && `groupTag="${groupTag}"`,
+                        ]
+                            .filter(Boolean)
+                            .join(", ");
+
+                        if (devices.length === 0) {
+                            return `No Autopilot devices found${filterNote ? ` matching ${filterNote}` : ""}.`;
+                        }
+
+                        const byManufacturer = new Map<string, number>();
+                        const byPurchaseOrder = new Map<string, number>();
+                        for (const d of devices) {
+                            const mfr = d.manufacturer ?? "Unknown";
+                            const po = d.purchaseOrderIdentifier || "(none)";
+                            byManufacturer.set(mfr, (byManufacturer.get(mfr) ?? 0) + 1);
+                            byPurchaseOrder.set(po, (byPurchaseOrder.get(po) ?? 0) + 1);
+                        }
+
+                        const sortedEntries = (m: Map<string, number>) =>
+                            [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+
+                        const rows = devices
+                            .slice(0, 50)
+                            .map(
+                                (d: any) =>
+                                    `- **${d.serialNumber ?? "Unknown"}** | ${d.manufacturer ?? "—"} ${d.model ?? "—"} | Group Tag: ${d.groupTag || "—"} | Profile: ${d.deploymentProfileAssignmentStatus ?? "—"} | PO: ${d.purchaseOrderIdentifier || "—"}`
+                            )
+                            .join("\n");
+
+                        const truncationNote = data.truncated
+                            ? `\n\n_⚠️ Hit the pagination safety cap — counts above reflect only the first ${devices.length} devices fetched, not necessarily the entire tenant._`
+                            : "";
+
+                        return (
+                            [
+                                `## Autopilot Devices${filterNote ? ` (${filterNote})` : ""} — ${devices.length} total`,
+                                `### By Manufacturer\n${sortedEntries(byManufacturer)}`,
+                                `### By Purchase Order Identifier\n${sortedEntries(byPurchaseOrder)}`,
+                                `### Devices (showing ${Math.min(50, devices.length)} of ${devices.length})\n${rows}${devices.length > 50 ? `\n_…and ${devices.length - 50} more_` : ""}`,
+                            ].join("\n\n") + truncationNote
+                        );
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 4. intune_get_devices_by_user ────────────────────────────────────────
     if (hasRole(roles, INTUNE_READ)) {
         server.registerTool(
@@ -337,7 +418,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const rows = list
                             .map(
                                 (d: any) =>
-                                    `- **${d.deviceName ?? "Unknown"}** | OS: ${d.operatingSystem ?? "—"} ${d.osVersion ?? ""} | Compliance: ${d.complianceState ?? "—"} | Last sync: ${d.lastSyncDateTime ?? "—"}`
+                                    `- **${d.deviceName ?? "Unknown"}** | OS: ${d.operatingSystem ?? "—"} ${d.osVersion ?? ""} | Compliance: ${d.complianceState ?? "—"} | Ownership: ${d.ownerType ?? "—"} | Last sync: ${d.lastSyncDateTime ?? "—"}`
                             )
                             .join("\n");
                         return `## Devices for "${userIdentifier}" (${list.length})\n\n${rows}`;
@@ -760,11 +841,15 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             const stateSection = state ? `**Deployment State:** ${state}` : "";
                             const findingsSection =
                                 findings.length > 0
-                                    ? `### Findings\n${findings.map((f: any) => `- ${f}`).join("\n")}`
+                                    ? `### Findings\n${findings
+                                          .map((f: any) => `- **[${f.severity ?? "—"}] ${f.code ?? "Finding"}**: ${f.message ?? f}`)
+                                          .join("\n")}`
                                     : "### Findings\n_No issues detected_";
                             const recoSection =
                                 recommendations.length > 0
-                                    ? `### Recommendations\n${recommendations.map((r: any) => `- ${r}`).join("\n")}`
+                                    ? `### Recommendations\n${recommendations
+                                          .map((r: any) => `- **[${r.priority ?? "—"}] ${r.action ?? "Recommendation"}**: ${r.details ?? r}`)
+                                          .join("\n")}`
                                     : "";
 
                             return `## Guided Policy Troubleshooting\n**Device:** ${devLabel} | **Policy:** ${polLabel}\n\n${stateSection}\n\n${findingsSection}${recoSection ? `\n\n${recoSection}` : ""}`;
@@ -977,11 +1062,15 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             const stateSection = installState ? `**Install State:** ${installState}` : "";
                             const findingsSection =
                                 findings.length > 0
-                                    ? `### Findings\n${findings.map((f: any) => `- ${f}`).join("\n")}`
+                                    ? `### Findings\n${findings
+                                          .map((f: any) => `- **[${f.severity ?? "—"}] ${f.code ?? "Finding"}**: ${f.message ?? f}`)
+                                          .join("\n")}`
                                     : "### Findings\n_No issues detected_";
                             const recoSection =
                                 recommendations.length > 0
-                                    ? `### Recommendations\n${recommendations.map((r: any) => `- ${r}`).join("\n")}`
+                                    ? `### Recommendations\n${recommendations
+                                          .map((r: any) => `- **[${r.priority ?? "—"}] ${r.action ?? "Recommendation"}**: ${r.details ?? r}`)
+                                          .join("\n")}`
                                     : "";
 
                             return `## Guided App Troubleshooting\n**Device:** ${devLabel} | **App:** ${appLabel}\n\n${stateSection}\n\n${findingsSection}${recoSection ? `\n\n${recoSection}` : ""}`;
@@ -1068,6 +1157,10 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         .describe(
                             'Filter by exact management agent, e.g. "mdm", "configurationManagerClientMdm", "msSense", "configurationManagerClient"'
                         ),
+                    ownerType: z
+                        .string()
+                        .optional()
+                        .describe('Filter by device ownership, e.g. "company", "personal", "unknown"'),
                     intuneManagedOnly: z
                         .boolean()
                         .optional()
@@ -1085,6 +1178,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                 complianceState,
                 managementState,
                 managementAgent,
+                ownerType,
                 intuneManagedOnly,
                 response_format = "markdown",
             }) => {
@@ -1094,6 +1188,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         complianceState,
                         managementState,
                         managementAgent,
+                        ownerType,
                         intuneManagedOnly,
                     });
 
@@ -1104,6 +1199,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             complianceState && `compliance="${complianceState}"`,
                             managementState && `managementState="${managementState}"`,
                             managementAgent && `managementAgent="${managementAgent}"`,
+                            ownerType && `ownerType="${ownerType}"`,
                             intuneManagedOnly && "intuneManagedOnly=true",
                         ]
                             .filter(Boolean)
@@ -1116,13 +1212,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const byOs = new Map<string, number>();
                         const byCompliance = new Map<string, number>();
                         const byAgent = new Map<string, number>();
+                        const byOwnership = new Map<string, number>();
                         for (const d of devices) {
                             const os = d.operatingSystem ?? "Unknown";
                             const comp = d.complianceState ?? "unknown";
                             const agent = d.managementAgent ?? "unknown";
+                            const ownership = d.ownerType ?? "unknown";
                             byOs.set(os, (byOs.get(os) ?? 0) + 1);
                             byCompliance.set(comp, (byCompliance.get(comp) ?? 0) + 1);
                             byAgent.set(agent, (byAgent.get(agent) ?? 0) + 1);
+                            byOwnership.set(ownership, (byOwnership.get(ownership) ?? 0) + 1);
                         }
 
                         const sortedEntries = (m: Map<string, number>) =>
@@ -1146,6 +1245,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                                 `### By OS\n${sortedEntries(byOs)}`,
                                 `### By Compliance State\n${sortedEntries(byCompliance)}`,
                                 `### By Management Agent\n${sortedEntries(byAgent)}`,
+                                `### By Ownership\n${sortedEntries(byOwnership)}`,
                                 `### Devices (showing ${Math.min(50, devices.length)} of ${devices.length})\n${rows}${devices.length > 50 ? `\n_…and ${devices.length - 50} more_` : ""}`,
                             ].join("\n\n") + truncationNote
                         );
@@ -2240,6 +2340,94 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             result.replacedExistingForGroup ? `- This replaced a prior assignment for the same group.` : "",
                         ].filter(Boolean).join("\n");
                     });
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 36. intune_list_conditional_access_policies ──────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_conditional_access_policies",
+            {
+                description:
+                    "List Entra Conditional Access policies — name, state (enabled/disabled/reportOnly), " +
+                    "targeted apps/platforms/users, and grant controls (MFA, compliant device required, etc). " +
+                    "Read-only, no write tool exists for Conditional Access here. " +
+                    "NOT YET WORKING (confirmed live 2026-07-28) — this app registration's token is missing the " +
+                    "Policy.Read.All Graph application permission; the call cleanly 403s with 'required scopes are " +
+                    "missing in the token' until an Entra admin grants and consents it, at which point this will " +
+                    "start working with no code change.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getConditionalAccessPolicies();
+
+                    const text = toText(data, response_format, () => {
+                        const policies: any[] = data.policies ?? [];
+                        if (policies.length === 0) return "No Conditional Access policies found.";
+
+                        const rows = policies
+                            .map((p: any) => {
+                                const grant = p.grantControls?.builtInControls?.join(", ") || p.grantControls?.customAuthenticationFactors?.join(", ") || "—";
+                                const platforms = p.conditions?.platforms?.includePlatforms?.join(", ") || "—";
+                                return `- **${p.displayName ?? p.id}** | State: ${p.state ?? "—"} | Grant: ${grant} | Platforms: ${platforms}`;
+                            })
+                            .join("\n");
+
+                        return `## Conditional Access Policies — ${policies.length} total\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 37. intune_list_enrollment_restrictions ──────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_enrollment_restrictions",
+            {
+                description:
+                    "List device enrollment configurations — backs Devices > Enrollment restrictions in the " +
+                    "Intune admin center, including per-platform device-type restrictions (e.g. blocking " +
+                    "personally-owned Windows enrollment) and their priority order. Read-only; no write tool " +
+                    "exists here since enabling a restriction has real enrollment-blocking consequences that " +
+                    "should go through the admin center deliberately. " +
+                    "Confirmed live 2026-07-28 — returned 8 real configurations for this tenant with no permission gap.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getEnrollmentRestrictions();
+
+                    const text = toText(data, response_format, () => {
+                        const configs: any[] = data.configurations ?? [];
+                        if (configs.length === 0) return "No enrollment configurations found.";
+
+                        const rows = configs
+                            .map(
+                                (c: any) =>
+                                    `- **${c.displayName ?? c.id}** | Type: ${c.deviceEnrollmentConfigurationType ?? "—"} | Priority: ${c.priority ?? "—"}${c.description ? `\n  ${c.description}` : ""}`
+                            )
+                            .join("\n");
+
+                        return `## Enrollment Restrictions — ${configs.length} total\n\n${rows}`;
+                    });
+
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);
