@@ -958,6 +958,24 @@ export class JamfClient {
         }
     }
 
+    // Read a script's full record (including scriptContents) by name or numeric ID —
+    // jamf_create_script is upsert-by-name and will happily overwrite an existing
+    // script's body, but until now there was no way to see what a script currently
+    // contains before changing it. Reuses getScriptById/findScriptByName rather than
+    // adding new API surface, mirroring the list-vs-get split jamf_get_smart_group
+    // already established for smart groups.
+    public async getScript(nameOrId: string): Promise<any> {
+        await this.ensureAuthenticated();
+        if (/^\d+$/.test(nameOrId)) {
+            return this.getScriptById(nameOrId);
+        }
+        const found = await this.findScriptByName(nameOrId);
+        if (!found) {
+            throw new Error(`Script not found: "${nameOrId}"`);
+        }
+        return found;
+    }
+
     private async findScriptByName(name: string): Promise<any | null> {
         const data = await this.getScripts(name, 0, 200);
         const scripts: any[] = data.results ?? [];
@@ -2704,10 +2722,17 @@ export class JamfClient {
     // case, unsafe for "just add one script to an existing policy"). Mirrors
     // updatePolicyScope exactly: read current, merge only `scripts`, PUT back that one
     // section alone — never the full policy object (same `printers`-409 reasoning).
-    // NOT YET CONFIRMED LIVE (unlike updatePolicyScope) — built by direct analogy
-    // to it since the Classic API's policy.scripts write shape is otherwise identical
-    // to what upsertPolicy already sends successfully; verify against a low-risk
-    // policy before relying on it in an incident.
+    // Confirmed live: used to insert a third same-priority script into the middle of
+    // an existing two-script policy chain, and the merged array this method builds
+    // and sends does match the caller's intended order exactly (verified via a
+    // follow-up GET). CAVEAT, also confirmed live: Jamf's actual execution order for
+    // multiple scripts sharing the same priority does NOT reliably follow that sent/
+    // displayed array order regardless — a real run swapped two same-priority
+    // scripts despite the correct order being sent and echoed back on GET. This
+    // looks like Jamf-side tie-breaking (e.g. by internal script ID) rather than
+    // anything this method controls; no client-side lever to force a specific order
+    // among same-priority scripts has been found. If exact ordering matters, verify
+    // the real run order via getComputerPolicyLogs after a live execution.
     public async updatePolicyScripts(nameOrId: string, changes: {
         addScripts?: { name: string; priority?: 'Before' | 'After'; parameter4?: string }[];
         removeScriptNames?: string[];
@@ -2817,6 +2842,143 @@ export class JamfClient {
             iconFilename: icon?.filename,
             retried,
         };
+    }
+
+    private async findConfigurationProfileByName(name: string): Promise<{ id: number; name: string } | null> {
+        const data = await this.getComputerConfigurationProfiles(name);
+        const lower = name.trim().toLowerCase();
+        return (data.results ?? []).find((p: any) => p.name?.toLowerCase() === lower) ?? null;
+    }
+
+    // Read a configuration profile's full payload/scope by name or numeric ID —
+    // jamf_list_configuration_profiles only ever returns id/name, so there was no way
+    // to see an existing profile's actual settings (general.payloads, the raw
+    // .mobileconfig plist XML) or scope without the admin console. Confirmed live:
+    // the Classic API's os_x_configuration_profile object has general
+    // (id/name/description/site/category/distribution_method/user_removable/level/
+    // uuid/redeploy_on_update/payloads) + scope (same shape as a policy's scope) +
+    // self_service sections.
+    public async getConfigurationProfileDetail(nameOrId: string): Promise<any> {
+        await this.ensureAuthenticated();
+        let id: string;
+        if (/^\d+$/.test(nameOrId)) {
+            id = nameOrId;
+        } else {
+            const found = await this.findConfigurationProfileByName(nameOrId);
+            if (!found) throw new Error(`Configuration profile not found: "${nameOrId}"`);
+            id = String(found.id);
+        }
+        this.logger.info('Fetching configuration profile detail', { id });
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.get(`/JSSResource/osxconfigurationprofiles/id/${id}`, {
+                headers: { Accept: 'application/json' }
+            });
+            logApiCall(this.logger, 'GET', `/JSSResource/osxconfigurationprofiles/id/${id}`, response.status, Date.now() - apiStart);
+            return response.data.os_x_configuration_profile ?? response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read macOS Configuration Profiles' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Configuration profile with ID ${id} not found.`);
+            }
+            this.logger.error('Error fetching configuration profile detail', { id, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/JSSResource/osxconfigurationprofiles/id/${id}`, undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Create-or-update a macOS configuration profile by name — the only way to deliver
+    // a .mobileconfig-native payload (Dock/Finder prefs, Focus/notification schedules,
+    // desktop picture, etc.) via this MCP server before this was a script + policy,
+    // which loses the profile-specific benefits (declarative re-assertion, no visible
+    // Terminal flash, login-window-stage applicability). `payload` is the raw plist XML
+    // (a full .mobileconfig file's contents, starting `<?xml version="1.0"...`) — passed
+    // straight into `general.payloads`; `serializeXmlObjectBody`'s existing `escapeXml()`
+    // entity-escapes it correctly as XML text content within the outer document (Jamf's
+    // Classic API expects the inner plist XML-escaped inline, not wrapped in CDATA —
+    // matches how `general.payloads` came back on a live GET, escaped the same way).
+    // NOT YET CONFIRMED LIVE for the write path (only the read/GET side of this object
+    // type has been exercised against real data) — verify against a real create/update
+    // before relying on it, same caveat this codebase already applies elsewhere (e.g.
+    // OEMConfig) to write paths built from the documented API shape but not yet exercised.
+    public async upsertConfigurationProfile(params: {
+        name: string;
+        payload: string;
+        description?: string;
+        categoryName?: string;
+        distributionMethod?: 'Install Automatically' | 'Make Available in Self Service';
+        targetGroupNames?: string[];
+        exclusionGroupNames?: string[];
+    }) {
+        await this.ensureAuthenticated();
+        this.logger.info('Upserting configuration profile', { name: params.name });
+        try {
+            const existing = await this.findConfigurationProfileByName(params.name);
+            const [targetGroups, exclusionGroups, categoryId] = await Promise.all([
+                Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+                params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
+            ]);
+
+            const profile: Record<string, any> = {
+                general: {
+                    name: params.name,
+                    description: params.description ?? '',
+                    distribution_method: params.distributionMethod ?? 'Install Automatically',
+                    payloads: params.payload,
+                    category: categoryId ? { id: categoryId } : undefined,
+                },
+                scope: {
+                    all_computers: false,
+                    computer_groups: targetGroups.map((g) => ({ id: g.id, name: g.name })),
+                    exclusions: exclusionGroups.length
+                        ? { computer_groups: exclusionGroups.map((g) => ({ id: g.id, name: g.name })) }
+                        : undefined,
+                },
+            };
+
+            if (!existing) {
+                const xml = buildXmlDocument('os_x_configuration_profile', profile);
+                const apiStart = Date.now();
+                const response = await this.client.post('/JSSResource/osxconfigurationprofiles/id/0', xml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'POST', '/JSSResource/osxconfigurationprofiles/id/0', response.status, Date.now() - apiStart);
+                const match = String(response.data).match(/<id>(\d+)<\/id>/);
+                if (!match) throw new Error('Configuration profile created but no ID could be determined from the response.');
+                this.logger.info('Configuration profile created', { name: params.name, id: match[1] });
+                return { action: 'created' as const, id: match[1], name: params.name };
+            }
+
+            // Same one-section-per-PUT discipline as upsertPolicy (confirmed live gotcha
+            // there: combining sections in a single PUT can silently drop them) — applied
+            // here defensively given the precedent on this same Classic API family, though
+            // not independently confirmed for configuration profiles specifically.
+            const id = String(existing.id);
+            const sections = Object.entries(profile).filter(([, v]) => v !== undefined);
+            for (const [key, value] of sections) {
+                const sectionXml = buildXmlDocument('os_x_configuration_profile', { [key]: value });
+                const apiStart = Date.now();
+                const response = await this.client.put(`/JSSResource/osxconfigurationprofiles/id/${id}`, sectionXml, {
+                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+                });
+                logApiCall(this.logger, 'PUT', `/JSSResource/osxconfigurationprofiles/id/${id} (${key})`, response.status, Date.now() - apiStart);
+            }
+            this.logger.info('Configuration profile updated', { name: params.name, id, sections: sections.map(([k]) => k) });
+            return { action: 'updated' as const, id, name: params.name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Create/Update macOS Configuration Profiles' permissions in JAMF Pro.`);
+            }
+            if (axios.isAxiosError(error) && error.response?.status === 415) {
+                throw new Error(`Unsupported Media Type (415) — the Classic API rejected the XML body for configuration profiles.`);
+            }
+            this.logger.error('Error upserting configuration profile', { name: params.name, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/JSSResource/osxconfigurationprofiles/id/0', undefined, undefined, error as Error);
+            throw error;
+        }
     }
 
     public async getComputerConfigurationProfiles(name?: string) {
@@ -3293,6 +3455,114 @@ export class JamfClient {
             }
             this.logger.error('Error fetching bulk FileVault status', { page, pageSize, error: (error as Error).message });
             logApiCall(this.logger, 'GET', `/pro/v4/tenant/${tenantId}/computers-inventory/filevault`, undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // ─── LAPS (Local Admin Password, Platform API Gateway) ──────────────────
+    // The tenant's own JAMF_CLIENT_ID/SECRET role 403s (INVALID_PRIVILEGE, missing
+    // "View Local Admin Password") on both LAPS endpoints directly — same shape as
+    // the bulk FileVault gap above, and the same Gateway credential covers it. No new
+    // credential or privilege grant needed beyond the existing JAMF_PLATFORM_* Gateway
+    // credential already wired up for FileVault/Compliance Benchmarks/Blueprints.
+    // CONFIRMED LIVE 2026-07-30 against a real device (managementId resolved, 2 real
+    // LAPS accounts listed with real username/guid fields, and a real current password
+    // successfully retrieved for one of them). One real bug caught by this testing:
+    // an earlier version of the password path dropped `clientManagementId` (passing it
+    // as a query param instead of keeping it in the path like the accounts-list
+    // endpoint does) and got a 403 back that looked exactly like a missing-privilege
+    // error — it wasn't; the fix was purely the path shape, confirmed by retesting
+    // after the fix with no credential/privilege change at all.
+
+    // Resolves a computer's `clientManagementId` — the GUID LAPS keys off, distinct
+    // from the plain numeric Jamf computer ID `resolveComputerId` returns. Confirmed
+    // live: `GET /api/v1/computers-inventory-detail/{id}?section=GENERAL` ->
+    // `general.managementId`.
+    private async resolveClientManagementId(nameOrSerial: string): Promise<string> {
+        // Uses the direct tenant client (not the Platform Gateway), so it needs the
+        // tenant's own auth ensured — getLapsAccounts/getLapsPassword only ensure the
+        // Gateway's auth before calling this, since resolving a computer ID/managementId
+        // always goes through the tenant's own API regardless of Gateway configuration.
+        await this.ensureAuthenticated();
+        const computerId = await this.resolveComputerId(nameOrSerial);
+        const apiStart = Date.now();
+        const response = await this.client.get(`/api/v1/computers-inventory-detail/${computerId}`, {
+            params: { section: 'GENERAL' }
+        });
+        logApiCall(this.logger, 'GET', `/api/v1/computers-inventory-detail/${computerId}`, response.status, Date.now() - apiStart);
+        const managementId = response.data.general?.managementId;
+        if (!managementId) {
+            throw new Error(`No managementId found for computer "${nameOrSerial}" — it may not be enrolled via modern MDM.`);
+        }
+        return managementId;
+    }
+
+    /** List LAPS-managed local admin accounts on a computer, by name or serial. */
+    public async getLapsAccounts(nameOrSerial: string) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        const clientManagementId = await this.resolveClientManagementId(nameOrSerial);
+        this.logger.info('Fetching LAPS accounts', { nameOrSerial, clientManagementId });
+        try {
+            const path = `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/accounts`;
+            const apiStart = Date.now();
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            return response.data;
+        } catch (error) {
+            const status = (error as any)?.response?.status;
+            if (status === 403 || status === 401) {
+                throw new Error(`Permission denied (${status}). The Platform API Gateway credential may be missing LAPS privileges on its account.jamf.com Integration.`);
+            }
+            if (status === 404) {
+                throw new Error(`No LAPS accounts found for computer "${nameOrSerial}" (managementId ${clientManagementId}) — it may not have LAPS enabled.`);
+            }
+            this.logger.error('Error fetching LAPS accounts', { nameOrSerial, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    /**
+     * Read a LAPS-managed local admin account's current password, by computer
+     * name/serial and account username. Resolves the account's own GUID (a distinct
+     * identifier from clientManagementId, needed for the password path) from
+     * getLapsAccounts rather than requiring the caller to already know it. Confirmed
+     * live 2026-07-30 against a real device/account, including the exact field names
+     * parsed here (username/guid).
+     */
+    public async getLapsPassword(nameOrSerial: string, username: string) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        const clientManagementId = await this.resolveClientManagementId(nameOrSerial);
+
+        const accountsData = await this.getLapsAccounts(nameOrSerial);
+        const accounts: any[] = accountsData.results ?? accountsData.accounts ?? (Array.isArray(accountsData) ? accountsData : []);
+        const account = accounts.find((a: any) => String(a.username ?? a.userName ?? '').toLowerCase() === username.toLowerCase());
+        if (!account) {
+            throw new Error(`LAPS account "${username}" not found for computer "${nameOrSerial}". Use jamf_get_laps_accounts to see available accounts.`);
+        }
+        const guid = account.guid ?? account.id;
+        if (!guid) {
+            throw new Error(`Could not determine the account GUID for "${username}" from the LAPS accounts response — its shape may differ from what this method expects.`);
+        }
+
+        this.logger.info('Fetching LAPS password', { nameOrSerial, clientManagementId, username });
+        try {
+            // clientManagementId stays in the path here, same as the accounts-list
+            // endpoint above — an earlier version of this method dropped it (passing it
+            // as a query param instead) and got a 403 back that looked like a privilege
+            // gap but was actually just a malformed path; confirmed live once fixed.
+            const path = `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/account/${encodeURIComponent(username)}/${guid}/password`;
+            const apiStart = Date.now();
+            const response = await this.platformClient.get(path);
+            logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
+            return { username, clientManagementId, ...response.data };
+        } catch (error) {
+            const status = (error as any)?.response?.status;
+            if (status === 403 || status === 401) {
+                throw new Error(`Permission denied (${status}). The Platform API Gateway credential may be missing LAPS privileges on its account.jamf.com Integration.`);
+            }
+            this.logger.error('Error fetching LAPS password', { nameOrSerial, username, error: (error as Error).message });
             throw error;
         }
     }

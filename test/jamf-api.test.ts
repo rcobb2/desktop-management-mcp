@@ -351,6 +351,44 @@ describe("JamfClient", () => {
                 p.name.toLowerCase().includes(fragment.toLowerCase())
             ), "all results should match the name filter");
         });
+
+        permissionAwareTest("get configuration profile detail by id and by name", async () => {
+            const all = await client.getComputerConfigurationProfiles();
+            if (all.results.length === 0) return;
+            const target = all.results[0];
+            const byId = await client.getConfigurationProfileDetail(String(target.id));
+            assert.equal(byId.general.id, target.id);
+            assert.ok(typeof byId.general.payloads === "string", "payloads should be a string");
+            const byName = await client.getConfigurationProfileDetail(target.name);
+            assert.equal(byName.general.id, target.id);
+        });
+
+        permissionAwareTest("get configuration profile detail throws for unknown profile", async () => {
+            await assert.rejects(
+                () => client.getConfigurationProfileDetail("zzz-definitely-not-a-real-profile"),
+                /not found/i
+            );
+        });
+
+        // Config profile create/update deliberately does NOT create-then-delete (no delete tool/permission
+        // established for this object type, matching the script/smart-group/policy precedent above) — looks
+        // for a pre-existing, manually-created fixture by name and only exercises the update-in-place path.
+        // Also NOT YET CONFIRMED LIVE for the write path itself (see CLAUDE.md) — this is the first live check.
+        skipWrite("upsert configuration profile updates a pre-existing fixture in place", async (t: any) => {
+            const fixtureName = process.env.TEST_CONFIG_PROFILE_NAME;
+            if (!fixtureName) {
+                t.skip("set TEST_CONFIG_PROFILE_NAME to a configuration profile name that already exists in JAMF Pro to exercise this test");
+                return;
+            }
+            const before = await client.getConfigurationProfileDetail(fixtureName);
+            const result = await client.upsertConfigurationProfile({
+                name: fixtureName,
+                payload: before.general.payloads,
+                description: before.general.description ?? "",
+            });
+            assert.equal(result.action, "updated");
+            assert.equal(result.id, String(before.general.id));
+        });
     });
 
     // ── Patch policies ────────────────────────────────────────────────────────
@@ -409,6 +447,25 @@ describe("JamfClient", () => {
             assert.ok(
                 filteredPackages.some((p: any) => p.id === target.id),
                 "name search should find packages beyond the first default-size page"
+            );
+        });
+
+        test("get script by id and by name returns scriptContents", async () => {
+            const data = await client.getScripts(undefined, 0, 1);
+            const scripts: any[] = (data as any).results ?? [];
+            if (scripts.length === 0) return;
+            const target = scripts[0];
+            const byId = await client.getScript(String(target.id));
+            assert.equal(byId.name, target.name);
+            assert.ok(typeof byId.scriptContents === "string", "scriptContents should be a string");
+            const byName = await client.getScript(target.name);
+            assert.equal(String(byName.id), String(target.id));
+        });
+
+        test("get script throws for unknown script", async () => {
+            await assert.rejects(
+                () => client.getScript("zzz-definitely-not-a-real-script"),
+                /not found/i
             );
         });
 
@@ -912,6 +969,31 @@ describe("JamfClient", () => {
             if (data.results.length > 0) {
                 assert.equal(typeof data.results[0].identifier, "string");
             }
+        });
+    });
+
+    // ── LAPS (Platform API Gateway) ───────────────────────────────────────────
+    describe("LAPS", () => {
+        permissionAwareTest("list LAPS accounts returns username/guid fields", async () => {
+            if (!hasPlatformGateway()) return;
+            const data: any = await client.getLapsAccounts(TEST_COMPUTER_NAME);
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.equal(typeof data.results[0].username, "string");
+                assert.equal(typeof data.results[0].guid, "string");
+            }
+        });
+
+        // Deliberately does not assert on the password's actual value anywhere — just
+        // that a non-empty string comes back — since this is a real, live credential.
+        permissionAwareTest("get LAPS password returns a real password field", async () => {
+            if (!hasPlatformGateway()) return;
+            const accounts: any = await client.getLapsAccounts(TEST_COMPUTER_NAME);
+            const account = accounts.results?.[0];
+            if (!account) return; // this fixture computer has no LAPS accounts to test against
+            const result = await client.getLapsPassword(TEST_COMPUTER_NAME, account.username);
+            assert.equal(typeof result.password, "string");
+            assert.ok(result.password.length > 0);
         });
     });
 });

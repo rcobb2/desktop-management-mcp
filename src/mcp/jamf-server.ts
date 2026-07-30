@@ -641,6 +641,48 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 9b. jamf_get_script ──────────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_script",
+            {
+                description:
+                    "Get a single script's full details, including its actual body (scriptContents), by name or " +
+                    "numeric ID. jamf_create_script is an upsert that will happily overwrite an existing script's " +
+                    "body blind — use this first to see what a script currently does before changing it. " +
+                    "Use jamf_list_scripts to find a script name/ID.",
+                inputSchema: {
+                    script: z.string().describe("Script name or numeric ID — use jamf_list_scripts to find one"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ script, response_format = "markdown" }) => {
+                try {
+                    const data: any = await client.getScript(script);
+
+                    const text = toText(data, response_format, () => {
+                        const lines = [
+                            `## ${data.name ?? `Script ${script}`}`,
+                            `- **ID:** ${data.id ?? "—"}`,
+                            `- **Category:** ${data.categoryName ?? "—"}`,
+                            `- **Priority:** ${data.priority ?? "—"}`,
+                            `- **OS Requirements:** ${data.osRequirements || "—"}`,
+                            data.info ? `- **Info:** ${data.info}` : "",
+                            data.notes ? `- **Notes:** ${data.notes}` : "",
+                            `\n### Script Contents\n\`\`\`\n${data.scriptContents ?? "(empty)"}\n\`\`\``,
+                        ];
+                        return lines.filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 10. jamf_list_packages ───────────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(
@@ -1163,6 +1205,99 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 18b. jamf_get_configuration_profile ──────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_configuration_profile",
+            {
+                description:
+                    "Get a single macOS configuration profile's full detail — payload (the raw .mobileconfig plist " +
+                    "XML), scope, and category — by name or numeric ID. jamf_list_configuration_profiles only " +
+                    "returns id/name; use this to see what a profile actually sets and who it's scoped to. " +
+                    "Use response_format=\"json\" to get the raw payload as a template for jamf_create_configuration_profile.",
+                inputSchema: {
+                    profile: z.string().describe("Profile name or numeric ID — use jamf_list_configuration_profiles to find one"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ profile, response_format = "markdown" }) => {
+                try {
+                    const data: any = await client.getConfigurationProfileDetail(profile);
+
+                    const text = toText(data, response_format, () => {
+                        const g = data.general ?? {};
+                        const scope = data.scope ?? {};
+                        const targetGroups: any[] = Array.isArray(scope.computer_groups) ? scope.computer_groups : [];
+                        const exclusionGroups: any[] = Array.isArray(scope.exclusions?.computer_groups) ? scope.exclusions.computer_groups : [];
+                        return [
+                            `## ${g.name ?? `Profile ${profile}`}`,
+                            `- **ID:** ${g.id ?? "—"}`,
+                            `- **Category:** ${g.category?.name ?? "—"}`,
+                            `- **Distribution Method:** ${g.distribution_method ?? "—"}`,
+                            `- **User Removable:** ${g.user_removable ?? "—"}`,
+                            g.description ? `- **Description:** ${g.description}` : "",
+                            `- **All Computers:** ${scope.all_computers ? "Yes" : "No"}`,
+                            `- **Target Groups:** ${targetGroups.length ? targetGroups.map((gr: any) => gr.name).join(", ") : "None"}`,
+                            `- **Exclusion Groups:** ${exclusionGroups.length ? exclusionGroups.map((gr: any) => gr.name).join(", ") : "None"}`,
+                            `\n### Payload size\n${g.payloads ? `${g.payloads.length} characters (use response_format="json" to see the full plist XML)` : "(empty)"}`,
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18c. jamf_create_configuration_profile ───────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_configuration_profile",
+            {
+                description:
+                    "Create or update a macOS configuration profile (upsert by name — re-running with the same " +
+                    "name updates the existing profile in place rather than duplicating it, matching " +
+                    "jamf_create_script/jamf_create_smart_group). `payload` is the raw .mobileconfig plist XML " +
+                    "content (a full plist document starting `<?xml version=\"1.0\"...`) — construct it by reading " +
+                    "an existing similar profile via jamf_get_configuration_profile (response_format=\"json\") and " +
+                    "using its general.payloads as a copy-and-modify template, or hand-author a plist for settings " +
+                    "not yet covered by any existing profile (Dock, Finder, Focus/notifications, desktop picture, " +
+                    "etc.). Scoped to smart/static computer groups by name, like jamf_create_policy. " +
+                    "NOT YET CONFIRMED LIVE for the write path — verify against a low-stakes profile before " +
+                    "relying on it for anything scoped broadly.",
+                inputSchema: {
+                    name: z.string().describe("Display name for the configuration profile"),
+                    payload: z.string().describe("Raw .mobileconfig plist XML content"),
+                    description: z.string().optional(),
+                    categoryName: z.string().optional(),
+                    distributionMethod: z.enum(["Install Automatically", "Make Available in Self Service"]).optional(),
+                    targetGroupNames: z.array(z.string()).default([]).describe("Smart/static computer group names to scope this profile to"),
+                    exclusionGroupNames: z.array(z.string()).default([]).describe("Smart/static computer group names to exclude"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, payload, description, categoryName, distributionMethod, targetGroupNames, exclusionGroupNames, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.upsertConfigurationProfile({
+                        name, payload, description, categoryName, distributionMethod, targetGroupNames, exclusionGroupNames,
+                    });
+
+                    const text = toText(result, response_format, () =>
+                        `## Configuration profile ${result.action} — "${result.name}"\n- ID: ${result.id}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 19. jamf_list_patch_policies ────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(
@@ -1421,6 +1556,75 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                         return `## FileVault Status — page ${page} (${results.length} of ${data.totalCount} total)\n\n${rows}`;
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 23c. jamf_get_laps_accounts ──────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_laps_accounts",
+            {
+                description:
+                    "List LAPS-managed local admin accounts on a computer (username, account GUID, source), by " +
+                    "name or serial. Routed through the Jamf Platform API Gateway (JAMF_PLATFORM_* env vars) — " +
+                    "the tenant's own direct API client lacks 'View Local Admin Password' privileges. Use " +
+                    "jamf_get_laps_password to read a specific account's current password.",
+                inputSchema: {
+                    computer: z.string().describe("Computer name or serial number"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ computer, response_format = "markdown" }) => {
+                try {
+                    const data: any = await client.getLapsAccounts(computer);
+                    const accounts: any[] = data.results ?? [];
+
+                    const text = toText(data, response_format, () => {
+                        if (accounts.length === 0) return `No LAPS accounts found for "${computer}".`;
+                        const rows = accounts
+                            .map((a: any) => `- **${a.username}** | Source: ${a.userSource ?? "—"} | GUID: ${a.guid}`)
+                            .join("\n");
+                        return `## LAPS Accounts — "${computer}"\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 23d. jamf_get_laps_password ──────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_laps_password",
+            {
+                description:
+                    "Read a LAPS-managed local admin account's CURRENT password on a computer, by name/serial and " +
+                    "username. Returns a real, live credential — use deliberately for a specific troubleshooting " +
+                    "need, not in a loop across many machines. Routed through the Jamf Platform API Gateway " +
+                    "(JAMF_PLATFORM_* env vars). Use jamf_get_laps_accounts first to find the account username.",
+                inputSchema: {
+                    computer: z.string().describe("Computer name or serial number"),
+                    username: z.string().describe("LAPS account username — use jamf_get_laps_accounts to find one"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ computer, username, response_format = "markdown" }) => {
+                try {
+                    const data = await client.getLapsPassword(computer, username);
+
+                    const text = toText(data, response_format, () =>
+                        `## LAPS Password — "${computer}" / ${data.username}\n\n\`${(data as any).password}\``
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);
@@ -1912,7 +2116,13 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     "deliberately never touches scripts) or a naive re-upsert (which resets every other field to " +
                     "a default unless re-specified), this reads the policy's current script list, merges in just " +
                     "the requested add/remove, and writes back only the scripts section. Useful for e.g. attaching " +
-                    "a pre-install cleanup script ahead of a package install (priority \"Before\").",
+                    "a pre-install cleanup script ahead of a package install (priority \"Before\"). " +
+                    "CAVEAT (confirmed live): for multiple scripts sharing the same priority, Jamf's actual " +
+                    "execution order does not reliably follow the order they're sent/displayed in — a real run " +
+                    "was observed to swap two same-priority scripts despite both this tool's response and a " +
+                    "follow-up jamf_get_policy read showing the intended order. If exact ordering among same-" +
+                    "priority scripts matters, verify the real run order via jamf_get_computer_policy_logs after " +
+                    "a live execution rather than trusting the displayed order.",
                 inputSchema: {
                     policy: z.string().describe("Policy name or numeric ID — use jamf_list_policies to find one"),
                     addScripts: z
