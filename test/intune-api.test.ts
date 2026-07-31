@@ -243,5 +243,21 @@ describe("IntuneClient", () => {
                 await client.deleteAppConfigurationPolicy(created.id);
             }
         });
+
+        skipWrite("create and delete an Android managed store app", async (t: any) => {
+            const packageId = process.env.TEST_ANDROID_MANAGED_STORE_PACKAGE_ID;
+            if (!packageId) {
+                t.skip("set TEST_ANDROID_MANAGED_STORE_PACKAGE_ID to a package ID already approved in this tenant's Managed Google Play connection to exercise this test — no Android app exists in this tenant's catalog as of writing (see MCP_TOOL_GAPS.md gap Intune #11), so this is expected to stay skipped for now");
+                return;
+            }
+            const testName = `zzz-test-android-app-${Date.now()}`;
+            const created = await client.createAndroidManagedStoreApp({
+                packageId,
+                displayName: testName,
+                publisher: "Test Publisher",
+            });
+            assert.ok(created.appId);
+            await client.deleteApp(created.appId);
+        });
     });
 });

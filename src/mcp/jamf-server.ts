@@ -1471,6 +1471,36 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 22c. jamf_delete_computer ─────────────────────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_delete_computer",
+            {
+                description:
+                    "Permanently delete a computer record from JAMF Pro — for decommissioned/replaced machines. " +
+                    "IRREVERSIBLE. Requires the Jamf Platform API Gateway credential (JAMF_PLATFORM_* env vars) — " +
+                    "this tenant's own API client cannot delete computer records via either the Classic API " +
+                    "(rejects OAuth client-credentials auth entirely) or the modern API (403 INVALID_PRIVILEGE); " +
+                    "the Gateway credential is the only confirmed-working path (204 on 35 records tested live). " +
+                    "Accepts computer name or serial number.",
+                inputSchema: {
+                    computerNameOrSerial: z.string().describe("Computer display name or serial number"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+            },
+            async ({ computerNameOrSerial }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.deleteComputer(computerNameOrSerial);
+                    const text = `Successfully deleted computer record for **${computerNameOrSerial}** (ID: ${result.computerId}). This cannot be undone.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 23. jamf_get_filevault_status ────────────────────────────────────────
     if (hasRole(roles, JAMF_READ)) {
         server.registerTool(

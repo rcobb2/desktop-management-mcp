@@ -133,6 +133,24 @@ export class IntuneClient {
     }
 
     /**
+     * Graph's v1.0 `managedDevice` type exposes device ownership as `managedDeviceOwnerType`, not
+     * `ownerType` (`ownerType` only exists on the beta schema / subtypes like `windowsManagedDevice`)
+     * — requesting `ownerType` in a v1.0 $select/$filter throws "Could not find a property named
+     * 'ownerType' on type 'microsoft.graph.managedDevice'". Queries select/filter on
+     * `managedDeviceOwnerType`; this normalizes each device back to also carry `ownerType` so
+     * existing consumers (intune-server.ts's markdown output, the ownerType filter/breakdown) don't
+     * need to know about the rename.
+     */
+    private static normalizeDeviceOwnerType<T extends { managedDeviceOwnerType?: string; ownerType?: string }>(devices: T[]): T[] {
+        for (const device of devices) {
+            if (device && device.managedDeviceOwnerType !== undefined) {
+                device.ownerType = device.managedDeviceOwnerType;
+            }
+        }
+        return devices;
+    }
+
+    /**
      * ROBUST STRATEGY:
      * 1. Search v1.0 (Stable filter) to get the ID.
      * 2. Fetch Beta (Rich data) using that ID to get the profile.
@@ -310,13 +328,14 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`deviceName eq '${escapedName}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
                 .get();
             
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', 200, apiDuration);
 
             if (response.value && response.value.length > 0) {
+                IntuneClient.normalizeDeviceOwnerType(response.value);
                 const device = response.value[0];
                 this.logger.info('Device found by exact name', { deviceName: normalizedDeviceName, deviceId: device.id });
                 return device;
@@ -329,7 +348,7 @@ export class IntuneClient {
                     .api('/deviceManagement/managedDevices')
                     .version('v1.0')
                     .filter(`startswith(deviceName,'${escapedName}')`)
-                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
+                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
                     .top(25)
                     .get();
 
@@ -337,6 +356,7 @@ export class IntuneClient {
                 logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices (prefix)', 200, prefixDuration);
 
                 const prefixMatches = prefixResponse.value || [];
+                IntuneClient.normalizeDeviceOwnerType(prefixMatches);
                 if (prefixMatches.length > 0) {
                     const exactCaseInsensitive = prefixMatches.find((d: any) => String(d.deviceName || '').toLowerCase() === normalizedDeviceName.toLowerCase());
                     const best = exactCaseInsensitive || prefixMatches[0];
@@ -359,7 +379,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
                 .top(999)
                 .get();
 
@@ -367,6 +387,7 @@ export class IntuneClient {
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices (client-fallback)', 200, fallbackDuration);
 
             const devices = fallbackResponse.value || [];
+            IntuneClient.normalizeDeviceOwnerType(devices);
             const lowerName = normalizedDeviceName.toLowerCase();
             const exactClient = devices.find((device: any) => String(device.deviceName || '').toLowerCase() === lowerName);
             if (exactClient) {
@@ -413,13 +434,14 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`serialNumber eq '${escapedSerial}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
                 .get();
 
             const apiDuration = Date.now() - apiStart;
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', 200, apiDuration);
 
             if (response.value && response.value.length > 0) {
+                IntuneClient.normalizeDeviceOwnerType(response.value);
                 const device = response.value[0];
                 this.logger.info('Device found by exact serial number', { serialNumber: normalizedSerial, deviceId: device.id });
                 return device;
@@ -429,15 +451,17 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType')
+                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
                 .top(999)
                 .get();
 
             const fallbackDuration = Date.now() - fallbackStart;
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices (serial-fallback)', 200, fallbackDuration);
 
+            const fallbackDevices = fallbackResponse.value || [];
+            IntuneClient.normalizeDeviceOwnerType(fallbackDevices);
             const lowerSerial = normalizedSerial.toLowerCase();
-            const matches = (fallbackResponse.value || []).find((device: any) => String(device.serialNumber || '').toLowerCase() === lowerSerial);
+            const matches = fallbackDevices.find((device: any) => String(device.serialNumber || '').toLowerCase() === lowerSerial);
             if (matches) {
                 this.logger.info('Device found by serial fallback', { serialNumber: normalizedSerial, deviceId: matches.id });
                 return matches;
@@ -526,7 +550,7 @@ export class IntuneClient {
             }
 
             const dedupedCandidateUpns = Array.from(new Set(candidateUpns.filter(Boolean).map((upn) => String(upn).toLowerCase())));
-            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType';
+            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType';
 
             for (const upnLower of dedupedCandidateUpns) {
                 const escapedUpn = this.escapeODataString(upnLower);
@@ -543,6 +567,7 @@ export class IntuneClient {
                 logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', 200, apiDuration);
 
                 const devices = deviceResponse.value || [];
+                IntuneClient.normalizeDeviceOwnerType(devices);
                 if (devices.length > 0) {
                     this.logger.info('Devices retrieved for resolved user identifier', {
                         userIdentifier: normalizedUserIdentifier,
@@ -566,6 +591,7 @@ export class IntuneClient {
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices (user-fallback)', 200, fallbackDuration);
 
             const allDevices = allDevicesResponse.value || [];
+            IntuneClient.normalizeDeviceOwnerType(allDevices);
             const lowerIdentifier = normalizedUserIdentifier.toLowerCase();
             const clientSideMatches = allDevices.filter((device: any) => {
                 const upn = String(device.userPrincipalName || '').toLowerCase();
@@ -630,7 +656,7 @@ export class IntuneClient {
         await this.trackAuthAttempt();
 
         const MAX_PAGES = 20; // 20 * 999 ≈ 20k devices — far above any real fleet size here
-        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,ownerType';
+        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType';
 
         const filters: string[] = [];
         if (options?.operatingSystem) {
@@ -646,7 +672,7 @@ export class IntuneClient {
             filters.push(`managementAgent eq '${this.escapeODataString(options.managementAgent)}'`);
         }
         if (options?.ownerType) {
-            filters.push(`ownerType eq '${this.escapeODataString(options.ownerType)}'`);
+            filters.push(`managedDeviceOwnerType eq '${this.escapeODataString(options.ownerType)}'`);
         }
 
         try {
@@ -674,6 +700,8 @@ export class IntuneClient {
                 devices.push(...(response.value || []));
                 page++;
             }
+
+            IntuneClient.normalizeDeviceOwnerType(devices);
 
             const truncated = Boolean(response['@odata.nextLink']);
             if (truncated) {
@@ -2520,6 +2548,72 @@ export class IntuneClient {
             return { appId, assignments };
         } catch (error) {
             this.logger.error('Error assigning app to groups', { appId, error: (error as Error).message });
+            throw error;
+        }
+    }
+
+    // Creates a Managed Google Play app object (Android Enterprise) referencing an
+    // already-approved package ID. This does NOT perform the approve/sync step itself —
+    // that's still a manual Intune admin console flow (Apps > Android > Add > Managed Google
+    // Play app > search/approve/sync), since Graph has no application-permission API for
+    // approving a new package against the tenant's Managed Google Play connection. This only
+    // creates the Intune app object once the package is already approved, so it can then be
+    // assigned like any other app via assignAppToGroups/assignAppToGroup. Always creates a NEW
+    // app object, same convention as createWin32App — no upsert-by-displayName.
+    // NOT YET CONFIRMED LIVE: this tenant has zero Android apps in its catalog as of 2026-07-31
+    // (see MCP_TOOL_GAPS.md, Intune gap #11), so this is built to Graph's documented v1.0
+    // managedAndroidStoreApp shape but hasn't been exercised against a real approved package.
+    public async createAndroidManagedStoreApp(params: {
+        packageId: string;
+        displayName: string;
+        publisher: string;
+        description?: string;
+        appStoreUrl?: string;
+        minimumSupportedOperatingSystem?: Record<string, boolean>;
+    }) {
+        this.logger.info('Creating Android managed store app', { packageId: params.packageId, displayName: params.displayName });
+        await this.trackAuthAttempt();
+
+        const appBody: Record<string, any> = {
+            '@odata.type': '#microsoft.graph.managedAndroidStoreApp',
+            displayName: params.displayName,
+            description: params.description ?? params.displayName,
+            publisher: params.publisher,
+            packageId: params.packageId,
+            appStoreUrl: params.appStoreUrl ?? `https://play.google.com/store/apps/details?id=${params.packageId}`,
+            minimumSupportedOperatingSystem: {
+                '@odata.type': 'microsoft.graph.androidMinimumOperatingSystem',
+                v5_0: true,
+                ...params.minimumSupportedOperatingSystem,
+            },
+        };
+
+        try {
+            const apiStart = Date.now();
+            const app = await this.client.api('/deviceAppManagement/mobileApps').version('v1.0').post(appBody);
+            logApiCall(this.logger, 'POST', '/deviceAppManagement/mobileApps', 201, Date.now() - apiStart);
+            this.logger.info('Android managed store app created', { appId: app.id, packageId: params.packageId });
+            return { appId: app.id, displayName: params.displayName, packageId: params.packageId };
+        } catch (error) {
+            this.logger.error('Error creating Android managed store app', { packageId: params.packageId, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/deviceAppManagement/mobileApps', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Test-only: deletes an app object by ID, used solely so test/intune-api.test.ts can
+    // self-clean an app it creates via createAndroidManagedStoreApp. Not exposed as an MCP
+    // tool — no delete tools exist anywhere in this codebase's MCP surface (see CLAUDE.md).
+    public async deleteApp(appId: string) {
+        this.logger.info('Deleting app (test cleanup)', { appId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            await this.client.api(`/deviceAppManagement/mobileApps/${appId}`).version('v1.0').delete();
+            logApiCall(this.logger, 'DELETE', `mobileApps/${appId}`, 204, Date.now() - apiStart);
+        } catch (error) {
+            this.logger.error('Error deleting app', { appId, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `mobileApps/${appId}`, undefined, undefined, error as Error);
             throw error;
         }
     }

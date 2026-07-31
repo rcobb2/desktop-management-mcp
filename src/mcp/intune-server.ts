@@ -1366,6 +1366,51 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── 16b. intune_create_android_managed_store_app ─────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_android_managed_store_app",
+            {
+                description:
+                    "Add a Managed Google Play (Android Enterprise) app to the Intune app catalog by package ID. " +
+                    "The package must already be approved for this tenant's Managed Google Play connection — " +
+                    "approving/syncing a new package is still a manual step in the Intune admin console (Apps > " +
+                    "Android > Add > Managed Google Play app > search/approve/sync); this tool only creates the " +
+                    "Intune app object referencing an already-approved package, so it can then be assigned via " +
+                    "intune_assign_app_to_groups/intune_assign_app. Always creates a NEW app object (no upsert). " +
+                    "NOT YET CONFIRMED LIVE — this tenant has no Android apps in its catalog to test against.",
+                inputSchema: {
+                    packageId: z.string().describe('Android package ID, e.g. "com.microsoft.emmx" (already approved in Managed Google Play for this tenant)'),
+                    displayName: z.string().describe("App display name shown in Intune/Company Portal"),
+                    publisher: z.string().describe("Publisher name shown in Intune/Company Portal"),
+                    description: z.string().optional(),
+                    appStoreUrl: z.string().optional().describe("Defaults to the Google Play store URL derived from packageId"),
+                    minimumSupportedOperatingSystem: z
+                        .record(z.boolean())
+                        .optional()
+                        .describe('Android version flags, e.g. {"v8_0": true} — defaults to {"v5_0": true} if omitted'),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ packageId, displayName, publisher, description, appStoreUrl, minimumSupportedOperatingSystem, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createAndroidManagedStoreApp({
+                        packageId, displayName, publisher, description, appStoreUrl, minimumSupportedOperatingSystem,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created Android managed store app **${result.displayName}** (ID ${result.appId}, package \`${result.packageId}\`). ` +
+                        `Use intune_assign_app_to_groups to deploy it to a group.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 17. intune_send_device_action ────────────────────────────────────────
     if (hasRole(roles, INTUNE_WRITE)) {
         server.registerTool(
