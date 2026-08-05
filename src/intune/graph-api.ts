@@ -793,7 +793,21 @@ export class IntuneClient {
         }
 
         const MAX_PAGES = 20; // 20 * 999 ≈ 20k members — far above any real group size here
-        const memberFields = 'id,displayName,userPrincipalName,mail,deviceId,operatingSystem';
+        // /groups/{id}/members is a polymorphic directoryObject collection (users, devices, groups
+        // mixed) — deviceId/operatingSystem only exist on the derived microsoft.graph.device type,
+        // so the type-cast segment below is the syntactically correct way to request them.
+        // CONFIRMED LIVE this cast alone does NOT fix null displayName/deviceId/operatingSystem on
+        // device rows for this app registration: the real root cause is a missing Graph
+        // Application permission (Device.Read.All) on the Intune MCP Service Principal, not a
+        // $select bug — a direct GET /devices/{id} with this app's own token 403s cleanly, while
+        // this polymorphic endpoint silently nulls the fields it can't authorize instead of
+        // erroring. Granting Device.Read.All requires Global Administrator or Privileged Role
+        // Administrator (Cloud Application Administrator, this app's current admin role, is
+        // deliberately blocked by Microsoft from self-granting Graph API permissions) — until
+        // that's granted, every device-typed group member resolves with displayName: null here,
+        // same class of gap as the documented Policy.Read.All requirement for
+        // intune_list_conditional_access_policies.
+        const memberFields = 'id,displayName,userPrincipalName,mail,microsoft.graph.device/deviceId,microsoft.graph.device/operatingSystem';
 
         try {
             let apiStart = Date.now();
@@ -1178,6 +1192,20 @@ export class IntuneClient {
         }
     }
 
+    // CONFIRMED LIVE: /deviceManagement/managedDevices/{id}/deviceConfigurationStates sometimes
+    // returns literal duplicate rows for the same policy (identical id/state/version) — observed
+    // on a real device where 3 of 6 assigned policies each appeared twice and 3 didn't, so it's
+    // not a per-device-wide doubling, more like a per-policy backend quirk. Raw Graph behavior,
+    // not a client bug — deduped by id here so counts/issues aren't inflated in either output.
+    private static dedupeById(states: any[]): any[] {
+        const seen = new Set<string>();
+        return states.filter((s) => {
+            if (seen.has(s.id)) return false;
+            seen.add(s.id);
+            return true;
+        });
+    }
+
     /**
      * Get deployment states for configuration and compliance policies on a managed device,
      * including conflict/error troubleshooting summaries.
@@ -1231,7 +1259,7 @@ export class IntuneClient {
                 const apiDuration = Date.now() - apiStart;
                 logApiCall(this.logger, 'GET', `/deviceManagement/managedDevices/${deviceId}/deviceConfigurationStates`, 200, apiDuration);
 
-                result.configurationPolicyStates = configStatesResponse.value || [];
+                result.configurationPolicyStates = IntuneClient.dedupeById(configStatesResponse.value || []);
             } catch (error) {
                 this.logger.warn('Failed to fetch device configuration policy states', { deviceId, error: (error as Error).message });
             }
@@ -1247,7 +1275,7 @@ export class IntuneClient {
                 const apiDuration = Date.now() - apiStart;
                 logApiCall(this.logger, 'GET', `/deviceManagement/managedDevices/${deviceId}/deviceCompliancePolicyStates`, 200, apiDuration);
 
-                result.compliancePolicyStates = complianceStatesResponse.value || [];
+                result.compliancePolicyStates = IntuneClient.dedupeById(complianceStatesResponse.value || []);
             } catch (error) {
                 this.logger.warn('Failed to fetch compliance policy states', { deviceId, error: (error as Error).message });
             }
@@ -1258,6 +1286,13 @@ export class IntuneClient {
                 return issueKeywords.some((keyword) => normalized.includes(keyword));
             };
 
+            // CONFIRMED LIVE: `settingStates` comes back as an empty array even for a policy whose
+            // whole-policy `state` is "conflict" (checked at both v1.0 and beta, real tenant data)
+            // — Graph does not populate per-setting detail here, so `settingIssues` below is
+            // typically empty in practice. The only source that names the actual conflicting
+            // setting/policy pair is `deviceConfigurationConflictSummary` (see
+            // getConfigurationConflicts), which is itself confirmed 500ing tenant-wide right now —
+            // so today, "conflict" state is knowable but not explainable for this tenant.
             result.issues.configurationPolicies = result.configurationPolicyStates
                 .filter((policyState: any) => hasIssue(policyState.state))
                 .map((policyState: any) => ({
@@ -1531,6 +1566,164 @@ export class IntuneClient {
             return result;
         } catch (error) {
             this.logger.error('Error fetching configuration policy assignments', {
+                policyId,
+                source: effectiveSource,
+                error: (error as Error).message,
+                stack: (error as Error).stack
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Surface deployment error counts, the actual erroring devices, and known cross-policy setting
+     * conflicts for a classic (non-Settings-Catalog) device configuration profile.
+     *
+     * Three Graph resources feed this, all confirmed live:
+     * - `deviceStatusOverview` (v1.0, per-policy) gives error/failed/pending counts but has no
+     *   conflict count at v1.0 (that field only exists on the beta variant of this resource).
+     * - `deviceStatuses` (v1.0, per-policy) names each device and its status directly off the
+     *   policy — no group-membership resolution needed, so this works even without the
+     *   Device.Read.All Graph permission that blocks name resolution elsewhere in this file (see
+     *   getGroupMembers). CONFIRMED LIVE against "Remote Desktop RDP Allow": 7 real devices in
+     *   error, named directly (CU04207W, CU04327W, etc.) — one row had an empty
+     *   `deviceDisplayName` (a stale/deleted device reference, not a bug), passed through as-is
+     *   with its `userName` as a fallback label.
+     * - `deviceConfigurationConflictSummary` (beta, tenant-wide list — not scoped by policy ID in
+     *   the URL) is meant to name actual conflicting policies and setting keys; this method fetches
+     *   the full list and filters client-side for entries that include this policyId. CONFIRMED
+     *   LIVE this 500s consistently in this tenant ("An internal server error has occurred",
+     *   reproducible regardless of $top) — a genuine Microsoft-side outage/gap, not a client bug.
+     *   Caught and reported via `conflictSummaryError` rather than failing the whole call, since
+     *   the other two resources still return real, useful data.
+     *
+     * Settings Catalog policies have no equivalent status/conflict navigation property at all
+     * (confirmed absent from the resource's own relationship list) — Settings Catalog conflict/
+     * error detail is only reachable via the Reports API's non-compliance report actions, not
+     * this method. Callers passing a Settings Catalog policy get `supported: false` back rather
+     * than a silently-empty conflict list.
+     */
+    public async getConfigurationConflicts(policyId: string, source?: 'classic' | 'settingsCatalog' | 'auto', options?: { maxDevices?: number }) {
+        const effectiveSource = source || 'auto';
+        this.logger.info('Fetching configuration policy conflicts', { policyId, source: effectiveSource });
+        await this.trackAuthAttempt();
+
+        const result: any = {
+            policyId,
+            source: null,
+            supported: true,
+            statusOverview: null,
+            deviceStatuses: [],
+            conflicts: [],
+            summary: { conflictCount: 0, errorCount: 0, failedCount: 0, pendingCount: 0, returnedDevices: 0, truncated: false }
+        };
+
+        const tryClassic = effectiveSource === 'classic' || effectiveSource === 'auto';
+        const trySettingsCatalog = effectiveSource === 'settingsCatalog' || effectiveSource === 'auto';
+
+        try {
+            if (tryClassic) {
+                try {
+                    const apiStart = Date.now();
+                    const overview = await this.client
+                        .api(`/deviceManagement/deviceConfigurations/${policyId}/deviceStatusOverview`)
+                        .version('v1.0')
+                        .get();
+                    logApiCall(this.logger, 'GET', `/deviceManagement/deviceConfigurations/${policyId}/deviceStatusOverview`, 200, Date.now() - apiStart);
+
+                    result.source = 'classic';
+                    result.statusOverview = overview;
+                    result.summary.errorCount = overview.errorCount ?? 0;
+                    result.summary.failedCount = overview.failedCount ?? 0;
+                    result.summary.pendingCount = overview.pendingCount ?? 0;
+
+                    try {
+                        const statusStart = Date.now();
+                        const statusResponse = await this.client
+                            .api(`/deviceManagement/deviceConfigurations/${policyId}/deviceStatuses`)
+                            .version('v1.0')
+                            .top(999)
+                            .get();
+                        logApiCall(this.logger, 'GET', `/deviceManagement/deviceConfigurations/${policyId}/deviceStatuses`, 200, Date.now() - statusStart);
+
+                        const allStatuses: any[] = statusResponse.value || [];
+                        const maxDevices = options?.maxDevices ?? 200;
+                        result.deviceStatuses = allStatuses.slice(0, maxDevices).map((s: any) => ({
+                            deviceName: s.deviceDisplayName || s.userName || '(unknown device)',
+                            userPrincipalName: s.userPrincipalName,
+                            status: s.status,
+                            lastReportedDateTime: s.lastReportedDateTime
+                        }));
+                        result.summary.returnedDevices = result.deviceStatuses.length;
+                        result.summary.truncated = allStatuses.length > maxDevices;
+                    } catch (error) {
+                        this.logger.warn('Failed to fetch per-device deviceStatuses for configuration conflicts', { policyId, error: (error as Error).message });
+                        result.deviceStatusesError = (error as Error).message;
+                    }
+                } catch (error) {
+                    if (effectiveSource === 'classic') throw error;
+                    this.logger.info('Classic deviceStatusOverview lookup failed, trying settings catalog', {
+                        policyId,
+                        error: (error as Error).message
+                    });
+                }
+            }
+
+            if (!result.source && trySettingsCatalog) {
+                // Confirm the policy actually exists as a Settings Catalog policy before
+                // reporting "not supported" — otherwise a typo'd policyId would look identical
+                // to a real, known Settings Catalog limitation.
+                const apiStart = Date.now();
+                await this.client
+                    .api(`/deviceManagement/configurationPolicies/${policyId}`)
+                    .version('beta')
+                    .select('id')
+                    .get();
+                logApiCall(this.logger, 'GET', `/deviceManagement/configurationPolicies/${policyId}`, 200, Date.now() - apiStart);
+
+                result.source = 'settingsCatalog';
+                result.supported = false;
+                result.note =
+                    'Settings Catalog policies have no deviceStatusOverview/conflict-summary navigation property in Graph. ' +
+                    'Use the Reports API (getConfigurationPolicyNonComplianceReport) for Settings Catalog error/conflict detail instead.';
+                return result;
+            }
+
+            if (!result.source) {
+                throw new Error(`Policy '${policyId}' was not found in classic device configurations or settings catalog policies.`);
+            }
+
+            // Tenant-wide conflict list — not scoped by policy ID in the URL, so fetch and filter.
+            try {
+                const apiStart = Date.now();
+                const conflictResponse = await this.client
+                    .api('/deviceManagement/deviceConfigurationConflictSummary')
+                    .version('beta')
+                    .top(999)
+                    .get();
+                logApiCall(this.logger, 'GET', '/deviceManagement/deviceConfigurationConflictSummary', 200, Date.now() - apiStart);
+
+                const allConflicts: any[] = conflictResponse.value || [];
+                result.conflicts = allConflicts.filter((c: any) =>
+                    Array.isArray(c.conflictingDeviceConfigurations) &&
+                    c.conflictingDeviceConfigurations.some((confSource: any) => confSource.id === policyId)
+                );
+                result.summary.conflictCount = result.conflicts.length;
+            } catch (error) {
+                this.logger.warn('Failed to fetch deviceConfigurationConflictSummary', { policyId, error: (error as Error).message });
+                result.conflictSummaryError = (error as Error).message;
+            }
+
+            this.logger.info('Configuration policy conflicts retrieved', {
+                policyId,
+                source: result.source,
+                conflictCount: result.summary.conflictCount,
+                errorCount: result.summary.errorCount
+            });
+
+            return result;
+        } catch (error) {
+            this.logger.error('Error fetching configuration policy conflicts', {
                 policyId,
                 source: effectiveSource,
                 error: (error as Error).message,
@@ -2339,6 +2532,145 @@ export class IntuneClient {
                 error: (error as Error).message,
                 stack: (error as Error).stack
             });
+            throw error;
+        }
+    }
+
+    // `resultantAppState`/`resultantAppStateDetail` enum int -> string maps, confirmed against
+    // Microsoft Learn's resource docs (not all live-observed — this tenant's real data only
+    // exercised `installed`/`notInstalled` + detail codes 0 and 3000 so far). A few remaining
+    // documented detail values (e.g. the platform/requirement-not-met family above 3002) are
+    // deliberately left unmapped rather than guessed — unmapped values fall through as
+    // `unknown (code N)` rather than a wrong label.
+    private static readonly INSTALL_STATE_MAP: Record<number, string> = {
+        [-1]: 'notApplicable', 1: 'installed', 2: 'failed', 3: 'notInstalled', 4: 'uninstallFailed', 5: 'pendingInstall', 99: 'unknown'
+    };
+    private static readonly INSTALL_STATE_DETAIL_MAP: Record<number, string> = {
+        0: 'noAdditionalDetails', 1: 'dependencyFailedToInstall', 2: 'dependencyWithRequirementsNotMet',
+        3: 'dependencyPendingReboot', 4: 'dependencyWithAutoInstallDisabled', 5: 'supersededAppUninstallFailed',
+        6: 'supersededAppUninstallPendingReboot', 7: 'removingSupersededApps',
+        1000: 'iosAppStoreUpdateFailedToInstall', 1001: 'vppAppHasUpdateAvailable', 1002: 'userRejectedUpdate',
+        1003: 'uninstallPendingReboot', 1004: 'supersedingAppsDetected', 1005: 'supersededAppsDetected',
+        2000: 'seeInstallErrorCode', 3000: 'autoInstallDisabled', 3001: 'managedAppNoLongerPresent', 3002: 'userRejectedInstall'
+    };
+
+    private async getGraphAccessToken(): Promise<string> {
+        const token = await this.credential.getToken(this.authScopes);
+        return token.token;
+    }
+
+    /**
+     * Per-device app install/uninstall failure detail for a single app — the "logs" gap
+     * `getGuidedAppDeploymentTroubleshooting` doesn't fill on its own, since that method only
+     * surfaces one matched device's status buried inside a larger heuristic report.
+     *
+     * CONFIRMED LIVE this method does NOT use `mobileApps/{id}/deviceStatuses` — that resource's
+     * "will be deprecated May 2023" note turned out to be accurate: it now 400s
+     * ("Resource not found for the segment 'deviceStatuses'") at BOTH v1.0 and beta, which means
+     * `getGuidedAppDeploymentTroubleshooting` above has been silently degraded this whole time too
+     * (its try/catch just logs a warning and treats every app as having no device status).
+     *
+     * The real, working replacement is the Reports API's `retrieveDeviceAppInstallationStatusReport`
+     * action (v1.0, confirmed live) — POST /deviceManagement/reports/retrieveDeviceAppInstallationStatusReport
+     * with a `{ filter, select, skip, top }` body, filtered on `ApplicationId`. This is called via
+     * native `fetch` rather than the Graph SDK client: confirmed live that `client.api(...).post(body)`
+     * against this exact endpoint silently returns `{}` (no error, just empty) while an identical raw
+     * fetch with the same token/body returns real data — the SDK's response handling doesn't cope with
+     * this endpoint's `{SessionId, TotalRowCount, Schema, Values}` tabular shape (Schema is a column
+     * list, Values is an array of row arrays in that column order, not objects). `InstallState`/
+     * `InstallStateDetail` come back as enum integers, not strings — mapped via INSTALL_STATE_MAP/
+     * INSTALL_STATE_DETAIL_MAP above.
+     */
+    public async getAppInstallStatus(appId: string, options?: { deviceName?: string; limit?: number }) {
+        this.logger.info('Fetching app install status', { appId, options });
+        await this.trackAuthAttempt();
+
+        const result: any = {
+            app: null,
+            deviceStatuses: [],
+            summary: { totalDevices: 0, returnedDevices: 0, failedCount: 0, truncated: false }
+        };
+
+        try {
+            try {
+                const apiStart = Date.now();
+                result.app = await this.client
+                    .api(`/deviceAppManagement/mobileApps/${appId}`)
+                    .version('v1.0')
+                    .select('id,displayName,publisher')
+                    .get();
+                logApiCall(this.logger, 'GET', `/deviceAppManagement/mobileApps/${appId}`, 200, Date.now() - apiStart);
+            } catch (error) {
+                this.logger.warn('Failed to fetch app metadata for install status', { appId, error: (error as Error).message });
+            }
+
+            const token = await this.getGraphAccessToken();
+            const reportBody = {
+                filter: `(ApplicationId eq '${appId}')`,
+                select: ['ApplicationId', 'AppVersion', 'DeviceName', 'ErrorCode', 'InstallState', 'InstallStateDetail', 'Platform', 'UserPrincipalName'],
+                skip: 0,
+                top: 999
+            };
+
+            const apiStart = Date.now();
+            const response = await fetch('https://graph.microsoft.com/v1.0/deviceManagement/reports/retrieveDeviceAppInstallationStatusReport', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify(reportBody)
+            });
+            logApiCall(this.logger, 'POST', '/deviceManagement/reports/retrieveDeviceAppInstallationStatusReport', response.status, Date.now() - apiStart);
+
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                throw new Error(`retrieveDeviceAppInstallationStatusReport failed (${response.status}): ${text}`);
+            }
+
+            const report: any = await response.json();
+            const columns: string[] = (report.Schema || []).map((s: any) => s.Column);
+            const rows: any[][] = report.Values || [];
+
+            let statuses = rows.map((row) => {
+                const record: any = {};
+                columns.forEach((col, i) => { record[col] = row[i]; });
+                return {
+                    deviceName: record.DeviceName,
+                    userPrincipalName: record.UserPrincipalName,
+                    platform: record.Platform,
+                    appVersion: record.AppVersion,
+                    installState: IntuneClient.INSTALL_STATE_MAP[record.InstallState] ?? `unknown (code ${record.InstallState})`,
+                    installStateDetail: IntuneClient.INSTALL_STATE_DETAIL_MAP[record.InstallStateDetail] ?? (record.InstallStateDetail ? `unknown (code ${record.InstallStateDetail})` : undefined),
+                    errorCode: record.ErrorCode || undefined
+                };
+            });
+
+            const totalDevices = report.TotalRowCount ?? statuses.length;
+
+            const deviceNameFilter = options?.deviceName?.trim().toLowerCase();
+            if (deviceNameFilter) {
+                statuses = statuses.filter((s: any) => String(s.deviceName || '').toLowerCase().includes(deviceNameFilter));
+            }
+
+            const limit = options?.limit ?? 100;
+            const truncated = statuses.length > limit || totalDevices > rows.length;
+            statuses = statuses.slice(0, limit);
+
+            result.deviceStatuses = statuses;
+            result.summary.totalDevices = totalDevices;
+            result.summary.returnedDevices = statuses.length;
+            result.summary.failedCount = statuses.filter((s: any) => s.installState === 'failed' || s.installState === 'uninstallFailed').length;
+            result.summary.truncated = truncated;
+
+            this.logger.info('App install status retrieved', {
+                appId,
+                totalDevices,
+                returnedDevices: result.summary.returnedDevices,
+                failedCount: result.summary.failedCount
+            });
+
+            return result;
+        } catch (error) {
+            this.logger.error('Error fetching app install status', { appId, error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'POST', '/deviceManagement/reports/retrieveDeviceAppInstallationStatusReport', undefined, undefined, error as Error);
             throw error;
         }
     }

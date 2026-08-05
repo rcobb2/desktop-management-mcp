@@ -67,6 +67,11 @@ function errorResult(err: unknown): { content: [{ type: "text"; text: string }];
     };
 }
 
+function hasIssueStatus(status: unknown): boolean {
+    const normalized = String(status ?? "").toLowerCase();
+    return normalized.includes("error") || normalized.includes("fail") || normalized.includes("conflict");
+}
+
 // ─── Device resolution helpers ───────────────────────────────────────────────
 
 async function resolveDevice(
@@ -664,18 +669,19 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         response_format,
                         () => {
                             const d = data as any;
-                            const assignments: any[] = d.assignments ?? [];
+                            const targets: any[] = d.resolvedTargets ?? [];
                             const label = resolvedName ?? resolvedPolicyId;
 
-                            if (assignments.length === 0) return `## Assignments for "${label}"\n\n_No assignments found._`;
+                            if (targets.length === 0) return `## Assignments for "${label}"\n\n_No assignments found._`;
 
-                            const included = assignments.filter((a: any) => !a.target?.targetType?.includes("Excluded"));
-                            const excluded = assignments.filter((a: any) => a.target?.targetType?.includes("Excluded"));
+                            const included = targets.filter((t: any) => !String(t.type ?? "").toLowerCase().startsWith("exclude"));
+                            const excluded = targets.filter((t: any) => String(t.type ?? "").toLowerCase().startsWith("exclude"));
 
-                            const formatGroup = (a: any) => {
-                                const name = a.target?.groupDisplayName ?? a.target?.groupId ?? a.target?.targetType ?? "Unknown";
-                                const filter = a.target?.deviceAndAppManagementAssignmentFilterDisplayName;
-                                return `- **${name}**${filter ? ` (filter: ${filter})` : ""}`;
+                            const formatGroup = (t: any) => {
+                                const name = t.displayName ?? t.id ?? t.type ?? "Unknown";
+                                const filter = t.filterId ? `${t.filterType ?? "include"} filter ${t.filterId}` : undefined;
+                                const err = t.error ? ` — resolution error: ${t.error}` : "";
+                                return `- **${name}**${filter ? ` (${filter})` : ""}${err}`;
                             };
 
                             const incSection =
@@ -729,7 +735,10 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const label = deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
                         const configPolicies: any[] = d.configurationPolicyStates ?? [];
                         const compliancePolicies: any[] = d.compliancePolicyStates ?? [];
-                        const issues: any[] = d.issues ?? [];
+                        const issues: any[] = [
+                            ...(d.issues?.configurationPolicies ?? []).map((i: any) => ({ ...i, kind: "Configuration" })),
+                            ...(d.issues?.compliancePolicies ?? []).map((i: any) => ({ ...i, kind: "Compliance" })),
+                        ];
 
                         const configSection =
                             configPolicies.length > 0
@@ -754,10 +763,19 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const issuesSection =
                             issues.length > 0
                                 ? `### ⚠️ Issues Found (${issues.length})\n${issues
-                                      .map(
-                                          (i: any) =>
-                                              `- **${i.title ?? "Issue"}**: ${i.description ?? "—"}\n  _Recommendation: ${i.recommendation ?? "See Intune portal for details"}_`
-                                      )
+                                      .map((i: any) => {
+                                          const settingLines = (i.settingIssues ?? []).map(
+                                              (s: any) =>
+                                                  `  - Setting \`${s.setting ?? "—"}\`: ${s.state ?? "—"}${s.errorCode ? ` (error ${s.errorCode})` : ""}${
+                                                      Array.isArray(s.sources) && s.sources.length > 0
+                                                          ? ` — conflicting sources: ${s.sources.map((src: any) => src.displayName ?? src.id ?? "—").join(", ")}`
+                                                          : ""
+                                                  }`
+                                          );
+                                          return `- **[${i.kind}] ${i.displayName ?? i.id}**: ${i.state ?? "—"}${i.errorCode ? ` (error ${i.errorCode})` : ""}${
+                                              settingLines.length > 0 ? `\n${settingLines.join("\n")}` : ""
+                                          }`;
+                                      })
                                       .join("\n")}`
                                 : "### Issues\n_No issues detected_";
 
@@ -2471,6 +2489,180 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                             .join("\n");
 
                         return `## Enrollment Restrictions — ${configs.length} total\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 38. intune_get_configuration_conflicts ───────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_configuration_conflicts",
+            {
+                description:
+                    "Get deployment error counts, the actual erroring/failing devices by name, and known cross-policy setting " +
+                    "conflicts for a classic (non-Settings-Catalog) configuration profile, looked up by policy ID or name. " +
+                    "Confirmed live: deployment status and per-device names work reliably; the cross-policy conflict-summary " +
+                    "lookup currently 500s tenant-wide (a Microsoft-side beta endpoint issue, reported gracefully rather than " +
+                    "failing the whole call). Settings Catalog policies are not supported by this Graph surface at all (no " +
+                    "equivalent navigation property exists); this tool returns supported: false for those rather than a " +
+                    "silently-empty conflict list.",
+                inputSchema: {
+                    policyId: z.string().optional().describe("Intune policy ID (GUID). Use if you already have it."),
+                    policyName: z.string().optional().describe("Policy display name (resolved to ID automatically)"),
+                    maxDevices: z.number().int().positive().max(999).default(200).describe("Max per-device status rows to return (default 200)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ policyId, policyName, maxDevices = 200, response_format = "markdown" }) => {
+                try {
+                    let resolvedPolicyId = policyId;
+                    let resolvedName = policyName;
+
+                    if (!resolvedPolicyId && policyName) {
+                        const resolved = await resolvePolicyByName(client, policyName, "auto");
+                        if (!resolved) return notFound(`policy "${policyName}"`);
+                        resolvedPolicyId = resolved.policyId;
+                        resolvedName = resolved.policyName;
+                    }
+
+                    if (!resolvedPolicyId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
+                    }
+
+                    const data = await client.getConfigurationConflicts(resolvedPolicyId, undefined, { maxDevices });
+
+                    const text = toText(data, response_format, () => {
+                        const d = data as any;
+                        const label = resolvedName ?? resolvedPolicyId;
+
+                        if (d.supported === false) {
+                            return `## Configuration Conflicts — "${label}"\n\n_${d.note}_`;
+                        }
+
+                        const overview = d.statusOverview ?? {};
+                        const statusLines = [
+                            `- Error: ${overview.errorCount ?? 0}`,
+                            `- Failed: ${overview.failedCount ?? 0}`,
+                            `- Pending: ${overview.pendingCount ?? 0}`,
+                            `- Success: ${overview.successCount ?? 0}`,
+                            `- Not applicable: ${overview.notApplicableCount ?? 0}`,
+                        ].join("\n");
+
+                        const deviceStatuses: any[] = d.deviceStatuses ?? [];
+                        const problemDevices = deviceStatuses.filter((s: any) => hasIssueStatus(s.status));
+                        const deviceSection =
+                            problemDevices.length > 0
+                                ? `### Devices With Issues (${problemDevices.length})\n${problemDevices
+                                      .map((s: any) => `- **${s.deviceName}** | Status: ${s.status}${s.userPrincipalName ? ` | User: ${s.userPrincipalName}` : ""}`)
+                                      .join("\n")}`
+                                : "### Devices With Issues\n_None reported_" +
+                                  (d.deviceStatusesError ? ` (lookup failed: ${d.deviceStatusesError})` : "");
+                        const truncNote = d.summary?.truncated
+                            ? `\n\n_Showing ${d.summary.returnedDevices} of the policy's device statuses (truncated by maxDevices)._`
+                            : "";
+
+                        const conflicts: any[] = d.conflicts ?? [];
+                        const conflictSection =
+                            conflicts.length > 0
+                                ? `### ⚠️ Known Cross-Policy Conflicts (${conflicts.length})\n${conflicts
+                                      .map(
+                                          (c: any) =>
+                                              `- Conflicting policies: ${(c.conflictingDeviceConfigurations ?? [])
+                                                  .map((p: any) => p.displayName ?? p.id)
+                                                  .join(", ")}\n  Settings: ${(c.contributingSettings ?? []).join(", ") || "—"}\n  Check-ins impacted: ${c.deviceCheckinsImpacted ?? "—"}`
+                                      )
+                                      .join("\n")}`
+                                : "### Known Cross-Policy Conflicts\n_None reported_" +
+                                  (d.conflictSummaryError ? ` (lookup failed: ${d.conflictSummaryError})` : "");
+
+                        return `## Configuration Conflicts — "${label}"\n\n### Deployment Status\n${statusLines}\n\n${deviceSection}${truncNote}\n\n${conflictSection}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 39. intune_get_app_install_status ────────────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_app_install_status",
+            {
+                description:
+                    "Get per-device install/uninstall failure detail for an app, looked up by app ID or name — surfaces the " +
+                    "categorized installStateDetail failure reason (e.g. dependencyFailedToInstall, requirementsNotMet, " +
+                    "seeInstallErrorCode) plus raw errorCode per device, not just an overall install-summary count. " +
+                    "Optionally filter to devices whose name matches deviceNameFilter.",
+                inputSchema: {
+                    appId: z.string().optional().describe("Intune app ID (GUID). Use if you already have it."),
+                    appName: z.string().optional().describe("App display name (resolved to ID automatically)"),
+                    deviceNameFilter: z.string().optional().describe("Only return devices whose name contains this substring"),
+                    limit: z.number().int().positive().max(999).default(100).describe("Max devices to return (default 100)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ appId, appName, deviceNameFilter, limit = 100, response_format = "markdown" }) => {
+                try {
+                    let resolvedAppId = appId;
+                    let resolvedName = appName;
+
+                    if (!resolvedAppId && appName) {
+                        const resolved = await resolveAppByName(client, appName);
+                        if (!resolved) return notFound(`app "${appName}"`);
+                        resolvedAppId = resolved.appId;
+                        resolvedName = resolved.appName;
+                    }
+
+                    if (!resolvedAppId) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide appId or appName." }] };
+                    }
+
+                    const data = await client.getAppInstallStatus(resolvedAppId, { deviceName: deviceNameFilter, limit });
+
+                    const text = toText(data, response_format, () => {
+                        const d = data as any;
+                        const label = resolvedName ?? d.app?.displayName ?? resolvedAppId;
+                        const statuses: any[] = d.deviceStatuses ?? [];
+
+                        const countOf = (state: string) => statuses.filter((s: any) => s.installState === state).length;
+                        const summaryLines = [
+                            `- Installed: ${countOf("installed")}`,
+                            `- Failed: ${countOf("failed") + countOf("uninstallFailed")}`,
+                            `- Pending: ${countOf("pendingInstall")}`,
+                            `- Not installed: ${countOf("notInstalled")}`,
+                            `- Not applicable: ${countOf("notApplicable")}`,
+                        ].join("\n");
+
+                        const rows =
+                            statuses.length > 0
+                                ? statuses
+                                      .map(
+                                          (s: any) =>
+                                              `- **${s.deviceName ?? s.deviceId ?? "—"}** | State: ${s.installState ?? "—"}${
+                                                  s.installStateDetail && s.installStateDetail !== "noAdditionalDetails"
+                                                      ? ` (${s.installStateDetail})`
+                                                      : ""
+                                              }${s.errorCode ? ` | Error code: ${s.errorCode}` : ""}`
+                                      )
+                                      .join("\n")
+                                : "_No device statuses found._";
+
+                        const truncNote = d.summary?.truncated
+                            ? `\n\n_Showing ${d.summary.returnedDevices} of ${d.summary.totalDevices} devices (truncated)._`
+                            : "";
+
+                        return `## App Install Status — "${label}"\n\n### Summary\n${summaryLines}\n\n### Devices (${statuses.length})\n${rows}${truncNote}`;
                     });
 
                     return { content: [{ type: "text", text }] };
