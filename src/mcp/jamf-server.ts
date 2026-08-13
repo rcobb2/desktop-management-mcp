@@ -867,8 +867,12 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                 description:
                     "Update a Mac's inventory record in JAMF Pro. " +
                     "Accepts the computer name or serial number to identify the device. " +
-                    "Can update: assigned username, real name, email, department, building, room, and asset tag. " +
-                    "Only fields you provide will be changed — omitted fields are left as-is.",
+                    "Can update: assigned username, real name, email, department, building, room, asset tag, the " +
+                    "computer's own name, and its site. " +
+                    "Only fields you provide will be changed — omitted fields are left as-is. " +
+                    "Note: username/realName/emailAddress/department/building/room/assetTag go through JAMF's " +
+                    "Classic API; name/site go through the modern v4 computers-inventory-detail API — different " +
+                    "endpoints under the hood, but both are applied in one call here.",
                 inputSchema: {
                     computerNameOrSerial: z.string().describe("Computer display name or serial number"),
                     username: z.string().optional().describe("JAMF username to assign to this computer"),
@@ -878,14 +882,16 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     building: z.string().optional().describe("Building name (must match a JAMF building)"),
                     room: z.string().optional().describe("Room number or name"),
                     assetTag: z.string().optional().describe("Asset tag to assign to this computer"),
+                    name: z.string().optional().describe("New computer display name (renames the Jamf record itself, not the assigned user)"),
+                    site: z.string().optional().describe("Site name (must match a JAMF site — use jamf_list_sites) or numeric site ID"),
                 },
                 annotations: { readOnlyHint: false, openWorldHint: true },
             },
-            async ({ computerNameOrSerial, username, realName, emailAddress, department, building, room, assetTag }) => {
+            async ({ computerNameOrSerial, username, realName, emailAddress, department, building, room, assetTag, name, site }) => {
                 try {
                     assertRole(roles, JAMF_WRITE);
                     const result = await client.updateComputerRecord(computerNameOrSerial, {
-                        username, realName, emailAddress, department, building, room, assetTag
+                        username, realName, emailAddress, department, building, room, assetTag, name, site
                     });
                     const text = `Computer record updated successfully (JAMF ID: ${result.computerId}).`;
                     return { content: [{ type: "text", text }] };
@@ -1411,6 +1417,77 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                         return rows;
                     });
 
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18g. jamf_create_extension_attribute ──────────────────────────────────
+    // Closes gap #28 from MCP_TOOL_GAPS.md — this tenant's own API client has Read/Update
+    // Computer Extension Attributes but not Create; requires the Platform Gateway
+    // (JAMF_PLATFORM_*), which is confirmed live to have the Create privilege this tenant's
+    // own client lacks. Always creates a NEW extension attribute (no upsert — Jamf's create
+    // endpoint has no name-based update path this file's other upsert tools rely on).
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_create_extension_attribute",
+            {
+                description:
+                    "Create a new Computer Extension Attribute definition in JAMF Pro (Settings > Computer " +
+                    "Management > Extension Attributes). Always creates a NEW attribute — there is no upsert-by-name " +
+                    "path for this object type. Requires the Platform Gateway credential (JAMF_PLATFORM_* env vars) " +
+                    "— this tenant's own API client has Read/Update Computer Extension Attribute privileges but not " +
+                    "Create.",
+                inputSchema: {
+                    name: z.string().describe("Display name for the extension attribute"),
+                    inputType: z
+                        .enum(["SCRIPT", "TEXT", "POPUP", "DIRECTORY_SERVICE_ATTRIBUTE_MAPPING"])
+                        .describe("How the attribute's value is populated"),
+                    description: z.string().optional().describe("Description shown in JAMF Pro"),
+                    dataType: z.enum(["STRING", "INTEGER", "DATE"]).optional().describe('Defaults to "STRING"'),
+                    inventoryDisplayType: z
+                        .enum(["GENERAL", "HARDWARE", "OPERATING_SYSTEM", "USER_AND_LOCATION", "PURCHASING", "EXTENSION_ATTRIBUTES"])
+                        .optional()
+                        .describe('Category to display this attribute under in JAMF Pro. Defaults to "EXTENSION_ATTRIBUTES"'),
+                    scriptContents: z.string().optional().describe('The script body. Required when inputType is "SCRIPT".'),
+                    popupMenuChoices: z.array(z.string()).optional().describe('Choices shown in the pop-up menu. Required when inputType is "POPUP".'),
+                    ldapAttributeMapping: z.string().optional().describe('Directory Service attribute to map. Required when inputType is "DIRECTORY_SERVICE_ATTRIBUTE_MAPPING".'),
+                    enabled: z.boolean().optional().describe("Defaults to true"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                name,
+                inputType,
+                description,
+                dataType,
+                inventoryDisplayType,
+                scriptContents,
+                popupMenuChoices,
+                ldapAttributeMapping,
+                enabled,
+                response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.createComputerExtensionAttribute({
+                        name,
+                        inputType,
+                        description,
+                        dataType,
+                        inventoryDisplayType,
+                        scriptContents,
+                        popupMenuChoices,
+                        ldapAttributeMapping,
+                        enabled,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created extension attribute **${name}** (ID: ${(result as any).id}).`
+                    );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

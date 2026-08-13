@@ -2880,7 +2880,6 @@ export class IntuneClient {
         }
     }
 
-    // Assigns an existing app (Win32 or otherwise) to one or more Entra ID groups.
     // Creates a Proactive Remediation script package (deviceHealthScript,
     // beta surface) - a detection+remediation PowerShell script pair. The
     // "Run remediation" on-demand device action (Devices > Windows >
@@ -2914,10 +2913,16 @@ export class IntuneClient {
             remediationScriptContent: Buffer.from(params.remediationScriptContent, 'utf8').toString('base64'),
         };
 
-        const apiStart = Date.now();
-        const script = await this.client.api('/deviceManagement/deviceHealthScripts').version('beta').post(body);
-        logApiCall(this.logger, 'POST', '/deviceManagement/deviceHealthScripts', 201, Date.now() - apiStart);
-        return { id: script.id, displayName: params.displayName };
+        try {
+            const apiStart = Date.now();
+            const script = await this.client.api('/deviceManagement/deviceHealthScripts').version('beta').post(body);
+            logApiCall(this.logger, 'POST', '/deviceManagement/deviceHealthScripts', 201, Date.now() - apiStart);
+            return { id: script.id, displayName: params.displayName };
+        } catch (error) {
+            this.logger.error('Error creating remediation script package', { displayName: params.displayName, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', '/deviceManagement/deviceHealthScripts', undefined, undefined, error as Error);
+            throw error;
+        }
     }
 
     // Assigns a remediation script package to a group, with a required
@@ -2944,27 +2949,36 @@ export class IntuneClient {
     // remediation, until Microsoft fixes this. Not worth fighting further
     // here - confirm on-demand behavior against a real device before
     // relying on the schedule for anything.
-    public async assignRemediation(scriptId: string, groupId: string, intervalDays: number = 1) {
-        this.logger.info('Assigning remediation script to group', { scriptId, groupId });
+    public async assignRemediation(scriptId: string, groupNameOrId: string, intervalDays: number = 1) {
+        this.logger.info('Assigning remediation script to group', { scriptId, groupNameOrId });
         await this.trackAuthAttempt();
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
 
         const body = {
             deviceHealthScriptAssignments: [
                 {
-                    target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId },
+                    target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId: group.id },
                     runRemediationScript: true,
                     runSchedule: { '@odata.type': '#microsoft.graph.deviceHealthScriptDailySchedule', interval: intervalDays, useUtc: false, time: '03:00:00' },
                 },
             ],
         };
 
-        const apiStart = Date.now();
-        const assignment = await this.client
-            .api(`/deviceManagement/deviceHealthScripts/${scriptId}/assign`)
-            .version('beta')
-            .post(body);
-        logApiCall(this.logger, 'POST', `deviceHealthScripts/${scriptId}/assign`, 200, Date.now() - apiStart);
-        return assignment;
+        try {
+            const apiStart = Date.now();
+            const path = `/deviceManagement/deviceHealthScripts/${scriptId}/assign`;
+            const assignment = await this.client.api(path).version('beta').post(body);
+            logApiCall(this.logger, 'POST', path, 200, Date.now() - apiStart);
+            return { scriptId, groupId: group.id, groupDisplayName: group.displayName, ...assignment };
+        } catch (error) {
+            this.logger.error('Error assigning remediation script to group', { scriptId, groupNameOrId, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', `deviceHealthScripts/${scriptId}/assign`, undefined, undefined, error as Error);
+            throw error;
+        }
     }
 
     // Triggers the "Run remediation" on-demand device action directly via
@@ -2977,13 +2991,35 @@ export class IntuneClient {
         this.logger.info('Triggering on-demand remediation run', { managedDeviceId, scriptId });
         await this.trackAuthAttempt();
 
-        const apiStart = Date.now();
-        await this.client
-            .api(`/deviceManagement/managedDevices/${managedDeviceId}/initiateOnDemandProactiveRemediation`)
-            .version('beta')
-            .post({ ScriptPolicyId: scriptId });
-        logApiCall(this.logger, 'POST', `managedDevices/${managedDeviceId}/initiateOnDemandProactiveRemediation`, 204, Date.now() - apiStart);
-        return { managedDeviceId, scriptId };
+        const path = `/deviceManagement/managedDevices/${managedDeviceId}/initiateOnDemandProactiveRemediation`;
+        try {
+            const apiStart = Date.now();
+            await this.client.api(path).version('beta').post({ ScriptPolicyId: scriptId });
+            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            return { managedDeviceId, scriptId };
+        } catch (error) {
+            this.logger.error('Error triggering on-demand remediation run', { managedDeviceId, scriptId, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', path, undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Test-only: deletes a remediation script package by ID, used solely so
+    // test/intune-api.test.ts can self-clean one it creates via createRemediation. Not
+    // exposed as an MCP tool — no delete tools exist anywhere in this codebase's MCP surface.
+    public async deleteRemediation(scriptId: string) {
+        this.logger.info('Deleting remediation script package (test cleanup)', { scriptId });
+        await this.trackAuthAttempt();
+        const path = `/deviceManagement/deviceHealthScripts/${scriptId}`;
+        try {
+            const apiStart = Date.now();
+            await this.client.api(path).version('beta').delete();
+            logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
+        } catch (error) {
+            this.logger.error('Error deleting remediation script package', { scriptId, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', path, undefined, undefined, error as Error);
+            throw error;
+        }
     }
 
     // Assigns an existing app (Win32 or otherwise) to one or more Entra ID groups.
@@ -3263,6 +3299,147 @@ export class IntuneClient {
             return { serialNumber: normalizedSerial, autopilotId, groupTag };
         } catch (error) {
             this.logger.error(`Error updating Autopilot group tag for ${normalizedSerial}`, { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Sets an Autopilot device identity's friendly `displayName` field (Intune admin center:
+     * Devices > Enrollment > Windows > Autopilot devices > [device] > Friendly name) — closes
+     * gap #14 from MCP_TOOL_GAPS.md. Distinct from setDeviceName above, which sends a live MDM
+     * rename action that changes the actual OS hostname; this is inert metadata with no OS-level
+     * effect. Confirmed live 2026-08-12 that windowsAutopilotDeviceIdentity object IDs can get
+     * reissued sometime after registration — posting updateDeviceProperties against an id
+     * harvested from an earlier lookup 404s with no signal it's an id-staleness problem rather
+     * than a permissions/API-support one (indistinguishable without comparing ids across two
+     * lookups taken at different times). This never accepts a caller-supplied id: it always
+     * resolves the device fresh via listAutopilotDevices() (the confirmed-reliable bulk-list
+     * path from gap #8, not the single-serial $filter path — that path has its own separate
+     * coverage gap, #12, unrelated to id staleness but worth avoiding here too) immediately
+     * before writing.
+     */
+    public async setAutopilotFriendlyName(serialNumber: string, displayName: string) {
+        this.logger.info('Setting Autopilot friendly name', { serialNumber, displayName });
+        await this.trackAuthAttempt();
+
+        const normalizedSerial = serialNumber.trim();
+        const { devices } = await this.listAutopilotDevices();
+        const match = devices.find(
+            (d: any) => String(d.serialNumber || '').toLowerCase() === normalizedSerial.toLowerCase()
+        );
+        if (!match) {
+            throw new Error(`No Autopilot device identity found for serial "${normalizedSerial}".`);
+        }
+
+        try {
+            const path = `/deviceManagement/windowsAutopilotDeviceIdentities/${match.id}/updateDeviceProperties`;
+            const apiStart = Date.now();
+            await this.client.api(path).version('beta').post({ displayName });
+            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            this.logger.info('Autopilot friendly name updated', { serialNumber: normalizedSerial, autopilotId: match.id, displayName });
+            return { serialNumber: normalizedSerial, autopilotId: match.id, displayName };
+        } catch (error) {
+            this.logger.error(`Error setting Autopilot friendly name for ${normalizedSerial}`, { error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Bulk-lists Windows Autopilot deployment profiles (windowsAutopilotDeploymentProfiles) — a
+     * genuinely different Graph object from the configuration/compliance policies this file
+     * already exposes; closes half of gap #13 from MCP_TOOL_GAPS.md ("No MCP tool exists to
+     * read/write Autopilot deployment profiles or their group assignments at all"). Beta-only,
+     * matching every other Autopilot-adjacent call in this file that's been confirmed to need it
+     * (setDeviceName, the deviceHealthScript remediation methods above) — no v1.0 mirror of this
+     * resource has been documented or tried here.
+     */
+    public async listAutopilotDeploymentProfiles() {
+        this.logger.info('Listing Autopilot deployment profiles');
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            const response = await this.client.api('/deviceManagement/windowsAutopilotDeploymentProfiles').version('beta').get();
+            logApiCall(this.logger, 'GET', '/deviceManagement/windowsAutopilotDeploymentProfiles', 200, Date.now() - apiStart);
+            const profiles = response.value || [];
+            this.logger.info('Autopilot deployment profiles listed', { count: profiles.length });
+            return { totalCount: profiles.length, profiles };
+        } catch (error) {
+            this.logger.error('Error listing Autopilot deployment profiles', { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', '/deviceManagement/windowsAutopilotDeploymentProfiles', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Resolves a deployment profile by GUID or (case-insensitive exact-then-partial) displayName —
+    // same name-resolution convention as resolveGroupId/resolveAppByName elsewhere in this file.
+    private async resolveAutopilotDeploymentProfile(idOrName: string): Promise<any> {
+        const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (GUID_RE.test(idOrName)) {
+            const apiStart = Date.now();
+            const profile = await this.client.api(`/deviceManagement/windowsAutopilotDeploymentProfiles/${idOrName}`).version('beta').get();
+            logApiCall(this.logger, 'GET', `windowsAutopilotDeploymentProfiles/${idOrName}`, 200, Date.now() - apiStart);
+            return profile;
+        }
+        const { profiles } = await this.listAutopilotDeploymentProfiles();
+        const lower = idOrName.trim().toLowerCase();
+        const match =
+            profiles.find((p: any) => String(p.displayName ?? '').toLowerCase() === lower) ??
+            profiles.find((p: any) => String(p.displayName ?? '').toLowerCase().includes(lower));
+        if (!match) throw new Error(`Autopilot deployment profile not found: "${idOrName}"`);
+        return match;
+    }
+
+    /**
+     * Reads one Autopilot deployment profile's detail plus its group assignments — the other
+     * half of gap #13. Each assignment comes back from Graph with only a bare `target.groupId`;
+     * this resolves each to a `groupDisplayName` via the same resolveGroupId() helper the
+     * assignment-write methods below already use, best-effort (a deleted/inaccessible group
+     * logs a warning rather than failing the whole read).
+     */
+    public async getAutopilotDeploymentProfileDetail(profileIdOrName: string) {
+        this.logger.info('Fetching Autopilot deployment profile detail', { profileIdOrName });
+        await this.trackAuthAttempt();
+
+        const profile = await this.resolveAutopilotDeploymentProfile(profileIdOrName);
+        try {
+            const apiStart = Date.now();
+            const assignmentsResponse = await this.client
+                .api(`/deviceManagement/windowsAutopilotDeploymentProfiles/${profile.id}/assignments`)
+                .version('beta')
+                .get();
+            logApiCall(this.logger, 'GET', `windowsAutopilotDeploymentProfiles/${profile.id}/assignments`, 200, Date.now() - apiStart);
+
+            const rawAssignments: any[] = assignmentsResponse.value || [];
+            const assignments = await Promise.all(
+                rawAssignments.map(async (a: any) => {
+                    const groupId = a.target?.groupId;
+                    let groupDisplayName: string | null = null;
+                    if (groupId) {
+                        try {
+                            const group = await this.resolveGroupId(groupId);
+                            groupDisplayName = group?.displayName ?? null;
+                        } catch (groupError) {
+                            this.logger.warn('Failed to resolve assignment group displayName (non-fatal)', {
+                                groupId,
+                                error: (groupError as Error).message
+                            });
+                        }
+                    }
+                    return { ...a, groupDisplayName };
+                })
+            );
+
+            return { ...profile, assignments };
+        } catch (error) {
+            this.logger.error('Error fetching Autopilot deployment profile assignments', { profileIdOrName, error: (error as Error).message });
+            logApiCall(
+                this.logger,
+                'GET',
+                `windowsAutopilotDeploymentProfiles/${profile.id}/assignments`,
+                undefined,
+                undefined,
+                error as Error
+            );
             throw error;
         }
     }

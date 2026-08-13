@@ -1430,6 +1430,145 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── intune_create_remediation ────────────────────────────────────────────
+    // Creates a Proactive Remediation script package (detection + remediation PowerShell
+    // pair, Windows-only). See intune_assign_remediation to scope it to a group and
+    // intune_run_remediation_now for an immediate on-demand run against a single device.
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_remediation",
+            {
+                description:
+                    "Create a Proactive Remediation script package (Devices > Scripts and remediations > " +
+                    "Remediations) — a detection script + remediation script pair, Windows-only. Always creates " +
+                    "a NEW package (no upsert). Detection/remediation script content is plain PowerShell text; " +
+                    "base64 encoding for the Graph payload happens inside this tool. Use intune_assign_remediation " +
+                    "to scope it to a group (required before the scheduled run can fire, though NOT required for " +
+                    "intune_run_remediation_now's on-demand action).",
+                inputSchema: {
+                    displayName: z.string().describe("Name shown in the Intune admin console"),
+                    description: z.string().describe("Description shown in the Intune admin console"),
+                    publisher: z.string().describe("Publisher name shown in the Intune admin console"),
+                    detectionScriptContent: z.string().describe("Plain-text PowerShell detection script content"),
+                    remediationScriptContent: z.string().describe("Plain-text PowerShell remediation script content"),
+                    runAsAccount: z.enum(["system", "user"]).optional().describe('Defaults to "system"'),
+                    runAs32Bit: z.boolean().optional().describe("Run the script in a 32-bit PowerShell host (default false)"),
+                    enforceSignatureCheck: z.boolean().optional().describe("Require the script to be signed (default false)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({
+                displayName,
+                description,
+                publisher,
+                detectionScriptContent,
+                remediationScriptContent,
+                runAsAccount,
+                runAs32Bit,
+                enforceSignatureCheck,
+                response_format = "markdown",
+            }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createRemediation({
+                        displayName,
+                        description,
+                        publisher,
+                        detectionScriptContent,
+                        remediationScriptContent,
+                        runAsAccount,
+                        runAs32Bit,
+                        enforceSignatureCheck,
+                    });
+                    const text = toText(result, response_format, () =>
+                        `Created remediation script package **${result.displayName}** (ID ${result.id}). ` +
+                        `Use intune_assign_remediation to scope it to a group.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── intune_assign_remediation ────────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_assign_remediation",
+            {
+                description:
+                    "Assign a Proactive Remediation script package to a group, with a daily run schedule. " +
+                    "IMPORTANT: this REPLACES the package's entire assignment set (Graph's /assign action is not " +
+                    "additive) — re-running with a different group does not preserve a previous assignment; " +
+                    "re-assign every group you want covered in one call if there's more than one. Assignment is " +
+                    "required before the scheduled automatic run can fire, but NOT required for " +
+                    "intune_run_remediation_now's on-demand action against a single device. Note: Graph has a " +
+                    "confirmed quirk where the schedule's runRemediationScript flag reads back false immediately " +
+                    "after being sent true — this doesn't affect on-demand runs, but the scheduled run may only " +
+                    "ever execute detection, not remediation, until Microsoft fixes it.",
+                inputSchema: {
+                    scriptId: z.string().describe("Remediation script package ID (from intune_create_remediation)"),
+                    group: z.string().describe("Azure AD group display name or object ID (GUID) to assign"),
+                    intervalDays: z.number().int().min(1).optional().describe("Daily run interval in days (default 1)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ scriptId, group, intervalDays, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.assignRemediation(scriptId, group, intervalDays);
+                    const text = toText(result, response_format, () =>
+                        `Assigned remediation script **${scriptId}** to group **${result.groupDisplayName ?? result.groupId}**.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── intune_run_remediation_now ───────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_run_remediation_now",
+            {
+                description:
+                    "Trigger the 'Run remediation' on-demand device action for a Proactive Remediation script " +
+                    "package against a single device, bypassing the schedule entirely — runs both the detection " +
+                    "and remediation script immediately. Assignment to the device/group is NOT required for this " +
+                    "action per Microsoft's docs, so this works even for an unassigned script package. Accepts " +
+                    "device name, Intune device ID, or serial number.",
+                inputSchema: {
+                    ...DeviceIdentifierSchema,
+                    scriptId: z.string().describe("Remediation script package ID"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ deviceName, deviceId, serialNumber, scriptId, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const resolved = await resolveDevice(client, { deviceName, deviceId, serialNumber });
+                    if (!resolved) {
+                        return notFound(`device (name: "${deviceName ?? "—"}", id: "${deviceId ?? "—"}", serial: "${serialNumber ?? "—"}")`);
+                    }
+
+                    const result = await client.runRemediationNow(resolved.deviceId, scriptId);
+                    const text = toText(result, response_format, () =>
+                        `Triggered on-demand remediation run for script **${scriptId}** on device **${deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId}**.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── 17. intune_send_device_action ────────────────────────────────────────
     if (hasRole(roles, INTUNE_WRITE)) {
         server.registerTool(
@@ -1585,6 +1724,144 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
 
                     const result = await client.updateAutopilotGroupTag(targetSerial, groupTag);
                     const text = `Autopilot group tag set to **${result.groupTag}** for serial **${result.serialNumber}**.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── intune_set_autopilot_friendly_name ───────────────────────────────────
+    // Closes MCP_TOOL_GAPS.md gap #14. Distinct from intune_set_device_name, which sends a
+    // live MDM rename action that changes the actual OS hostname — this sets the inert
+    // "Friendly name" metadata field on the Autopilot device identity itself (blank by
+    // default), with no OS-level effect.
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_set_autopilot_friendly_name",
+            {
+                description:
+                    "Set a Windows Autopilot device identity's friendly name (Intune admin center: Devices > " +
+                    "Enrollment > Windows > Autopilot devices > [device] > Friendly name), looked up by serial " +
+                    "number. This is metadata only — it does NOT rename the device's OS hostname (see " +
+                    "intune_set_device_name for that). Always re-resolves the device fresh via the bulk Autopilot " +
+                    "list before writing, since these objects' internal IDs can be reissued after registration and " +
+                    "a cached ID silently 404s.",
+                inputSchema: {
+                    serialNumber: z.string().describe("Autopilot device serial number"),
+                    displayName: z.string().describe("The friendly name to set"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ serialNumber, displayName }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.setAutopilotFriendlyName(serialNumber, displayName);
+                    const text = `Autopilot friendly name set to **${result.displayName}** for serial **${result.serialNumber}**.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── intune_list_autopilot_deployment_profiles ────────────────────────────
+    // Closes half of MCP_TOOL_GAPS.md gap #13 — a genuinely different Graph object from the
+    // configuration/compliance policies this server already exposes.
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_list_autopilot_deployment_profiles",
+            {
+                description:
+                    "List Windows Autopilot deployment profiles (Devices > Enrollment > Windows > Deployment " +
+                    "Profiles). Returns each profile's name, ID, OOBE settings, and assignment count. Use " +
+                    "intune_get_autopilot_deployment_profile for a single profile's resolved group assignments.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.listAutopilotDeploymentProfiles();
+
+                    const text = toText(data, response_format, () => {
+                        const profiles: any[] = data.profiles ?? [];
+                        if (profiles.length === 0) return "No Autopilot deployment profiles found.";
+
+                        const rows = profiles
+                            .map(
+                                (p: any) =>
+                                    `- **${p.displayName}** (ID: ${p.id}) | Type: ${p["@odata.type"]?.replace("#microsoft.graph.", "") ?? "—"} | Assignments: ${p.assignments?.length ?? "—"} | Modified: ${p.lastModifiedDateTime ?? "—"}`
+                            )
+                            .join("\n");
+
+                        return `## Autopilot Deployment Profiles — ${profiles.length} total\n\n${rows}`;
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── intune_get_autopilot_deployment_profile ──────────────────────────────
+    // Closes the other half of gap #13 — the profile's resolved group assignments, which
+    // aren't included in the bulk list above.
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_get_autopilot_deployment_profile",
+            {
+                description:
+                    "Get a single Windows Autopilot deployment profile's full detail, including its resolved " +
+                    "group assignments (target group display names, not just bare group IDs). Accepts profile " +
+                    "ID (GUID) or display name. Use this to check what a device *should* be getting at OOBE " +
+                    "before troubleshooting Autopilot deployment behavior.",
+                inputSchema: {
+                    profileId: z.string().optional().describe("Autopilot deployment profile ID (GUID)"),
+                    profileName: z.string().optional().describe("Profile display name (exact match preferred, partial match as fallback)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ profileId, profileName, response_format = "markdown" }) => {
+                try {
+                    const identifier = profileId ?? profileName;
+                    if (!identifier) {
+                        return {
+                            isError: true,
+                            content: [{ type: "text", text: "Error: provide profileId or profileName." }],
+                        };
+                    }
+
+                    const data = await client.getAutopilotDeploymentProfileDetail(identifier);
+
+                    const text = toText(data, response_format, () => {
+                        const d = data as any;
+                        const assignments: any[] = d.assignments ?? [];
+                        const assignmentRows =
+                            assignments.length > 0
+                                ? assignments
+                                      .map((a: any) => `- **${a.groupDisplayName ?? a.target?.groupId ?? "Unknown"}** (${a.target?.["@odata.type"]?.replace("#microsoft.graph.", "") ?? "—"})`)
+                                      .join("\n")
+                                : "_No group assignments — this profile is not assigned to any group yet._";
+
+                        return [
+                            `## Autopilot Deployment Profile — ${d.displayName ?? identifier}`,
+                            `- **ID:** ${d.id}`,
+                            `- **Type:** ${d["@odata.type"]?.replace("#microsoft.graph.", "") ?? "—"}`,
+                            `- **Deployment Mode:** ${d.deviceNameTemplate ? `Custom naming: ${d.deviceNameTemplate}` : "—"}`,
+                            `- **Language:** ${d.language ?? "—"}`,
+                            `- **Modified:** ${d.lastModifiedDateTime ?? "—"}`,
+                            `### Group Assignments (${assignments.length})`,
+                            assignmentRows,
+                        ].join("\n");
+                    });
+
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);

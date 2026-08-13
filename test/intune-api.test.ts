@@ -286,5 +286,32 @@ describe("IntuneClient", () => {
             assert.ok(created.appId);
             await client.deleteApp(created.appId);
         });
+
+        // Fully self-cleaning, unlike TEST_AZURE_GROUP_NAME-gated tests above only because the
+        // gate here is optional rather than required — the create/assign path can be exercised
+        // without a group, but assign is skipped (not the whole test) if TEST_AZURE_GROUP_NAME
+        // is unset, so this always at least covers create+delete.
+        skipWrite("create, assign, and delete a Proactive Remediation script package", async () => {
+            const groupName = process.env.TEST_AZURE_GROUP_NAME;
+            const testName = `zzz-test-remediation-${Date.now()}`;
+            const created = await client.createRemediation({
+                displayName: testName,
+                description: "Created by test/intune-api.test.ts — safe to delete if found orphaned.",
+                publisher: "Test Publisher",
+                detectionScriptContent: "exit 0",
+                remediationScriptContent: "exit 0",
+            });
+            assert.ok(created.id);
+
+            try {
+                if (groupName) {
+                    const assigned = await client.assignRemediation(created.id, groupName);
+                    assert.equal(assigned.scriptId, created.id);
+                    assert.ok(assigned.groupId);
+                }
+            } finally {
+                await client.deleteRemediation(created.id);
+            }
+        });
     });
 });

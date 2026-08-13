@@ -2022,6 +2022,17 @@ export class JamfClient {
         }
     }
 
+    // Resolves a site name to its numeric ID via getSites() — used by updateComputerRecord's
+    // `site` param below. Jamf's v4 computer PATCH takes siteId (a string ID), not a name.
+    private async resolveSiteIdByName(name: string): Promise<string> {
+        const sites: Array<{ id: string; name: string }> = await this.getSites();
+        const match = sites.find((s) => s.name.toLowerCase() === name.trim().toLowerCase());
+        if (!match) {
+            throw new Error(`Site not found: "${name}". Available sites: ${sites.map((s) => s.name).join(', ')}`);
+        }
+        return match.id;
+    }
+
     public async updateComputerRecord(
         nameOrSerial: string,
         updates: {
@@ -2032,40 +2043,72 @@ export class JamfClient {
             building?: string;
             room?: string;
             assetTag?: string;
+            name?: string;
+            site?: string;
         }
     ) {
         await this.ensureAuthenticated();
         this.logger.info('Updating computer record', { nameOrSerial, updates });
-        try {
-            const computerId = await this.resolveComputerId(nameOrSerial);
-            const body: any = { computer: {} };
+        const computerId = await this.resolveComputerId(nameOrSerial);
 
-            const location: any = {};
-            if (updates.username !== undefined) location.username = updates.username;
-            if (updates.realName !== undefined) location.real_name = updates.realName;
-            if (updates.emailAddress !== undefined) location.email_address = updates.emailAddress;
-            if (updates.department !== undefined) location.department = updates.department;
-            if (updates.building !== undefined) location.building = updates.building;
-            if (updates.room !== undefined) location.room = updates.room;
-            if (Object.keys(location).length > 0) body.computer.location = location;
+        // username/realName/email/department/building/room/assetTag go through the Classic
+        // API PUT as before — confirmed live to be a partial merge (see updatePolicyScope's
+        // doc comment for the same finding on a sibling object type).
+        const location: any = {};
+        if (updates.username !== undefined) location.username = updates.username;
+        if (updates.realName !== undefined) location.real_name = updates.realName;
+        if (updates.emailAddress !== undefined) location.email_address = updates.emailAddress;
+        if (updates.department !== undefined) location.department = updates.department;
+        if (updates.building !== undefined) location.building = updates.building;
+        if (updates.room !== undefined) location.room = updates.room;
 
-            if (updates.assetTag !== undefined) {
-                body.computer.general = { asset_tag: updates.assetTag };
+        const body: any = { computer: {} };
+        if (Object.keys(location).length > 0) body.computer.location = location;
+        if (updates.assetTag !== undefined) body.computer.general = { asset_tag: updates.assetTag };
+
+        if (Object.keys(body.computer).length > 0) {
+            try {
+                const apiStart = Date.now();
+                const response = await this.client.put(`/JSSResource/computers/id/${computerId}`, body);
+                logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${computerId}`, response.status, Date.now() - apiStart);
+            } catch (error) {
+                if (axios.isAxiosError(error) && error.response?.status === 403) {
+                    throw new Error(`Permission denied (403). The API client may be missing 'Update Computers' permissions in JAMF Pro.`);
+                }
+                this.logger.error('Error updating computer record', { nameOrSerial, error: (error as Error).message });
+                logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${computerId}`, undefined, undefined, error as Error);
+                throw error;
             }
-
-            const apiStart = Date.now();
-            const response = await this.client.put(`/JSSResource/computers/id/${computerId}`, body);
-            logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${computerId}`, response.status, Date.now() - apiStart);
-            this.logger.info('Computer record updated', { nameOrSerial, computerId });
-            return { success: true, computerId };
-        } catch (error) {
-            if (axios.isAxiosError(error) && error.response?.status === 403) {
-                throw new Error(`Permission denied (403). The API client may be missing 'Update Computers' permissions in JAMF Pro.`);
-            }
-            this.logger.error('Error updating computer record', { nameOrSerial, error: (error as Error).message });
-            logApiCall(this.logger, 'PUT', `/JSSResource/computers/id/${nameOrSerial}`, undefined, undefined, error as Error);
-            throw error;
         }
+
+        // `name`/`site` go through the modern v4 PATCH instead — closes gap #25 from
+        // MCP_TOOL_GAPS.md. Neither field exists on the Classic API body above (site in
+        // particular isn't part of `location` at all); confirmed live 2026-08-12 that
+        // PATCH /api/v4/computers-inventory-detail/{id} with `general.name`/`general.siteId`
+        // is the real, documented (per jamf-docs' ComputerGeneralUpdate schema) way to change
+        // either. Returns 204 with no body on success.
+        if (updates.name !== undefined || updates.site !== undefined) {
+            const general: any = {};
+            if (updates.name !== undefined) general.name = updates.name;
+            if (updates.site !== undefined) {
+                general.siteId = /^\d+$/.test(updates.site) ? updates.site : await this.resolveSiteIdByName(updates.site);
+            }
+            try {
+                const apiStart = Date.now();
+                const response = await this.client.patch(`/api/v4/computers-inventory-detail/${computerId}`, { general });
+                logApiCall(this.logger, 'PATCH', `/api/v4/computers-inventory-detail/${computerId}`, response.status, Date.now() - apiStart);
+            } catch (error) {
+                if (axios.isAxiosError(error) && error.response?.status === 403) {
+                    throw new Error(`Permission denied (403). The API client may be missing 'Update Computers' permissions in JAMF Pro.`);
+                }
+                this.logger.error('Error updating computer name/site', { nameOrSerial, error: (error as Error).message });
+                logApiCall(this.logger, 'PATCH', `/api/v4/computers-inventory-detail/${computerId}`, undefined, undefined, error as Error);
+                throw error;
+            }
+        }
+
+        this.logger.info('Computer record updated', { nameOrSerial, computerId });
+        return { success: true, computerId };
     }
 
     // Deletes a computer record. Gateway-only, deliberately — confirmed live that the two
@@ -3166,6 +3209,59 @@ export class JamfClient {
             }
             this.logger.error('Error fetching Self Service branding configuration', { error: (error as Error).message });
             logApiCall(this.logger, 'GET', '/api/v1/self-service/branding/macos', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Creates a new Computer Extension Attribute definition — closes gap #28 from
+    // MCP_TOOL_GAPS.md, found 2026-08-13 building a live AD-bind verification EA. This
+    // tenant's own API client has Read/Update Computer Extension Attributes but not
+    // Create (`POST /v1/computer-extension-attributes` returns a genuine
+    // `403 INVALID_PRIVILEGE`, not an auth-rejection like the Classic API delete cases) —
+    // same class of gap as computer delete/config-profile delete above. Confirmed live
+    // that the Platform Gateway credential DOES have the Create privilege via its
+    // mirrored path, so this requires the Gateway outright (same convention as
+    // deleteComputer/deleteConfigurationProfile) rather than trying the direct client
+    // first and falling back, since the direct client is already confirmed not to work
+    // for this operation on this tenant. Returns Jamf's HrefResponse shape ({id, href})
+    // on success (201).
+    public async createComputerExtensionAttribute(params: {
+        name: string;
+        description?: string;
+        dataType?: 'STRING' | 'INTEGER' | 'DATE';
+        inputType: 'SCRIPT' | 'TEXT' | 'POPUP' | 'DIRECTORY_SERVICE_ATTRIBUTE_MAPPING';
+        inventoryDisplayType?: 'GENERAL' | 'HARDWARE' | 'OPERATING_SYSTEM' | 'USER_AND_LOCATION' | 'PURCHASING' | 'EXTENSION_ATTRIBUTES';
+        scriptContents?: string;
+        popupMenuChoices?: string[];
+        ldapAttributeMapping?: string;
+        enabled?: boolean;
+    }) {
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        this.logger.info('Creating computer extension attribute', { name: params.name, inputType: params.inputType });
+
+        const body: any = {
+            name: params.name,
+            description: params.description,
+            dataType: params.dataType ?? 'STRING',
+            inputType: params.inputType,
+            inventoryDisplayType: params.inventoryDisplayType ?? 'EXTENSION_ATTRIBUTES',
+            enabled: params.enabled ?? true,
+        };
+        if (params.inputType === 'SCRIPT') body.scriptContents = params.scriptContents;
+        if (params.inputType === 'POPUP') body.popupMenuChoices = params.popupMenuChoices;
+        if (params.inputType === 'DIRECTORY_SERVICE_ATTRIBUTE_MAPPING') body.ldapAttributeMapping = params.ldapAttributeMapping;
+
+        try {
+            const apiStart = Date.now();
+            const path = `/pro/v1/tenant/${tenantId}/computer-extension-attributes`;
+            const response = await this.platformClient.post(path, body);
+            logApiCall(this.logger, 'POST', path, response.status, Date.now() - apiStart);
+            this.logger.info('Computer extension attribute created', { name: params.name, id: response.data?.id });
+            return response.data;
+        } catch (error) {
+            this.logger.error('Error creating computer extension attribute', { name: params.name, error: (error as Error).message });
+            logApiCall(this.logger, 'POST', `/pro/v1/tenant/${tenantId}/computer-extension-attributes`, undefined, undefined, error as Error);
             throw error;
         }
     }
