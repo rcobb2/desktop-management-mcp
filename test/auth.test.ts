@@ -7,10 +7,12 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import type { Request, Response, NextFunction } from "express";
 import { requireMcpAuth } from "../src/utils/auth.js";
 import { hasRole, assertRole, resolveRolesFromAuthInfo, JAMF_READ, JAMF_WRITE } from "../src/utils/roles.js";
 import type { EntraAuthInfo } from "../src/utils/entra-jwt.js";
+import { limitConcurrentRequests } from "../src/utils/concurrency.js";
 
 // ── roles.ts ──────────────────────────────────────────────────────────────────
 
@@ -187,5 +189,55 @@ describe("requireMcpAuth", () => {
         assert.equal(nextCalled, false);
         assert.match(res.headers["WWW-Authenticate"], /resource_metadata=/);
         delete process.env.TEST_ENTRA_ENABLED;
+    });
+});
+
+// ── concurrency.ts: limitConcurrentRequests ──────────────────────────────────
+// Regression coverage for MCP_TOOL_GAPS.md gaps #9 (Intune)/#15 (JAMF) — "firing
+// several concurrent calls wedges the entire server." No live credentials needed;
+// this only exercises the in-process queuing logic against fake req/res objects.
+
+function fakeResWithEvents(): Response {
+    const emitter = new EventEmitter();
+    return emitter as unknown as Response;
+}
+
+describe("limitConcurrentRequests", () => {
+    test("runs up to `max` requests immediately, queues the rest", () => {
+        const limiter = limitConcurrentRequests(2);
+        const started: number[] = [];
+        const responses = [fakeResWithEvents(), fakeResWithEvents(), fakeResWithEvents()];
+
+        limiter({} as Request, responses[0], (() => started.push(0)) as NextFunction);
+        limiter({} as Request, responses[1], (() => started.push(1)) as NextFunction);
+        limiter({} as Request, responses[2], (() => started.push(2)) as NextFunction);
+
+        assert.deepEqual(started, [0, 1], "third request should be queued, not started immediately");
+
+        (responses[0] as unknown as EventEmitter).emit("finish");
+        assert.deepEqual(started, [0, 1, 2], "finishing a slot should release the queued request");
+    });
+
+    test("close and finish are both handled, and a slot is released only once", () => {
+        const limiter = limitConcurrentRequests(1);
+        const started: number[] = [];
+        const responses = [fakeResWithEvents(), fakeResWithEvents()];
+
+        limiter({} as Request, responses[0], (() => started.push(0)) as NextFunction);
+        limiter({} as Request, responses[1], (() => started.push(1)) as NextFunction);
+        assert.deepEqual(started, [0]);
+
+        // Both events can fire for the same response (e.g. finish then close on socket
+        // teardown) — the second must be a no-op, not release a slot twice.
+        (responses[0] as unknown as EventEmitter).emit("finish");
+        (responses[0] as unknown as EventEmitter).emit("close");
+        assert.deepEqual(started, [0, 1], "queued request should start exactly once");
+    });
+
+    test("requests below the limit are never queued", () => {
+        const limiter = limitConcurrentRequests(8);
+        let nextCalled = false;
+        limiter({} as Request, fakeResWithEvents(), (() => (nextCalled = true)) as NextFunction);
+        assert.equal(nextCalled, true);
     });
 });

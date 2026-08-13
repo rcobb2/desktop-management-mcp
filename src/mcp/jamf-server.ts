@@ -51,6 +51,7 @@ import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, JAMF_READ, JAMF_WRITE, JAMF_ALL_ROLES } from "../utils/roles.js";
 import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
+import { limitConcurrentRequests } from "../utils/concurrency.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1290,6 +1291,126 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     const text = toText(result, response_format, () =>
                         `## Configuration profile ${result.action} — "${result.name}"\n- ID: ${result.id}`
                     );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18d. jamf_delete_configuration_profile ───────────────────────────────
+    if (hasRole(roles, JAMF_WRITE)) {
+        server.registerTool(
+            "jamf_delete_configuration_profile",
+            {
+                description:
+                    "Permanently delete a macOS configuration profile from JAMF Pro by name or numeric ID. " +
+                    "IRREVERSIBLE — use jamf_get_configuration_profile first to confirm you have the right profile " +
+                    "(check scope/payload) before deleting. Requires the Jamf Platform API Gateway credential " +
+                    "(JAMF_PLATFORM_* env vars) — confirmed live that the direct client's Classic API DELETE for " +
+                    "this object type rejects OAuth client-credentials auth entirely (401), same as computers; " +
+                    "the Gateway's Classic API path is the confirmed-working route.",
+                inputSchema: {
+                    profile: z.string().describe("Profile name or numeric ID — use jamf_list_configuration_profiles to find one"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+            },
+            async ({ profile }) => {
+                try {
+                    assertRole(roles, JAMF_WRITE);
+                    const result = await client.deleteConfigurationProfile(profile);
+                    const text = `Successfully deleted configuration profile **${result.name}** (ID: ${result.id}). This cannot be undone.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18e. jamf_get_sso_settings ────────────────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_sso_settings",
+            {
+                description:
+                    "Get JAMF Pro's Global SSO/SAML configuration (Settings > System > Single Sign-On) — whether " +
+                    "SSO is enabled, for enrollment, and for macOS Self Service; the configured IdP type and SAML/" +
+                    "OIDC settings; and the SSO signing certificate's status/expiration. Useful for diagnosing Self " +
+                    "Service/enrollment SSO login failures (e.g. an expired signing certificate is a common cause). " +
+                    "Distinct from jamf_test_directory_lookup, which covers the separate Cloud Identity Provider " +
+                    "(LDAP-style directory search) feature, not SSO login itself.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data: any = await client.getSsoSettings();
+
+                    const text = toText(data, response_format, () => {
+                        const cert = data.certificate?.keystoreDetails;
+                        const saml = data.samlSettings ?? {};
+                        return [
+                            `## SSO Settings`,
+                            `- **Configuration Type:** ${data.configurationType ?? "—"}`,
+                            `- **SSO Enabled:** ${data.ssoEnabled ? "Yes" : "No"}`,
+                            `- **SSO for Enrollment:** ${data.ssoForEnrollmentEnabled ? "Yes" : "No"}`,
+                            `- **SSO for macOS Self Service:** ${data.ssoForMacOsSelfServiceEnabled ? "Yes" : "No"}`,
+                            `- **SSO Bypass Allowed:** ${data.ssoBypassAllowed ? "Yes" : "No"}`,
+                            data.configurationType !== "OIDC" ? `- **IdP Provider Type:** ${saml.idpProviderType ?? "—"}` : "",
+                            data.configurationType !== "OIDC" ? `- **Token Expiration Disabled:** ${saml.tokenExpirationDisabled ? "Yes" : "No"}` : "",
+                            `\n### Signing Certificate`,
+                            cert
+                                ? `- **Subject:** ${cert.subject ?? "—"}\n- **Issuer:** ${cert.issuer ?? "—"}\n- **Expiration:** ${cert.expiration ?? "—"}`
+                                : "- No certificate detail available (not configured, or not applicable for this IdP type).",
+                        ].filter(Boolean).join("\n");
+                    });
+
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 18f. jamf_get_self_service_branding ───────────────────────────────────
+    if (hasRole(roles, JAMF_READ)) {
+        server.registerTool(
+            "jamf_get_self_service_branding",
+            {
+                description:
+                    "Get JAMF Pro's Self Service macOS branding configuration (Settings > Self Service > Branding) " +
+                    "— application name, header image, and home screen heading/subheading. Most tenants have exactly " +
+                    "one macOS branding configuration.",
+                inputSchema: {
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ response_format = "markdown" }) => {
+                try {
+                    const data = await client.getSelfServiceBranding();
+                    const configs: any[] = (data as any).results ?? [];
+
+                    const text = toText(data, response_format, () => {
+                        if (configs.length === 0) return "No Self Service macOS branding configuration found.";
+                        const rows = configs
+                            .map((c: any) =>
+                                `## ${c.brandingName ?? "Unnamed"} (ID: ${c.id})\n` +
+                                `- **Application Name:** ${c.applicationName ?? "—"}\n` +
+                                `- **Secondary Branding Name:** ${c.brandingNameSecondary ?? "—"}\n` +
+                                `- **Home Heading:** ${c.homeHeading ?? "—"}\n` +
+                                `- **Home Subheading:** ${c.homeSubheading ?? "—"}\n` +
+                                `- **Icon ID:** ${c.iconId ?? "—"} | **Header Image ID:** ${c.brandingHeaderImageId ?? "—"}`
+                            )
+                            .join("\n\n");
+                        return rows;
+                    });
+
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
                     return errorResult(err);
@@ -3177,6 +3298,11 @@ async function main() {
             resourceMetadataUrl,
         })
     );
+
+    // Bounds how many /mcp requests this process handles concurrently — see
+    // limitConcurrentRequests()'s doc comment (closes MCP_TOOL_GAPS.md gap #15).
+    // Mounted after requireMcpAuth so an unauthenticated request can't occupy a queue slot.
+    app.use("/mcp", limitConcurrentRequests(parseInt(process.env.MCP_MAX_CONCURRENT_REQUESTS ?? "8", 10)));
 
     // Each request gets its own transport (stateless mode — required for APIM / multi-instance)
     app.post("/mcp", async (req: Request, res: Response) => {

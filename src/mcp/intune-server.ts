@@ -39,6 +39,7 @@ import { requireMcpAuth } from "../utils/auth.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, INTUNE_READ, INTUNE_WRITE, INTUNE_ALL_ROLES } from "../utils/roles.js";
 import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
+import { limitConcurrentRequests } from "../utils/concurrency.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -2721,6 +2722,11 @@ async function main() {
             resourceMetadataUrl,
         })
     );
+
+    // Bounds how many /mcp requests this process handles concurrently — see
+    // limitConcurrentRequests()'s doc comment (closes MCP_TOOL_GAPS.md gap #9).
+    // Mounted after requireMcpAuth so an unauthenticated request can't occupy a queue slot.
+    app.use("/mcp", limitConcurrentRequests(parseInt(process.env.MCP_MAX_CONCURRENT_REQUESTS ?? "8", 10)));
 
     // Each request gets its own transport (stateless mode — required for APIM / multi-instance)
     app.post("/mcp", async (req: Request, res: Response) => {

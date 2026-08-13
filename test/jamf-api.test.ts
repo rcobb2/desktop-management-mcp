@@ -9,6 +9,7 @@
 
 import { test, describe, before } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { JamfClient } from "../src/jamf/jamf-api.js";
 
 function requireEnv(name: string): string {
@@ -389,6 +390,48 @@ describe("JamfClient", () => {
             assert.equal(result.action, "updated");
             assert.equal(result.id, String(before.general.id));
         });
+
+        // Fully self-cleaning (unlike the fixture-based update test above) — this profile
+        // is unscoped (no target groups), so it never reaches a real Mac. Doubles as the
+        // first live confirmation of both the create-path write (previously NOT YET
+        // CONFIRMED LIVE per CLAUDE.md) and the new delete path (gap #24). Delete requires
+        // the Platform Gateway (see deleteConfigurationProfile's doc comment) — skip rather
+        // than create an orphaned profile if it isn't configured in this environment.
+        skipWrite("create then delete a configuration profile cleans up fully", async (t: any) => {
+            if (!hasPlatformGateway()) {
+                t.skip("requires JAMF_PLATFORM_* env vars (Gateway) for the delete path");
+                return;
+            }
+            const testName = `zzz-test-config-profile-${Date.now()}`;
+            const payload = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array/>
+  <key>PayloadDisplayName</key>
+  <string>${testName}</string>
+  <key>PayloadIdentifier</key>
+  <string>edu.colgate.mcp.test.${Date.now()}</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>${randomUUID()}</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>`;
+            const created = await client.upsertConfigurationProfile({ name: testName, payload });
+            assert.equal(created.action, "created");
+
+            const deleted = await client.deleteConfigurationProfile(created.id);
+            assert.equal(deleted.success, true);
+
+            await assert.rejects(
+                () => client.getConfigurationProfileDetail(created.id),
+                /not found/i
+            );
+        });
     });
 
     // ── Patch policies ────────────────────────────────────────────────────────
@@ -512,6 +555,29 @@ describe("JamfClient", () => {
             if (cats.length > 0) {
                 assert.ok(cats[0].id !== undefined);
                 assert.ok(typeof cats[0].name === "string");
+            }
+        });
+    });
+
+    // ── SSO settings and Self Service branding ───────────────────────────────
+    // Closes gaps #22/#23 from MCP_TOOL_GAPS.md — permissionAwareTest treats a 403 as a
+    // skip since it's unconfirmed whether this tenant's API client (direct or, if
+    // configured, Platform Gateway) has "Read SSO Settings"/"Read Self Service Branding
+    // Configuration" — same posture as every other permission-gated read in this file.
+    describe("SSO settings and Self Service branding", () => {
+
+        permissionAwareTest("get SSO settings returns configuration type and enabled flags", async () => {
+            const data: any = await client.getSsoSettings();
+            assert.ok(typeof data.ssoEnabled === "boolean");
+            assert.ok(typeof data.configurationType === "string");
+        });
+
+        permissionAwareTest("get Self Service macOS branding returns paginated results", async () => {
+            const data = await client.getSelfServiceBranding();
+            assert.ok(typeof data.totalCount === "number");
+            assert.ok(Array.isArray(data.results));
+            if (data.results.length > 0) {
+                assert.ok(data.results[0].id !== undefined);
             }
         });
     });

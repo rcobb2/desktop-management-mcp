@@ -150,6 +150,33 @@ describe("IntuneClient", () => {
         });
     });
 
+    // ── Device group memberships ───────────────────────────────────────────────
+    // Regression test for gap #12 (MCP_TOOL_GAPS.md): azureADGroups previously came back
+    // empty for every device, including ones independently confirmed to be real group
+    // members. Root cause was passing managedDevice.azureADDeviceId (the AAD device
+    // object's `deviceId` alternate-key property, not its `id`) into the `/devices/{id}/...`
+    // path form — a 404 the old code's catch block swallowed into a silent empty result.
+    // Needs both TEST_INTUNE_DEVICE_NAME (an enrolled device name) and
+    // TEST_INTUNE_DEVICE_GROUP_NAME (a group that device is a known direct member of) since
+    // there's no way to assert the fix actually returns real data without a known-good pair.
+    describe("Device group memberships", () => {
+        const deviceName = process.env.TEST_INTUNE_DEVICE_NAME;
+        const expectedGroupName = process.env.TEST_INTUNE_DEVICE_GROUP_NAME;
+        if (!deviceName || !expectedGroupName) return;
+
+        permissionAwareTest("azureADGroups includes a device's known group membership", async () => {
+            const device = await client.getManagedDeviceByName(deviceName);
+            assert.ok(device?.azureADDeviceId, `test device "${deviceName}" has no azureADDeviceId`);
+            const data = await client.getDeviceGroupMemberships(device.id, device.azureADDeviceId);
+            assert.ok(Array.isArray(data.azureADGroups), "azureADGroups should be an array");
+            const names = data.azureADGroups.map((g: any) => g.displayName);
+            assert.ok(
+                names.includes(expectedGroupName),
+                `expected azureADGroups to include "${expectedGroupName}", got: ${JSON.stringify(names)}`
+            );
+        });
+    });
+
     // ── Write operations ──────────────────────────────────────────────────────
     describe("Write operations", () => {
         skipWrite("create, update, assign, and delete an Android compliance policy", async (t: any) => {

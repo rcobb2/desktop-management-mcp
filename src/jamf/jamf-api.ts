@@ -3040,6 +3040,136 @@ export class JamfClient {
         }
     }
 
+    // Deletes a macOS configuration profile by name or ID — closes gap #24 from
+    // MCP_TOOL_GAPS.md, found 2026-07-31 needing to delete 3 confirmed-dead "Jamf Connect"
+    // test profiles (unscoped, Category: Testing) with jamf_create_configuration_profile/
+    // jamf_get_configuration_profile/jamf_list_configuration_profiles having no delete
+    // counterpart.
+    //
+    // CONFIRMED LIVE 2026-08-06, and a real correction to an earlier finding: the direct
+    // client's Classic API DELETE (`/JSSResource/osxconfigurationprofiles/id/{id}`) returns
+    // the exact same generic pre-auth 401 HTML page already documented for computers/
+    // computercommands (gap #9/#21) — this Classic API sub-resource rejects OAuth
+    // client-credentials auth entirely for DELETE, same as those. But unlike computers,
+    // there's no modern (v1/v3) REST equivalent for macOS configuration profiles to fall
+    // back to via the Gateway's normal `/pro/v{n}/tenant/{tenantId}/...` mapping (Classic
+    // API only, no `restGet()`-style mirror exists). Testing the Gateway's OWN Classic API
+    // access (`platform-api=Classic API` in Jamf's OpenAPI specs) found the CLAUDE.md note
+    // above marking Classic API as one of only two things this Gateway credential can't
+    // reach was itself based on a malformed path — `GET /api/proclassic/JSSResource/categories`
+    // (no tenant segment, stray `/JSSResource/` prefix) does 403 with BAD_PERMISSIONS, but
+    // the spec's actual documented shape is base URL `https://{region}.apigw.jamf.com/api/proclassic`
+    // + path `/tenant/{tenantId}/{resource}` — NO `/JSSResource/` segment at all. Retried
+    // `GET {base}/proclassic/tenant/{tenantId}/categories` with that corrected shape and got a
+    // clean 200 with real category data — meaning the Gateway DOES have Classic API access,
+    // the earlier "confirmed exception" was a path-shape bug in how it was tested, not a real
+    // permission boundary. The same corrected shape applied to DELETE
+    // (`{base}/proclassic/tenant/{tenantId}/osxconfigurationprofiles/id/{id}`) returned a
+    // clean 200 and was confirmed live end-to-end (create via upsertConfigurationProfile,
+    // delete via this method, verified gone via a follow-up getConfigurationProfileDetail
+    // 404) against a real throwaway unscoped profile. This likely also reopens gap #1's
+    // "known permission gap" (no delete for Scripts/Policies/Smart Groups via the direct
+    // client) as something worth re-testing through this same corrected Gateway Classic
+    // path — not done here, out of scope for this change, but flagged as a real lead.
+    public async deleteConfigurationProfile(nameOrId: string) {
+        await this.ensureAuthenticated();
+        await this.ensurePlatformAuthenticated();
+        const tenantId = this.getPlatformTenantId();
+        let id: string;
+        let name = nameOrId;
+        if (/^\d+$/.test(nameOrId)) {
+            id = nameOrId;
+        } else {
+            const found = await this.findConfigurationProfileByName(nameOrId);
+            if (!found) throw new Error(`Configuration profile not found: "${nameOrId}"`);
+            id = String(found.id);
+            name = found.name;
+        }
+        this.logger.info('Deleting configuration profile', { nameOrId, id });
+        try {
+            const apiStart = Date.now();
+            const path = `/proclassic/tenant/${tenantId}/osxconfigurationprofiles/id/${id}`;
+            const response = await this.platformClient.delete(path);
+            logApiCall(this.logger, 'DELETE', path, response.status, Date.now() - apiStart);
+            this.logger.info('Configuration profile deleted', { id, name });
+            return { success: true, id, name };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                throw new Error(`Configuration profile "${nameOrId}" not found.`);
+            }
+            this.logger.error('Error deleting configuration profile', { nameOrId, error: (error as Error).message });
+            logApiCall(this.logger, 'DELETE', `/proclassic/tenant/${tenantId}/osxconfigurationprofiles/id/${id}`, undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Reads Jamf Pro's Global SSO/SAML configuration (Settings > System > Single Sign-On) —
+    // closes gap #22 from MCP_TOOL_GAPS.md, found 2026-07-31 troubleshooting a fleet-wide
+    // Self Service "An unknown error has occurred" screen appearing right after users
+    // complete Entra sign-in. This is a genuinely different Jamf feature from the Cloud
+    // Identity Provider (jamf_test_directory_lookup, LDAP-style directory search) — SSO
+    // settings govern Self Service/enrollment SAML/OIDC login itself. Folds in the SSO
+    // signing certificate's status/expiration (GET /v2/sso/cert) as a best-effort extra
+    // field, same non-fatal-sub-call pattern as getBlueprintDetail's report/
+    // getComplianceBenchmarkDetail's compliance-percentage — a cert-read failure (e.g. a
+    // tenant configured for OIDC only, with no SAML certificate at all) doesn't fail the
+    // whole settings read. Routed through restGet() like every other non-Classic REST GET
+    // in this file — Gateway-or-direct depending on JAMF_PLATFORM_* configuration.
+    public async getSsoSettings() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching SSO settings');
+        try {
+            const apiStart = Date.now();
+            const response = await this.restGet('/api/v3/sso');
+            logApiCall(this.logger, 'GET', '/api/v3/sso', response.status, Date.now() - apiStart);
+
+            let certificate: any = null;
+            try {
+                const certStart = Date.now();
+                const certResponse = await this.restGet('/api/v2/sso/cert');
+                logApiCall(this.logger, 'GET', '/api/v2/sso/cert', certResponse.status, Date.now() - certStart);
+                certificate = certResponse.data;
+            } catch (certError) {
+                this.logger.warn('Error fetching SSO certificate detail (non-fatal)', { error: (certError as Error).message });
+            }
+
+            this.logger.info('SSO settings retrieved');
+            return { ...response.data, certificate };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read SSO Settings' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching SSO settings', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v3/sso', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    // Reads Self Service's macOS branding configuration (Settings > Self Service >
+    // Branding — app name, header image, home heading/subheading) — closes gap #23 from
+    // MCP_TOOL_GAPS.md, found in the same 2026-07-31 Self Service SSO investigation as
+    // gap #22. Jamf Pro's search returns a paged list (`results`), even though this
+    // tenant (and most tenants) only ever configures one macOS branding profile.
+    public async getSelfServiceBranding() {
+        await this.ensureAuthenticated();
+        this.logger.info('Fetching Self Service macOS branding configuration');
+        try {
+            const apiStart = Date.now();
+            const response = await this.restGet('/api/v1/self-service/branding/macos');
+            logApiCall(this.logger, 'GET', '/api/v1/self-service/branding/macos', response.status, Date.now() - apiStart);
+            const results: any[] = response.data.results ?? [];
+            this.logger.info('Self Service branding configuration retrieved', { count: results.length });
+            return { totalCount: response.data.totalCount ?? results.length, results };
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) {
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Self Service Branding Configuration'/'Read Self Service' permissions in JAMF Pro.`);
+            }
+            this.logger.error('Error fetching Self Service branding configuration', { error: (error as Error).message });
+            logApiCall(this.logger, 'GET', '/api/v1/self-service/branding/macos', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
     public async getPatchPolicies(page?: number, pageSize?: number) {
         await this.ensureAuthenticated();
         this.logger.info('Fetching patch policies', { page, pageSize });

@@ -24,6 +24,7 @@ interface IntunewinEncryptionInfo {
 
 interface ParsedIntunewinPackage {
     setupFileName: string;
+    contentFileName: string;
     unencryptedContentSize: number;
     encryptionInfo: IntunewinEncryptionInfo;
     encryptedContent: Buffer;
@@ -45,7 +46,12 @@ function readIntunewinZipEntries(buffer: Buffer): Promise<{ detectionXml?: Buffe
             zipfile.on('entry', (entry) => {
                 const isDir = /\/$/.test(entry.fileName);
                 const isDetection = /Metadata\/Detection\.xml$/i.test(entry.fileName);
-                const isContent = /^Contents\//i.test(entry.fileName) && !isDir;
+                // Real Content Prep Tool output nests everything under an
+                // IntuneWinPackage/ prefix (e.g. IntuneWinPackage/Contents/...),
+                // not a bare top-level Contents/ — match the segment anywhere
+                // in the path, consistent with the suffix-anchored Detection.xml
+                // check above, rather than requiring it at the start.
+                const isContent = /(^|\/)Contents\//i.test(entry.fileName) && !isDir;
                 if (isDir || (!isDetection && !isContent)) {
                     zipfile.readEntry();
                     return;
@@ -79,6 +85,13 @@ async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPac
     const xml = entries.detectionXml.toString('utf8');
     return {
         setupFileName: extractDetectionXmlTag(xml, 'SetupFile'),
+        // <FileName> is the encrypted content archive's own name (e.g.
+        // "IntunePackage.intunewin") — a mobileAppContentFile's `name` must
+        // be this, not the setup/install script name (<SetupFile>, used
+        // separately as the app's setupFilePath). Confirmed against a real
+        // Content Prep Tool-produced Detection.xml — the two tags are
+        // distinct and neither is a fallback for the other.
+        contentFileName: extractDetectionXmlTag(xml, 'FileName'),
         unencryptedContentSize: parseInt(extractDetectionXmlTag(xml, 'UnencryptedContentSize'), 10),
         encryptionInfo: {
             encryptionKey: extractDetectionXmlTag(xml, 'EncryptionKey'),
@@ -892,18 +905,27 @@ export class IntuneClient {
                 this.logger.warn('Failed to fetch Intune device categories', { deviceId, error: (error as Error).message });
             }
 
-            // Get Azure AD group memberships if azureADDeviceId is provided
+            // Get Azure AD group memberships if azureADDeviceId is provided.
+            // managedDevice.azureADDeviceId is the AAD device object's `deviceId` alternate-key
+            // property (the GUID `dsregcmd /status` calls "Device Id"), NOT its `id` (object ID) —
+            // confirmed against Graph's own device-get/device-list-memberof docs, which document
+            // two distinct address forms: `/devices/{id}` (object ID) vs `/devices(deviceId='{deviceId}')`
+            // (alternate key). Plugging azureADDeviceId into the `/devices/{id}/...` form 404s (wrong
+            // ID space) — silently, since the catch below only logs a warning — which is exactly the
+            // "azureADGroups always empty" symptom (gap #12) for a device independently confirmed to be
+            // a real group member. Fixed by using the alternate-key path form instead.
             if (azureADDeviceId) {
                 try {
                     const apiStart = Date.now();
+                    const path = `/devices(deviceId='${azureADDeviceId}')/memberOf`;
                     const groupsResponse = await this.client
-                        .api(`/devices/${azureADDeviceId}/memberOf`)
+                        .api(path)
                         .version('v1.0')
                         .select('id,displayName,mail,description,mailEnabled,securityEnabled')
                         .get();
-                    
+
                     const apiDuration = Date.now() - apiStart;
-                    logApiCall(this.logger, 'GET', `/devices/${azureADDeviceId}/memberOf`, 200, apiDuration);
+                    logApiCall(this.logger, 'GET', path, 200, apiDuration);
 
                     result.azureADGroups = groupsResponse.value || [];
                     this.logger.info('Azure AD group memberships retrieved', { azureADDeviceId, groupCount: result.azureADGroups.length });
@@ -2821,7 +2843,7 @@ export class IntuneClient {
                 .version('beta')
                 .post({
                     '@odata.type': '#microsoft.graph.mobileAppContentFile',
-                    name: pkg.setupFileName,
+                    name: pkg.contentFileName,
                     size: pkg.unencryptedContentSize,
                     sizeEncrypted: pkg.encryptedContent.length,
                     isDependency: false,
@@ -2856,6 +2878,112 @@ export class IntuneClient {
             });
             throw error;
         }
+    }
+
+    // Assigns an existing app (Win32 or otherwise) to one or more Entra ID groups.
+    // Creates a Proactive Remediation script package (deviceHealthScript,
+    // beta surface) - a detection+remediation PowerShell script pair. The
+    // "Run remediation" on-demand device action (Devices > Windows >
+    // [device] > ... > Run remediation) targets one of these directly, but
+    // still requires the package to already be assigned to reach that
+    // device before the on-demand button is available - see
+    // assignRemediation below. Content is raw script text; base64 encoding
+    // happens here so callers can pass plain strings.
+    public async createRemediation(params: {
+        displayName: string;
+        description: string;
+        publisher: string;
+        detectionScriptContent: string;
+        remediationScriptContent: string;
+        runAsAccount?: 'system' | 'user';
+        runAs32Bit?: boolean;
+        enforceSignatureCheck?: boolean;
+    }) {
+        this.logger.info('Creating remediation script package', { displayName: params.displayName });
+        await this.trackAuthAttempt();
+
+        const body = {
+            '@odata.type': '#microsoft.graph.deviceHealthScript',
+            displayName: params.displayName,
+            description: params.description,
+            publisher: params.publisher,
+            runAsAccount: params.runAsAccount ?? 'system',
+            runAs32Bit: params.runAs32Bit ?? false,
+            enforceSignatureCheck: params.enforceSignatureCheck ?? false,
+            detectionScriptContent: Buffer.from(params.detectionScriptContent, 'utf8').toString('base64'),
+            remediationScriptContent: Buffer.from(params.remediationScriptContent, 'utf8').toString('base64'),
+        };
+
+        const apiStart = Date.now();
+        const script = await this.client.api('/deviceManagement/deviceHealthScripts').version('beta').post(body);
+        logApiCall(this.logger, 'POST', '/deviceManagement/deviceHealthScripts', 201, Date.now() - apiStart);
+        return { id: script.id, displayName: params.displayName };
+    }
+
+    // Assigns a remediation script package to a group, with a required
+    // (but largely formal, for on-demand use) run schedule - the on-demand
+    // "Run remediation" action doesn't wait for this schedule, but Graph
+    // still requires a valid one to create the assignment at all.
+    //
+    // NOTE: Microsoft's own docs describe a plain POST to .../assignments
+    // creating one deviceHealthScriptAssignment at a time - confirmed LIVE
+    // this does not work ("No OData route exists that match template...").
+    // The working pattern, matching every other Intune resource's bulk
+    // assignment action (Win32 apps' mobileAppAssignments, compliance
+    // policies' deviceCompliancePolicyAssignments, etc.), is POST .../assign
+    // with the assignment list wrapped in deviceHealthScriptAssignments.
+    //
+    // SEPARATE CONFIRMED QUIRK: runRemediationScript reads back false via
+    // GET immediately after being sent as true (reproduced twice, same
+    // group/script, 2026-08-06) - Graph silently resets it regardless of
+    // what's posted. Doesn't block the on-demand "Run remediation" device
+    // action (Microsoft's docs describe that action as bypassing the
+    // schedule/runRemediationScript entirely - it always runs both scripts
+    // when an admin fires it against one device), but the *scheduled*
+    // automatic run this flag controls may only ever run detection, never
+    // remediation, until Microsoft fixes this. Not worth fighting further
+    // here - confirm on-demand behavior against a real device before
+    // relying on the schedule for anything.
+    public async assignRemediation(scriptId: string, groupId: string, intervalDays: number = 1) {
+        this.logger.info('Assigning remediation script to group', { scriptId, groupId });
+        await this.trackAuthAttempt();
+
+        const body = {
+            deviceHealthScriptAssignments: [
+                {
+                    target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId },
+                    runRemediationScript: true,
+                    runSchedule: { '@odata.type': '#microsoft.graph.deviceHealthScriptDailySchedule', interval: intervalDays, useUtc: false, time: '03:00:00' },
+                },
+            ],
+        };
+
+        const apiStart = Date.now();
+        const assignment = await this.client
+            .api(`/deviceManagement/deviceHealthScripts/${scriptId}/assign`)
+            .version('beta')
+            .post(body);
+        logApiCall(this.logger, 'POST', `deviceHealthScripts/${scriptId}/assign`, 200, Date.now() - apiStart);
+        return assignment;
+    }
+
+    // Triggers the "Run remediation" on-demand device action directly via
+    // Graph, bypassing whatever's hiding the button in this tenant's console
+    // (a preview-feature toggle, most likely - see initiateOnDemandProactiveRemediation's
+    // own docs: assignment to the target device/group is explicitly NOT
+    // required for on-demand use, so a missing UI button doesn't mean this
+    // action itself is blocked).
+    public async runRemediationNow(managedDeviceId: string, scriptId: string) {
+        this.logger.info('Triggering on-demand remediation run', { managedDeviceId, scriptId });
+        await this.trackAuthAttempt();
+
+        const apiStart = Date.now();
+        await this.client
+            .api(`/deviceManagement/managedDevices/${managedDeviceId}/initiateOnDemandProactiveRemediation`)
+            .version('beta')
+            .post({ ScriptPolicyId: scriptId });
+        logApiCall(this.logger, 'POST', `managedDevices/${managedDeviceId}/initiateOnDemandProactiveRemediation`, 204, Date.now() - apiStart);
+        return { managedDeviceId, scriptId };
     }
 
     // Assigns an existing app (Win32 or otherwise) to one or more Entra ID groups.
