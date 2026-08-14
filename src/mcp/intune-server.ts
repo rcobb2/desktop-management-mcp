@@ -1747,7 +1747,11 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                     "number. This is metadata only — it does NOT rename the device's OS hostname (see " +
                     "intune_set_device_name for that). Always re-resolves the device fresh via the bulk Autopilot " +
                     "list before writing, since these objects' internal IDs can be reissued after registration and " +
-                    "a cached ID silently 404s.",
+                    "a cached ID silently 404s; also re-reads the device's current group tag fresh right before " +
+                    "writing and re-sends it alongside the new name (confirmed live: setting displayName alone " +
+                    "fails with a generic backend error on this Graph action, undocumented by Microsoft). The " +
+                    "underlying backend has been observed to be independently flaky (a generic error that resolves " +
+                    "on retry) — retry once before concluding a real failure.",
                 inputSchema: {
                     serialNumber: z.string().describe("Autopilot device serial number"),
                     displayName: z.string().describe("The friendly name to set"),

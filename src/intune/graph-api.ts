@@ -3332,10 +3332,27 @@ export class IntuneClient {
         }
 
         try {
-            const path = `/deviceManagement/windowsAutopilotDeviceIdentities/${match.id}/updateDeviceProperties`;
+            // CONFIRMED LIVE 2026-08-14: posting `{ displayName }` alone to updateDeviceProperties
+            // fails 100% (2/2 real devices, both v1.0 and beta) with a generic backend error
+            // ("An error has occurred", proxy.msua08.manage.microsoft.com/DeviceEnrollmentFE) despite
+            // matching Microsoft's own documented request shape exactly — Microsoft's docs list
+            // displayName as an independently-optional field with no stated precondition. The fix,
+            // also confirmed live: the call succeeds once `groupTag` is included in the SAME POST body
+            // alongside `displayName`, even when unchanged. `listAutopilotDevices()`'s bulk result
+            // (`match.groupTag` above) is NOT safe to reuse here — separately confirmed live that this
+            // bulk endpoint can lag behind a device's true current state — so this re-fetches the
+            // group tag fresh via a direct single-object GET immediately before writing, the same
+            // "never trust a stale read before a write" posture already applied to the device ID
+            // itself (see this method's own staleness handling above).
+            const path = `/deviceManagement/windowsAutopilotDeviceIdentities/${match.id}`;
+            const freshStart = Date.now();
+            const fresh = await this.client.api(path).version('v1.0').get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - freshStart);
+
+            const writePath = `${path}/updateDeviceProperties`;
             const apiStart = Date.now();
-            await this.client.api(path).version('beta').post({ displayName });
-            logApiCall(this.logger, 'POST', path, 204, Date.now() - apiStart);
+            await this.client.api(writePath).version('v1.0').post({ displayName, groupTag: fresh.groupTag ?? '' });
+            logApiCall(this.logger, 'POST', writePath, 204, Date.now() - apiStart);
             this.logger.info('Autopilot friendly name updated', { serialNumber: normalizedSerial, autopilotId: match.id, displayName });
             return { serialNumber: normalizedSerial, autopilotId: match.id, displayName };
         } catch (error) {
