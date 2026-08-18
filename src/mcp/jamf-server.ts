@@ -82,6 +82,36 @@ function errorResult(err: unknown): { content: [{ type: "text"; text: string }];
     };
 }
 
+// Shared markdown renderer for a single computer's inventory detail — used by both
+// jamf_get_computer and jamf_get_computer_by_serial, which both call a client method
+// that returns the byte-identical /api/v3/computers-inventory-detail response shape
+// (getComputerByName/getComputerBySerial both resolve an ID then hit the same detail
+// endpoint). Previously each tool hand-rolled its own near-identical renderer, which is
+// how the two drifted into reading different (and in jamf_get_computer's case, wrong)
+// field paths for the same data — see the fix note in CLAUDE.md's code review section.
+function renderComputerDetail(data: any, fallbackName: string): string {
+    const hw = data.hardware ?? {};
+    const gen = data.general ?? {};
+    const loc = data.userAndLocation ?? data.location ?? {};
+    const os = data.operatingSystem ?? {};
+    return [
+        `## ${gen.name ?? fallbackName}`,
+        `- **Serial:** ${hw.serialNumber ?? "—"}`,
+        `- **Asset Tag:** ${gen.assetTag ?? "—"}`,
+        `- **Model:** ${hw.model ?? "—"} (${hw.modelIdentifier ?? "—"})`,
+        `- **OS:** ${os.name ?? "—"} ${os.version ?? ""}`,
+        `- **Last Check-in:** ${gen.lastContactTime ?? "—"}`,
+        `- **IP Address:** ${gen.lastIpAddress ?? "—"}`,
+        `- **Assigned User:** ${loc.username ?? "—"} (${loc.realname ?? "—"})`,
+        `- **Email:** ${loc.email ?? loc.emailAddress ?? "—"}`,
+        `- **Department:** ${loc.department ?? "—"}`,
+        `- **Site:** ${gen.site?.name ?? "None"}`,
+        `- **MDM Capable:** ${gen.mdmCapable?.capable ? "Yes" : "No"}`,
+        `- **Supervised:** ${gen.supervised ? "Yes" : "No"}`,
+        `- **Management:** ${gen.remoteManagement?.managed ? "Managed" : "Unmanaged"}`,
+    ].join("\n");
+}
+
 // ─── Server factory ──────────────────────────────────────────────────────────
 
 function createJamfMcpServer(roles: string[], caller: string): McpServer {
@@ -114,28 +144,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     if (!response || response.totalCount === 0) return notFound(`computer "${computerName}"`);
                     const data: any = response.results[0];
 
-                    const text = toText(response, response_format, () => {
-                        const hw = data.hardware ?? {};
-                        const gen = data.general ?? {};
-                        const loc = data.location ?? {};
-                        const os = data.operatingSystem ?? {};
-                        const lines = [
-                            `## ${gen.name ?? computerName}`,
-                            `- **Serial:** ${gen.serialNumber ?? "—"}`,
-                            `- **Asset Tag:** ${gen.assetTag ?? "—"}`,
-                            `- **Model:** ${hw.model ?? "—"} (${hw.modelIdentifier ?? "—"})`,
-                            `- **OS:** ${os.name ?? "—"} ${os.version ?? ""}`,
-                            `- **Last Check-in:** ${gen.lastContactTime ?? "—"}`,
-                            `- **IP Address:** ${gen.ipAddress ?? "—"}`,
-                            `- **Assigned User:** ${loc.username ?? "—"} (${loc.realname ?? "—"})`,
-                            `- **Email:** ${loc.emailAddress ?? "—"}`,
-                            `- **Site:** ${gen.site?.name ?? "None"}`,
-                            `- **MDM Capable:** ${gen.mdmCapable?.capable ? "Yes" : "No"}`,
-                            `- **Supervised:** ${gen.supervised ? "Yes" : "No"}`,
-                            `- **Management:** ${gen.remoteManagement?.managed ? "Managed" : "Unmanaged"}`,
-                        ];
-                        return lines.join("\n");
-                    });
+                    const text = toText(response, response_format, () => renderComputerDetail(data, computerName));
 
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
@@ -326,7 +335,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
             {
                 description:
                     "Get the list of Mac computers that currently belong to a JAMF Pro smart computer group. " +
-                    "Returns member names, serials, models, and last check-in times. " +
+                    "Returns each member's name and serial number. " +
                     "Use jamf_list_smart_groups first to find a group ID.",
                 inputSchema: {
                     groupId: z.string().describe("The JAMF Pro ID of the smart computer group"),
@@ -337,16 +346,18 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
             async ({ groupId, response_format = "markdown" }) => {
                 try {
                     const data = await client.getSmartComputerGroupMembers(groupId);
-                    // getSmartComputerGroupMembers returns { totalCount, members }
+                    // getSmartComputerGroupMembers returns { totalCount, members }, each member
+                    // { id, name, serialNumber } — the group-detail response this is now sourced
+                    // from (see that method's doc comment) doesn't carry model/last-check-in, so
+                    // this description and rendering no longer promise fields that were never
+                    // actually populated (the previous per-member fetch discarded everything but
+                    // name anyway).
                     const members: any[] = (data as any).members ?? [];
 
                     const text = toText(data, response_format, () => {
                         if (members.length === 0) return `Smart group ${groupId} has no members.`;
                         const rows = members
-                            .map((m: any) => {
-                                const gen = m.general ?? m;
-                                return `- **${gen.name ?? "Unknown"}** | Serial: ${gen.serialNumber ?? "—"} | Model: ${m.hardware?.model ?? "—"} | Last seen: ${gen.lastContactTime ?? "—"}`;
-                            })
+                            .map((m: any) => `- **${m.name ?? "Unknown"}** | Serial: ${m.serialNumber ?? "—"}`)
                             .join("\n");
                         return `## Smart Group ${groupId} Members (${members.length})\n\n${rows}`;
                     });
@@ -415,7 +426,10 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
             async ({ response_format = "markdown" }) => {
                 try {
                     const data = await client.getStaticComputerGroups();
-                    const groups: any[] = Array.isArray(data) ? data : [];
+                    // getStaticComputerGroups() always returns { totalCount, computerGroups },
+                    // never a bare array — this used to check Array.isArray(data), which was
+                    // always false, so the markdown branch always reported zero groups.
+                    const groups: any[] = Array.isArray((data as any).computerGroups) ? (data as any).computerGroups : [];
 
                     const text = toText(data, response_format, () => {
                         if (groups.length === 0) return "No static computer groups found.";
@@ -818,38 +832,23 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     "Look up a Mac in JAMF Pro by its serial number. " +
                     "Returns full inventory detail: hardware specs, OS, user assignment, IP, site, and management status.",
                 inputSchema: {
-                    serial: z.string().describe("The serial number of the Mac (e.g. C02ABC123DEF)"),
+                    serialNumber: z.string().optional().describe("The serial number of the Mac (e.g. C02ABC123DEF)"),
+                    serial: z.string().optional().describe('Deprecated alias for serialNumber, kept for backward compatibility — prefer "serialNumber", which every other serial-number param across both servers uses.'),
                     response_format: ResponseFormatSchema,
                 },
                 annotations: { readOnlyHint: true, openWorldHint: true },
             },
-            async ({ serial, response_format = "markdown" }) => {
+            async ({ serialNumber, serial, response_format = "markdown" }) => {
                 try {
-                    const response = await client.getComputerBySerial(serial.trim().toUpperCase());
-                    if (!response || response.totalCount === 0) return notFound(`serial number "${serial}"`);
+                    const targetSerial = serialNumber ?? serial;
+                    if (!targetSerial) {
+                        return { isError: true, content: [{ type: "text", text: "Error: provide serialNumber." }] };
+                    }
+                    const response = await client.getComputerBySerial(targetSerial.trim().toUpperCase());
+                    if (!response || response.totalCount === 0) return notFound(`serial number "${targetSerial}"`);
                     const data: any = response.results[0];
 
-                    const text = toText(response, response_format, () => {
-                        const hw = data.hardware ?? {};
-                        const gen = data.general ?? {};
-                        const loc = data.userAndLocation ?? data.location ?? {};
-                        const os = data.operatingSystem ?? {};
-                        return [
-                            `## ${gen.name ?? serial}`,
-                            `- **Serial:** ${hw.serialNumber ?? "—"}`,
-                            `- **Asset Tag:** ${gen.assetTag ?? "—"}`,
-                            `- **Model:** ${hw.model ?? "—"} (${hw.modelIdentifier ?? "—"})`,
-                            `- **OS:** ${os.name ?? "—"} ${os.version ?? ""}`,
-                            `- **Last Check-in:** ${gen.lastContactTime ?? "—"}`,
-                            `- **IP Address:** ${gen.lastIpAddress ?? "—"}`,
-                            `- **Assigned User:** ${loc.username ?? "—"} (${loc.realname ?? "—"})`,
-                            `- **Email:** ${loc.email ?? loc.emailAddress ?? "—"}`,
-                            `- **Department:** ${loc.department ?? "—"}`,
-                            `- **Site:** ${gen.site?.name ?? "None"}`,
-                            `- **MDM Capable:** ${gen.mdmCapable?.capable ? "Yes" : "No"}`,
-                            `- **Supervised:** ${gen.supervised ? "Yes" : "No"}`,
-                        ].join("\n");
-                    });
+                    const text = toText(response, response_format, () => renderComputerDetail(data, targetSerial));
 
                     return { content: [{ type: "text", text }] };
                 } catch (err) {
@@ -1726,7 +1725,14 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                             `## FileVault Status — ${(data as any).name ?? computerNameOrSerial}`,
                             `- **Serial:** ${(data as any).serialNumber ?? "—"}`,
                             `- **Overall State:** ${fv.bootPartitionEncryptionDetails?.partitionFileVault2State ?? fv.overallEncryptionStatus ?? "—"}`,
-                            `- **Recovery Key Escrowed:** ${fv.institutionalRecoveryKeyPresent ? "Yes" : fv.individualRecoveryKeyPresent ? "Yes (personal)" : "No"}`,
+                            // individualRecoveryKeyPresent doesn't exist on this object — the real
+                            // field (confirmed against jamf_list_filevault_status, which reads the
+                            // identical bulk shape correctly, and against Jamf's own
+                            // ComputerInventoryFileVault schema) is individualRecoveryKeyValidityStatus,
+                            // one of VALID/INVALID/UNKNOWN/NOT_APPLICABLE. Only NOT_APPLICABLE means no
+                            // individual key exists at all — UNKNOWN means Jamf can't currently verify
+                            // one that likely still exists, not that there is none.
+                            `- **Recovery Key Escrowed:** ${fv.institutionalRecoveryKeyPresent ? "Yes" : fv.individualRecoveryKeyValidityStatus && fv.individualRecoveryKeyValidityStatus !== "NOT_APPLICABLE" ? `Yes (personal, ${fv.individualRecoveryKeyValidityStatus})` : "No"}`,
                         ];
                         if (partitions.length > 0) {
                             lines.push("", "**Partitions:**");

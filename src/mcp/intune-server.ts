@@ -79,7 +79,16 @@ async function resolveDevice(
     client: IntuneClient,
     opts: { deviceName?: string; deviceId?: string; serialNumber?: string }
 ): Promise<{ deviceId: string; azureADDeviceId?: string } | null> {
-    if (opts.deviceId) return { deviceId: opts.deviceId };
+    if (opts.deviceId) {
+        // Used to return { deviceId } with no lookup at all — unlike the deviceName/
+        // serialNumber branches below, which both resolve azureADDeviceId. Any tool
+        // needing it (e.g. intune_get_device_groups' Azure AD group lookup) silently got
+        // an always-empty result when called with a bare deviceId specifically, the exact
+        // identifier this function's own schema advertises accepting.
+        const device = await client.getManagedDeviceById(opts.deviceId);
+        if (device) return { deviceId: device.id, azureADDeviceId: device.azureADDeviceId };
+        return { deviceId: opts.deviceId };
+    }
 
     if (opts.deviceName) {
         const device = await client.getManagedDeviceByName(opts.deviceName);
@@ -96,18 +105,23 @@ async function resolveDevice(
     return null;
 }
 
+// Shared "exact match else first result" name-match picker — was reimplemented identically
+// in all four resolve*ByName functions below (only the item array and name-key differed).
+function pickBestNameMatch<T>(items: T[], name: string, nameKey: keyof T = "name" as keyof T): T | null {
+    if (items.length === 0) return null;
+    const lower = name.toLowerCase();
+    const exact = items.find((item) => String(item[nameKey] ?? "").toLowerCase() === lower);
+    return exact ?? items[0];
+}
+
 async function resolveAppByName(
     client: IntuneClient,
     appName: string
 ): Promise<{ appId: string; appName: string } | null> {
     const deployments = await client.getAppDeployments({ appName });
     const apps: any[] = Array.isArray(deployments.apps) ? deployments.apps : [];
-    if (apps.length === 0) return null;
-
-    const lower = appName.toLowerCase();
-    const exact = apps.find((a: any) => String(a.name ?? "").toLowerCase() === lower);
-    const match = exact ?? apps[0];
-    return { appId: match.id, appName: match.name };
+    const match = pickBestNameMatch(apps, appName);
+    return match ? { appId: match.id, appName: match.name } : null;
 }
 
 async function resolvePolicyByName(
@@ -119,12 +133,8 @@ async function resolvePolicyByName(
     let all: any[] = Array.isArray(result.combined) ? result.combined : [];
 
     if (source && source !== "auto") all = all.filter((p: any) => p.source === source);
-    if (all.length === 0) return null;
-
-    const lower = policyName.toLowerCase();
-    const exact = all.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
-    const match = exact ?? all[0];
-    return { policyId: match.id, policyName: match.name, source: match.source };
+    const match = pickBestNameMatch(all, policyName);
+    return match ? { policyId: match.id, policyName: match.name, source: match.source } : null;
 }
 
 async function resolveCompliancePolicyByName(
@@ -133,12 +143,8 @@ async function resolveCompliancePolicyByName(
 ): Promise<{ policyId: string; policyName: string } | null> {
     const result = await client.getCompliancePolicies({ policyName });
     const policies: any[] = Array.isArray(result.policies) ? result.policies : [];
-    if (policies.length === 0) return null;
-
-    const lower = policyName.toLowerCase();
-    const exact = policies.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
-    const match = exact ?? policies[0];
-    return { policyId: match.id, policyName: match.name };
+    const match = pickBestNameMatch(policies, policyName);
+    return match ? { policyId: match.id, policyName: match.name } : null;
 }
 
 async function resolveAppConfigurationPolicyByName(
@@ -147,12 +153,55 @@ async function resolveAppConfigurationPolicyByName(
 ): Promise<{ id: string; name: string } | null> {
     const result = await client.getAppConfigurationPolicies({ name });
     const policies: any[] = Array.isArray(result.policies) ? result.policies : [];
-    if (policies.length === 0) return null;
+    const match = pickBestNameMatch(policies, name);
+    return match ? { id: match.id, name: match.name } : null;
+}
 
-    const lower = name.toLowerCase();
-    const exact = policies.find((p: any) => String(p.name ?? "").toLowerCase() === lower);
-    const match = exact ?? policies[0];
-    return { id: match.id, name: match.name };
+// Shared "accept an ID directly, or resolve one by name" pattern — repeated across roughly
+// ten read/update/assign tool handlers below, each with its own ~10-14 line copy of: use the
+// ID if given; else resolve by name via a lookup function, notFound() if that comes up empty;
+// else return a "provide X or Y" error. entityLabel/missingParamsText are passed per call site
+// so the user-facing wording stays exactly what each tool already had.
+type ResolveIdOrNameResult<R> =
+    | { ok: true; id: string; resolved: R | null }
+    | { ok: false; errorResult: { isError: true; content: [{ type: "text"; text: string }] } };
+
+async function resolveIdOrName<R>(
+    idParam: string | undefined,
+    nameParam: string | undefined,
+    resolveByName: (name: string) => Promise<R | null>,
+    extractId: (resolved: R) => string,
+    entityLabel: string,
+    missingParamsText: string
+): Promise<ResolveIdOrNameResult<R>> {
+    if (idParam) return { ok: true, id: idParam, resolved: null };
+    if (nameParam) {
+        const resolved = await resolveByName(nameParam);
+        if (!resolved) return { ok: false, errorResult: notFound(`${entityLabel} "${nameParam}"`) };
+        return { ok: true, id: extractId(resolved), resolved };
+    }
+    return { ok: false, errorResult: { isError: true, content: [{ type: "text", text: missingParamsText }] } };
+}
+
+// Shared "resolvedSource must be known before an ID-only call to a policy tool can proceed"
+// check — repeated verbatim across intune_assign_policy, intune_get_configuration_profile, and
+// intune_update_configuration_profile. Only fires when policyId was given directly (name-based
+// resolution always already knows the source).
+function resolvePolicySourceOrError(
+    resolvedSource: "classic" | "settingsCatalog" | undefined,
+    source: "classic" | "settingsCatalog" | "auto"
+): { ok: true; source: "classic" | "settingsCatalog" } | { ok: false; errorResult: { isError: true; content: [{ type: "text"; text: string }] } } {
+    if (resolvedSource) return { ok: true, source: resolvedSource };
+    if (source === "auto") {
+        return {
+            ok: false,
+            errorResult: {
+                isError: true,
+                content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }],
+            },
+        };
+    }
+    return { ok: true, source };
 }
 
 const DeviceIdentifierSchema = {
@@ -517,7 +566,10 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const d = data as any;
                         const label = deviceName ?? deviceId ?? serialNumber ?? resolved.deviceId;
                         const detected: any[] = d.detectedApps ?? [];
-                        const intune: any[] = d.intuneApps ?? [];
+                        // getDeviceApplications returns this field as `assignedApps` — was
+                        // `intuneApps` here, a field that never existed on the response, so this
+                        // section always rendered empty regardless of real data.
+                        const intune: any[] = d.assignedApps ?? [];
 
                         const detectedSection =
                             detected.length > 0
@@ -530,7 +582,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         const intuneSection =
                             intune.length > 0
                                 ? `### Intune App Deployments (${intune.length})\n${intune
-                                      .map((a: any) => `- **${a.displayName}** | Intent: ${a.intent ?? "—"} | State: ${a.installState ?? a.installSummary?.installedDeviceCount ?? "—"}`)
+                                      .map((a: any) => `- **${a.displayName}** | Intent: ${a.mobileAppIntent ?? a.intent ?? "—"} | State: ${a.installState ?? "—"}`)
                                       .join("\n")}`
                                 : "### Intune App Deployments\n_None_";
 
@@ -855,7 +907,11 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
 
                             const findings: any[] = d.findings ?? [];
                             const recommendations: any[] = d.recommendations ?? [];
-                            const state = d.deploymentState ?? d.policyState;
+                            // getGuidedPolicyTroubleshooting never returns a `deploymentState` field;
+                            // `policyState` is the whole matched policy-state object (id/displayName/
+                            // state/errorCode/...), not a string — interpolating it directly rendered
+                            // the literal text "[object Object]".
+                            const state = d.policyState?.state ?? d.deploymentState;
 
                             const stateSection = state ? `**Deployment State:** ${state}` : "";
                             const findingsSection =
@@ -1905,34 +1961,20 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ policyId, policyName, source = "auto", group, exclude, filterId, filterType, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedPolicyId = policyId;
-                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
-                    let resolvedName = policyName;
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolvePolicyByName(client, n, source),
+                        (r) => r.policyId,
+                        "policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedPolicyId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
-                    if (!resolvedPolicyId && policyName) {
-                        const resolved = await resolvePolicyByName(client, policyName, source);
-                        if (!resolved) return notFound(`policy "${policyName}"`);
-                        resolvedPolicyId = resolved.policyId;
-                        resolvedSource = resolved.source;
-                        resolvedName = resolved.policyName;
-                    }
-
-                    if (!resolvedPolicyId) {
-                        return {
-                            isError: true,
-                            content: [{ type: "text", text: "Error: provide policyId or policyName." }],
-                        };
-                    }
-
-                    if (!resolvedSource) {
-                        if (source === "auto") {
-                            return {
-                                isError: true,
-                                content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }],
-                            };
-                        }
-                        resolvedSource = source;
-                    }
+                    const sourceOrError = resolvePolicySourceOrError(resolvedIdOrError.resolved?.source, source);
+                    if (!sourceOrError.ok) return sourceOrError.errorResult;
+                    const resolvedSource = sourceOrError.source;
 
                     const result = await client.assignConfigurationPolicyToGroup(resolvedPolicyId, resolvedSource, group, {
                         exclude,
@@ -1990,22 +2032,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ appId, appName, group, intent = "required", exclude, filterId, filterType, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedAppId = appId;
-                    let resolvedAppName = appName;
-
-                    if (!resolvedAppId && appName) {
-                        const resolved = await resolveAppByName(client, appName);
-                        if (!resolved) return notFound(`app "${appName}"`);
-                        resolvedAppId = resolved.appId;
-                        resolvedAppName = resolved.appName;
-                    }
-
-                    if (!resolvedAppId) {
-                        return {
-                            isError: true,
-                            content: [{ type: "text", text: "Error: provide appId or appName." }],
-                        };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        appId, appName,
+                        (n) => resolveAppByName(client, n),
+                        (r) => r.appId,
+                        "app",
+                        "Error: provide appId or appName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedAppId = resolvedIdOrError.id;
+                    const resolvedAppName = resolvedIdOrError.resolved?.appName ?? appName;
 
                     const result = await client.assignAppToGroup(resolvedAppId, group, intent, { exclude, filterId, filterType });
 
@@ -2053,34 +2089,20 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             },
             async ({ policyId, policyName, source = "auto", response_format = "markdown" }) => {
                 try {
-                    let resolvedPolicyId = policyId;
-                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
-                    let resolvedName = policyName;
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolvePolicyByName(client, n, source),
+                        (r) => r.policyId,
+                        "policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedPolicyId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
-                    if (!resolvedPolicyId && policyName) {
-                        const resolved = await resolvePolicyByName(client, policyName, source);
-                        if (!resolved) return notFound(`policy "${policyName}"`);
-                        resolvedPolicyId = resolved.policyId;
-                        resolvedSource = resolved.source;
-                        resolvedName = resolved.policyName;
-                    }
-
-                    if (!resolvedPolicyId) {
-                        return {
-                            isError: true,
-                            content: [{ type: "text", text: "Error: provide policyId or policyName." }],
-                        };
-                    }
-
-                    if (!resolvedSource) {
-                        if (source === "auto") {
-                            return {
-                                isError: true,
-                                content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }],
-                            };
-                        }
-                        resolvedSource = source;
-                    }
+                    const sourceOrError = resolvePolicySourceOrError(resolvedIdOrError.resolved?.source, source);
+                    if (!sourceOrError.ok) return sourceOrError.errorResult;
+                    const resolvedSource = sourceOrError.source;
 
                     const detail = await client.getConfigurationPolicyDetail(resolvedPolicyId, resolvedSource);
 
@@ -2182,17 +2204,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             },
             async ({ policyId, policyName, response_format = "markdown" }) => {
                 try {
-                    let resolvedId = policyId;
-                    let resolvedName = policyName;
-                    if (!resolvedId && policyName) {
-                        const resolved = await resolveCompliancePolicyByName(client, policyName);
-                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
-                        resolvedId = resolved.policyId;
-                        resolvedName = resolved.policyName;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolveCompliancePolicyByName(client, n),
+                        (r) => r.policyId,
+                        "compliance policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
                     const detail = await client.getCompliancePolicyDetail(resolvedId);
 
@@ -2276,17 +2297,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ policyId, policyName, updates, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedId = policyId;
-                    let resolvedName = policyName;
-                    if (!resolvedId && policyName) {
-                        const resolved = await resolveCompliancePolicyByName(client, policyName);
-                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
-                        resolvedId = resolved.policyId;
-                        resolvedName = resolved.policyName;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolveCompliancePolicyByName(client, n),
+                        (r) => r.policyId,
+                        "compliance policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
                     const result = await client.updateAndroidCompliancePolicy(resolvedId, updates);
 
@@ -2326,17 +2346,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ policyId, policyName, group, exclude, filterId, filterType, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedId = policyId;
-                    let resolvedName = policyName;
-                    if (!resolvedId && policyName) {
-                        const resolved = await resolveCompliancePolicyByName(client, policyName);
-                        if (!resolved) return notFound(`compliance policy "${policyName}"`);
-                        resolvedId = resolved.policyId;
-                        resolvedName = resolved.policyName;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolveCompliancePolicyByName(client, n),
+                        (r) => r.policyId,
+                        "compliance policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
                     const result = await client.assignCompliancePolicyToGroup(resolvedId, group, { exclude, filterId, filterType });
 
@@ -2422,26 +2441,20 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ policyId, policyName, source = "auto", name, description, settings, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedId = policyId;
-                    let resolvedSource: "classic" | "settingsCatalog" | undefined;
-                    let resolvedName = policyName;
+                    const resolvedIdOrError = await resolveIdOrName(
+                        policyId, policyName,
+                        (n) => resolvePolicyByName(client, n, source),
+                        (r) => r.policyId,
+                        "policy",
+                        "Error: provide policyId or policyName."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.policyName ?? policyName;
 
-                    if (!resolvedId && policyName) {
-                        const resolved = await resolvePolicyByName(client, policyName, source);
-                        if (!resolved) return notFound(`policy "${policyName}"`);
-                        resolvedId = resolved.policyId;
-                        resolvedSource = resolved.source;
-                        resolvedName = resolved.policyName;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide policyId or policyName." }] };
-                    }
-                    if (!resolvedSource) {
-                        if (source === "auto") {
-                            return { isError: true, content: [{ type: "text", text: "Error: source must be \"classic\" or \"settingsCatalog\" when providing policyId directly (auto-detection requires policyName)." }] };
-                        }
-                        resolvedSource = source;
-                    }
+                    const sourceOrError = resolvePolicySourceOrError(resolvedIdOrError.resolved?.source, source);
+                    if (!sourceOrError.ok) return sourceOrError.errorResult;
+                    const resolvedSource = sourceOrError.source;
 
                     if (resolvedSource === "classic" && settings !== undefined) {
                         return { isError: true, content: [{ type: "text", text: "Error: settings updates are only supported for Settings Catalog policies." }] };
@@ -2521,17 +2534,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             },
             async ({ id, name, response_format = "markdown" }) => {
                 try {
-                    let resolvedId = id;
-                    let resolvedName = name;
-                    if (!resolvedId && name) {
-                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
-                        if (!resolved) return notFound(`app configuration policy "${name}"`);
-                        resolvedId = resolved.id;
-                        resolvedName = resolved.name;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        id, name,
+                        (n) => resolveAppConfigurationPolicyByName(client, n),
+                        (r) => r.id,
+                        "app configuration policy",
+                        "Error: provide id or name."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.name ?? name;
 
                     const detail = await client.getAppConfigurationPolicyDetail(resolvedId);
 
@@ -2613,17 +2625,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ id, name, newName, description, payloadJson, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedId = id;
-                    let resolvedName = name;
-                    if (!resolvedId && name) {
-                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
-                        if (!resolved) return notFound(`app configuration policy "${name}"`);
-                        resolvedId = resolved.id;
-                        resolvedName = resolved.name;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        id, name,
+                        (n) => resolveAppConfigurationPolicyByName(client, n),
+                        (r) => r.id,
+                        "app configuration policy",
+                        "Error: provide id or name."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.name ?? name;
 
                     const result = await client.updateAndroidAppConfigurationPolicy(resolvedId, { name: newName, description, payloadJson });
 
@@ -2661,17 +2672,16 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({ id, name, group, exclude, filterId, filterType, response_format = "markdown" }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
-                    let resolvedId = id;
-                    let resolvedName = name;
-                    if (!resolvedId && name) {
-                        const resolved = await resolveAppConfigurationPolicyByName(client, name);
-                        if (!resolved) return notFound(`app configuration policy "${name}"`);
-                        resolvedId = resolved.id;
-                        resolvedName = resolved.name;
-                    }
-                    if (!resolvedId) {
-                        return { isError: true, content: [{ type: "text", text: "Error: provide id or name." }] };
-                    }
+                    const resolvedIdOrError = await resolveIdOrName(
+                        id, name,
+                        (n) => resolveAppConfigurationPolicyByName(client, n),
+                        (r) => r.id,
+                        "app configuration policy",
+                        "Error: provide id or name."
+                    );
+                    if (!resolvedIdOrError.ok) return resolvedIdOrError.errorResult;
+                    const resolvedId = resolvedIdOrError.id;
+                    const resolvedName = resolvedIdOrError.resolved?.name ?? name;
 
                     const result = await client.assignAppConfigurationPolicyToGroup(resolvedId, group, { exclude, filterId, filterType });
 

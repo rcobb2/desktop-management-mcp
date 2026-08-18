@@ -327,57 +327,88 @@ export class JamfClient {
         return this.client.get(directPath, config);
     }
 
+    // Shared two-step "resolve ID via an RSQL filter, then fetch full detail" fetch — used by
+    // getComputerByName/getComputerBySerial below, which previously each hand-rolled the
+    // identical sequence (only the filter clause and log labels genuinely differ). The detail
+    // endpoint returns the object directly, not wrapped in `results` — wrapped here to match
+    // the shape both public methods' callers (jamf_get_computer/jamf_get_computer_by_serial)
+    // already expect.
+    private async getComputerDetailByFilter(filter: string): Promise<{ totalCount: number; results: any[] }> {
+        const apiStart = Date.now();
+        const inventoryResponse = await this.restGet('/api/v3/computers-inventory', {
+            params: { filter, 'page-size': 1 }
+        });
+        logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', inventoryResponse.status, Date.now() - apiStart);
+
+        const computerId = inventoryResponse.data.results?.[0]?.id;
+        if (!computerId) return { totalCount: 0, results: [] };
+
+        const apiStart2 = Date.now();
+        const detailResponse = await this.restGet(`/api/v3/computers-inventory-detail/${computerId}`);
+        logApiCall(this.logger, 'GET', `/api/v3/computers-inventory-detail/${computerId}`, detailResponse.status, Date.now() - apiStart2);
+        return { totalCount: 1, results: [detailResponse.data] };
+    }
+
     public async getComputerByName(name: string) {
         await this.ensureAuthenticated();
         this.logger.info('Fetching computer by name', { computerName: name });
         try {
-            // First, get the computer's ID using the computers-inventory endpoint
-            const apiStart = Date.now();
-            const inventoryResponse = await this.restGet('/api/v3/computers-inventory', {
-                params: {
-                    filter: `general.name=="${escapeRsqlValue(name)}"`,
-                    'page-size': 1
-                }
-            });
-            
-            let apiDuration = Date.now() - apiStart;
-            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', inventoryResponse.status, apiDuration);
-
-            const computerId = inventoryResponse.data.results?.[0]?.id;
-
-            if (!computerId) {
+            const result = await this.getComputerDetailByFilter(`general.name=="${escapeRsqlValue(name)}"`);
+            if (result.totalCount === 0) {
                 this.logger.warn('Computer not found', { computerName: name });
-                return {
-                    totalCount: 0,
-                    results: []
-                }; // Computer not found
+            } else {
+                this.logger.info('Computer details retrieved successfully', { computerName: name });
             }
-
-            // Now, use the ID to get detailed information from computers-inventory-detail
-            const apiStart2 = Date.now();
-            const detailResponse = await this.restGet(`/api/v3/computers-inventory-detail/${computerId}`);
-            apiDuration = Date.now() - apiStart2;
-            logApiCall(this.logger, 'GET', `/api/v3/computers-inventory-detail/${computerId}`, detailResponse.status, apiDuration);
-            
-            this.logger.info('Computer details retrieved successfully', { computerName: name, computerId });
-            // The detail endpoint usually returns the object directly, not wrapped in results.
-            // We need to wrap it to match the expected tool output schema.
-            return {
-                totalCount: 1,
-                results: [detailResponse.data]
-            };
-
+            return result;
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching computer', { computerName: name });
                 logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
-                // Adjust error message for detail endpoint if necessary, or keep general
                 throw new Error(`Permission denied (403). The API client may be missing necessary 'Read' permissions for 'Computer Inventory' and 'Computer Inventory Details' in JAMF Pro.`);
             }
             this.logger.error(`Error fetching computer ${name}`, { error: (error as Error).message, stack: (error as Error).stack });
             logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', undefined, undefined, error as Error);
             throw error;
         }
+    }
+
+    // Pages through the full /api/v2/mobile-devices collection (up to a safety cap) — shared by
+    // getMobileDeviceByName and listMobileDevices, which previously fetched this independently:
+    // the by-name lookup used a single 1000-device page (silently missing a match beyond the
+    // first 1000 devices in a larger fleet) while the list method already paginated properly.
+    private async fetchAllV2MobileDevices(): Promise<{ devices: any[]; totalCount: number; truncated: boolean }> {
+        const MAX_PAGES = 20; // 20 * 1000 = 20k devices — far above any real fleet size here
+        const PAGE_SIZE = 1000;
+
+        const devices: any[] = [];
+        let page = 0;
+        let totalCount = 0;
+        let truncated = false;
+
+        while (page < MAX_PAGES) {
+            const apiStart = Date.now();
+            const response = await this.restGet('/api/v2/mobile-devices', {
+                params: { page, 'page-size': PAGE_SIZE }
+            });
+            logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, Date.now() - apiStart);
+
+            const pageResults: any[] = response.data.results || [];
+            totalCount = response.data.totalCount ?? totalCount;
+            devices.push(...pageResults);
+
+            if (pageResults.length === 0 || devices.length >= totalCount) break;
+            page++;
+            if (page >= MAX_PAGES) {
+                truncated = true;
+                this.logger.warn('fetchAllV2MobileDevices hit the pagination safety cap; results are truncated', {
+                    pagesFetched: page,
+                    deviceCount: devices.length,
+                    totalCount
+                });
+            }
+        }
+
+        return { devices, totalCount, truncated };
     }
 
     public async getMobileDeviceByName(name: string) {
@@ -387,18 +418,7 @@ export class JamfClient {
             // v2's filter param is confirmed (live) to be a silent no-op, so find the matching
             // device from the list endpoint first, then fetch its /detail record below — the list
             // endpoint alone lacks osVersion, managed/supervised, and assigned-user fields.
-            const apiStart = Date.now();
-            const response = await this.restGet('/api/v2/mobile-devices', {
-                params: {
-                    'page-size': 1000 // Ensure we get enough devices to find the one we need
-                }
-            });
-
-            const apiDuration = Date.now() - apiStart;
-            logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, apiDuration);
-
-            // Manual filtering since v2 doesn't support server-side filtering for name
-            const allDevices = response.data.results || [];
+            const { devices: allDevices } = await this.fetchAllV2MobileDevices();
             const foundDevice = allDevices.find((device: any) => device.name === name);
 
             if (!foundDevice) {
@@ -454,37 +474,8 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Listing mobile devices', options ?? {});
 
-        const MAX_PAGES = 20; // 20 * 1000 = 20k devices — far above any real fleet size here
-        const PAGE_SIZE = 1000;
-
         try {
-            const v2Devices: any[] = [];
-            let page = 0;
-            let totalCount = 0;
-            let truncated = false;
-
-            while (page < MAX_PAGES) {
-                const apiStart = Date.now();
-                const response = await this.restGet('/api/v2/mobile-devices', {
-                    params: { page, 'page-size': PAGE_SIZE }
-                });
-                logApiCall(this.logger, 'GET', '/api/v2/mobile-devices', response.status, Date.now() - apiStart);
-
-                const pageResults: any[] = response.data.results || [];
-                totalCount = response.data.totalCount ?? totalCount;
-                v2Devices.push(...pageResults);
-
-                if (pageResults.length === 0 || v2Devices.length >= totalCount) break;
-                page++;
-                if (page >= MAX_PAGES) {
-                    truncated = true;
-                    this.logger.warn('listMobileDevices hit the pagination safety cap; results are truncated', {
-                        pagesFetched: page,
-                        deviceCount: v2Devices.length,
-                        totalCount
-                    });
-                }
-            }
+            const { devices: v2Devices, totalCount, truncated } = await this.fetchAllV2MobileDevices();
 
             // Classic API returns managed/supervised in one shot (no pagination controls on this
             // endpoint) — merged in by id to fill the gap in v2's field set.
@@ -599,60 +590,38 @@ export class JamfClient {
         }
     }
 
+    // Used to resolve member IDs via /api/v2/computer-groups/smart-group-membership/{id}, then
+    // do an N+1 fan-out (one /api/v3/computers-inventory/{id} GET per member) just to recover
+    // each member's name. getSmartGroupDetail's Classic API response already embeds the current
+    // `computers` array (id/name/serial_number) for both smart and static groups in one call —
+    // getPolicyFleetStatus already relies on exactly that to resolve group membership — so this
+    // now does the same, dropping the per-member fan-out entirely.
     public async getSmartComputerGroupMembers(groupId: string) {
         await this.ensureAuthenticated();
         this.logger.info('Fetching smart computer group members', { groupId });
         try {
-            // Using Jamf Pro API v2 to get member IDs
-            const apiStart = Date.now();
-            const response = await this.restGet(`/api/v2/computer-groups/smart-group-membership/${groupId}`);
-            let apiDuration = Date.now() - apiStart;
-            logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, response.status, apiDuration);
-            
-            const memberIds = response.data.members || [];
+            const detail = await this.getSmartGroupDetail(groupId);
+            const members = (detail.computers ?? []).map((c: any) => ({
+                id: c.id,
+                name: c.name || 'Unknown',
+                serialNumber: c.serial_number ?? null
+            }));
 
-            // Fetch computer details for each member to get hostname
-            const membersWithNames = await Promise.all(
-                memberIds.map(async (id: number) => {
-                    try {
-                        const apiStart2 = Date.now();
-                        const computerResponse = await this.restGet(`/api/v3/computers-inventory/${id}`, {
-                            params: { section: 'GENERAL' }
-                        });
-                        apiDuration = Date.now() - apiStart2;
-                        logApiCall(this.logger, 'GET', `/api/v3/computers-inventory/${id}`, computerResponse.status, apiDuration);
-                        return {
-                            id: id,
-                            name: computerResponse.data.general?.name || 'Unknown'
-                        };
-                    } catch (error) {
-                        this.logger.error(`Error fetching details for computer ID ${id}`, { error: (error as Error).message });
-                        logApiCall(this.logger, 'GET', `/api/v3/computers-inventory/${id}`, undefined, undefined, error as Error);
-                        return {
-                            id: id,
-                            name: 'Error fetching name'
-                        };
-                    }
-                })
-            );
-
-            this.logger.info('Smart computer group members retrieved successfully', { groupId, memberCount: membersWithNames.length });
+            this.logger.info('Smart computer group members retrieved successfully', { groupId, memberCount: members.length });
             return {
-                totalCount: membersWithNames.length,
-                members: membersWithNames
+                totalCount: members.length,
+                members
             };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 this.logger.error('Permission denied fetching smart computer group members', { groupId });
-                logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, undefined, undefined, error as Error);
-                throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Computer Groups' and/or 'Read Computers' permissions in JAMF Pro.`);
+                throw new Error(`Permission denied (403). The API client may be missing 'Read Smart Computer Groups' permissions in JAMF Pro.`);
             }
             if (axios.isAxiosError(error) && error.response?.status === 404) {
                 this.logger.warn('Smart computer group not found', { groupId });
                 throw new Error(`Smart Computer Group with ID ${groupId} not found.`);
             }
             this.logger.error(`Error fetching smart computer group members for group ${groupId}`, { error: (error as Error).message, stack: (error as Error).stack });
-            logApiCall(this.logger, 'GET', `/api/v2/computer-groups/smart-group-membership/${groupId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -1380,25 +1349,17 @@ export class JamfClient {
         applicationVersion: string;
         siteId?: string;
     }) {
-        await this.ensureAuthenticated();
-        this.logger.info('Upserting application smart group', { name: params.name });
-
-        const criteria = [
-            { name: 'Application Title', priority: 0, and_or: 'and', search_type: 'is', value: params.applicationTitle, opening_paren: false, closing_paren: false },
-            { name: 'Application Version', priority: 1, and_or: 'and', search_type: 'is', value: params.applicationVersion, opening_paren: false, closing_paren: false },
-        ];
-        const fields: Record<string, any> = { name: params.name, is_smart: true, criteria };
-        if (params.siteId) fields.site = { id: params.siteId };
-
-        const existing = await this.findComputerGroupByNameExact(params.name);
-        if (!existing) {
-            const id = await this.createSmartGroup(fields);
-            this.logger.info('Smart group created', { name: params.name, id });
-            return { action: 'created' as const, id, name: params.name };
-        }
-        await this.updateSmartGroupById(String(existing.id), fields);
-        this.logger.info('Smart group updated', { name: params.name, id: existing.id });
-        return { action: 'updated' as const, id: String(existing.id), name: params.name };
+        // Was a verbatim copy of upsertSmartGroup's body with a hardcoded 2-criterion
+        // array — now just delegates, so a future fix to the shared upsert plumbing only
+        // needs to be made once.
+        return this.upsertSmartGroup({
+            name: params.name,
+            criteria: [
+                { name: 'Application Title', and_or: 'and', search_type: 'is', value: params.applicationTitle },
+                { name: 'Application Version', and_or: 'and', search_type: 'is', value: params.applicationVersion },
+            ],
+            siteId: params.siteId,
+        });
     }
 
     // Upsert by name with an arbitrary criteria list — the generic sibling of
@@ -1963,7 +1924,13 @@ export class JamfClient {
 
     // Policy scoping can target either a smart or static computer group — Classic
     // API's scope.computer_groups doesn't distinguish the two structurally, so this
-    // searches both lists.
+    // searches both lists. Exact match only (case-insensitive) — an earlier version
+    // fell back to a substring "includes" match when no exact match was found, which
+    // could silently scope a policy/profile to the wrong group on a typo (e.g. a name
+    // like "Engineering - Con" would silently match "Engineering - Contractors" with
+    // no error at all), and behaved inconsistently with findComputerGroupByNameExact's
+    // already-exact-match-only semantics used by the smart-group upsert tools. Lists
+    // near-matches in the error instead of silently guessing one.
     private async resolveComputerGroupIdByName(name: string): Promise<{ id: string; name: string }> {
         const [smart, staticData] = await Promise.all([
             this.getSmartComputerGroups(),
@@ -1973,10 +1940,82 @@ export class JamfClient {
         const staticGroups: any[] = (staticData as any).computerGroups ?? [];
         const all = [...smartGroups, ...staticGroups];
         const lower = name.trim().toLowerCase();
-        const match = all.find((g) => g.name?.toLowerCase() === lower)
-            ?? all.find((g) => g.name?.toLowerCase().includes(lower));
-        if (!match) throw new Error(`Computer group not found: "${name}"`);
+        const match = all.find((g) => g.name?.toLowerCase() === lower);
+        if (!match) {
+            const near = all.filter((g) => g.name?.toLowerCase().includes(lower)).map((g) => g.name);
+            throw new Error(`Computer group not found: "${name}"${near.length > 0 ? ` — did you mean: ${near.join(', ')}?` : ''}`);
+        }
         return { id: String(match.id), name: match.name };
+    }
+
+    // Resolves target/exclusion computer group names into the Classic API `scope` object shape —
+    // was duplicated verbatim between upsertPolicy and upsertConfigurationProfile below.
+    private async resolveScope(params: { targetGroupNames?: string[]; exclusionGroupNames?: string[] }): Promise<{
+        scope: {
+            all_computers: boolean;
+            computer_groups: { id: string; name: string }[];
+            exclusions?: { computer_groups: { id: string; name: string }[] };
+        };
+    }> {
+        const [targetGroups, exclusionGroups] = await Promise.all([
+            Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+            Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+        ]);
+        return {
+            scope: {
+                all_computers: false,
+                computer_groups: targetGroups.map((g) => ({ id: g.id, name: g.name })),
+                exclusions: exclusionGroups.length
+                    ? { computer_groups: exclusionGroups.map((g) => ({ id: g.id, name: g.name })) }
+                    : undefined,
+            },
+        };
+    }
+
+    // Classic API "create" idiom shared by upsertPolicy/upsertConfigurationProfile: POST an
+    // empty-ID create to `{endpoint}/id/0` and extract the new numeric ID via regex from the
+    // response body, which Classic API always returns as XML for this call regardless of the
+    // Accept header (see this file's top-of-file section comment) — the same idiom
+    // createSmartGroup/createUserGroup already isolate for their own object types, just not
+    // previously applied here.
+    private async createClassicApiResource(rootTag: string, endpoint: string, fields: Record<string, any>, resourceLabel: string): Promise<string> {
+        const xml = buildXmlDocument(rootTag, fields);
+        const apiStart = Date.now();
+        const response = await this.client.post(`${endpoint}/id/0`, xml, {
+            headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+        });
+        logApiCall(this.logger, 'POST', `${endpoint}/id/0`, response.status, Date.now() - apiStart);
+        const match = String(response.data).match(/<id>(\d+)<\/id>/);
+        if (!match) throw new Error(`${resourceLabel} created but no ID could be determined from the response.`);
+        return match[1];
+    }
+
+    // Resolves script names to their upsert-ready {id, name, priority, parameter4} shape — was
+    // duplicated between upsertPolicy and updatePolicyScripts below.
+    private async resolveScriptRefs(scripts: { name: string; priority?: 'Before' | 'After'; parameter4?: string }[]) {
+        return Promise.all(scripts.map(async (s) => {
+            const found = await this.findScriptByName(s.name);
+            if (!found) throw new Error(`Script not found: "${s.name}"`);
+            return { id: String(found.id), name: found.name, priority: s.priority ?? 'After', parameter4: s.parameter4 };
+        }));
+    }
+
+    // Classic API "update" idiom shared by upsertPolicy/upsertConfigurationProfile — confirmed
+    // live gotcha (upsertPolicy): combining multiple top-level sections (e.g. package_configuration
+    // + scope) in a single PUT can silently drop ALL of them, with a follow-up GET showing neither
+    // applied. Sending one top-level section per sequential PUT is the only combination confirmed
+    // to reliably apply every section. Returns the section keys actually sent, for logging.
+    private async putClassicApiSectionsSequentially(rootTag: string, endpoint: string, id: string, fields: Record<string, any>): Promise<string[]> {
+        const sections = Object.entries(fields).filter(([, v]) => v !== undefined);
+        for (const [key, value] of sections) {
+            const sectionXml = buildXmlDocument(rootTag, { [key]: value });
+            const apiStart = Date.now();
+            const response = await this.client.put(`${endpoint}/id/${id}`, sectionXml, {
+                headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+            });
+            logApiCall(this.logger, 'PUT', `${endpoint}/id/${id} (${key})`, response.status, Date.now() - apiStart);
+        }
+        return sections.map(([k]) => k);
     }
 
     private async resolvePolicyId(nameOrId: string): Promise<{ id: string; name: string }> {
@@ -1999,19 +2038,9 @@ export class JamfClient {
         await this.ensureAuthenticated();
         this.logger.info('Fetching computer by serial', { serial });
         try {
-            const apiStart = Date.now();
-            const inventoryResponse = await this.restGet('/api/v3/computers-inventory', {
-                params: { filter: `hardware.serialNumber=="${escapeRsqlValue(serial)}"`, 'page-size': 1 }
-            });
-            logApiCall(this.logger, 'GET', '/api/v3/computers-inventory', inventoryResponse.status, Date.now() - apiStart);
-            const computerId = inventoryResponse.data.results?.[0]?.id;
-            if (!computerId) return { totalCount: 0, results: [] };
-
-            const apiStart2 = Date.now();
-            const detailResponse = await this.restGet(`/api/v3/computers-inventory-detail/${computerId}`);
-            logApiCall(this.logger, 'GET', `/api/v3/computers-inventory-detail/${computerId}`, detailResponse.status, Date.now() - apiStart2);
-            this.logger.info('Computer by serial retrieved', { serial, computerId });
-            return { totalCount: 1, results: [detailResponse.data] };
+            const result = await this.getComputerDetailByFilter(`hardware.serialNumber=="${escapeRsqlValue(serial)}"`);
+            if (result.totalCount > 0) this.logger.info('Computer by serial retrieved', { serial });
+            return result;
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
                 throw new Error(`Permission denied (403). The API client may be missing 'Read Computers' permissions in JAMF Pro.`);
@@ -2530,15 +2559,10 @@ export class JamfClient {
         this.logger.info('Upserting policy', { name: params.name });
         try {
             const existing = await this.findPolicyByName(params.name);
-            const [targetGroups, exclusionGroups, categoryId, scripts, packages, diskEncryptionConfigId] = await Promise.all([
-                Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
-                Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+            const [scopeResult, categoryId, scripts, packages, diskEncryptionConfigId] = await Promise.all([
+                this.resolveScope({ targetGroupNames: params.targetGroupNames, exclusionGroupNames: params.exclusionGroupNames }),
                 params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
-                Promise.all((params.scripts ?? []).map(async (s) => {
-                    const found = await this.findScriptByName(s.name);
-                    if (!found) throw new Error(`Script not found: "${s.name}"`);
-                    return { id: String(found.id), name: found.name, priority: s.priority ?? 'After', parameter4: s.parameter4 };
-                })),
+                this.resolveScriptRefs(params.scripts ?? []),
                 Promise.all((params.packages ?? []).map(async (p) => {
                     const found = await this.findPackageByName(p.name);
                     if (!found) throw new Error(`Package not found: "${p.name}"`);
@@ -2561,13 +2585,7 @@ export class JamfClient {
                     frequency: params.frequency ?? 'Once per computer',
                     category: categoryId ? { id: categoryId } : undefined,
                 },
-                scope: {
-                    all_computers: false,
-                    computer_groups: targetGroups.map((g) => ({ id: g.id, name: g.name })),
-                    exclusions: exclusionGroups.length
-                        ? { computer_groups: exclusionGroups.map((g) => ({ id: g.id, name: g.name })) }
-                        : undefined,
-                },
+                ...scopeResult,
                 self_service: params.selfService
                     ? {
                           use_for_self_service: params.selfService.useForSelfService,
@@ -2623,34 +2641,19 @@ export class JamfClient {
             };
 
             if (!existing) {
-                const xml = buildXmlDocument('policy', policy);
-                const apiStart = Date.now();
-                const response = await this.client.post('/JSSResource/policies/id/0', xml, {
-                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-                });
-                logApiCall(this.logger, 'POST', '/JSSResource/policies/id/0', response.status, Date.now() - apiStart);
-                const match = String(response.data).match(/<id>(\d+)<\/id>/);
-                if (!match) throw new Error('Policy created but no ID could be determined from the response.');
-                this.logger.info('Policy created', { name: params.name, id: match[1] });
-                return { action: 'created' as const, id: match[1], name: params.name };
+                const id = await this.createClassicApiResource('policy', '/JSSResource/policies', policy, 'Policy');
+                this.logger.info('Policy created', { name: params.name, id });
+                return { action: 'created' as const, id, name: params.name };
             }
 
             // Confirmed live (Jamf Pro 11.29.1): a single PUT combining certain
             // top-level sections (e.g. package_configuration + scope) returns 201 but
             // silently drops BOTH changes — a follow-up GET shows neither applied.
-            // Sending one top-level section per sequential PUT is the only combination
-            // confirmed to reliably apply every section; slower, but correct.
+            // putClassicApiSectionsSequentially sends one top-level section per PUT,
+            // the only combination confirmed to reliably apply every section.
             const id = String(existing.id);
-            const sections = Object.entries(policy).filter(([, v]) => v !== undefined);
-            for (const [key, value] of sections) {
-                const sectionXml = buildXmlDocument('policy', { [key]: value });
-                const apiStart = Date.now();
-                const response = await this.client.put(`/JSSResource/policies/id/${id}`, sectionXml, {
-                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-                });
-                logApiCall(this.logger, 'PUT', `/JSSResource/policies/id/${id} (${key})`, response.status, Date.now() - apiStart);
-            }
-            this.logger.info('Policy updated', { name: params.name, id, sections: sections.map(([k]) => k) });
+            const sections = await this.putClassicApiSectionsSequentially('policy', '/JSSResource/policies', id, policy);
+            this.logger.info('Policy updated', { name: params.name, id, sections });
             return { action: 'updated' as const, id, name: params.name };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
@@ -2820,11 +2823,7 @@ export class JamfClient {
             const current = await this.getPolicyDetail(id);
             const existingScripts: any[] = Array.isArray(current.scripts) ? current.scripts : [];
 
-            const toAdd = await Promise.all((changes.addScripts ?? []).map(async (s) => {
-                const found = await this.findScriptByName(s.name);
-                if (!found) throw new Error(`Script not found: "${s.name}"`);
-                return { id: String(found.id), name: found.name, priority: s.priority ?? 'After', parameter4: s.parameter4 };
-            }));
+            const toAdd = await this.resolveScriptRefs(changes.addScripts ?? []);
 
             const removeLower = new Set((changes.removeScriptNames ?? []).map((n) => n.toLowerCase()));
             const addIds = new Set(toAdd.map((s) => s.id));
@@ -2992,9 +2991,8 @@ export class JamfClient {
         this.logger.info('Upserting configuration profile', { name: params.name });
         try {
             const existing = await this.findConfigurationProfileByName(params.name);
-            const [targetGroups, exclusionGroups, categoryId] = await Promise.all([
-                Promise.all((params.targetGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
-                Promise.all((params.exclusionGroupNames ?? []).map((n) => this.resolveComputerGroupIdByName(n))),
+            const [scopeResult, categoryId] = await Promise.all([
+                this.resolveScope({ targetGroupNames: params.targetGroupNames, exclusionGroupNames: params.exclusionGroupNames }),
                 params.categoryName ? this.resolveCategoryId(params.categoryName) : Promise.resolve(undefined),
             ]);
 
@@ -3006,26 +3004,13 @@ export class JamfClient {
                     payloads: params.payload,
                     category: categoryId ? { id: categoryId } : undefined,
                 },
-                scope: {
-                    all_computers: false,
-                    computer_groups: targetGroups.map((g) => ({ id: g.id, name: g.name })),
-                    exclusions: exclusionGroups.length
-                        ? { computer_groups: exclusionGroups.map((g) => ({ id: g.id, name: g.name })) }
-                        : undefined,
-                },
+                ...scopeResult,
             };
 
             if (!existing) {
-                const xml = buildXmlDocument('os_x_configuration_profile', profile);
-                const apiStart = Date.now();
-                const response = await this.client.post('/JSSResource/osxconfigurationprofiles/id/0', xml, {
-                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-                });
-                logApiCall(this.logger, 'POST', '/JSSResource/osxconfigurationprofiles/id/0', response.status, Date.now() - apiStart);
-                const match = String(response.data).match(/<id>(\d+)<\/id>/);
-                if (!match) throw new Error('Configuration profile created but no ID could be determined from the response.');
-                this.logger.info('Configuration profile created', { name: params.name, id: match[1] });
-                return { action: 'created' as const, id: match[1], name: params.name };
+                const id = await this.createClassicApiResource('os_x_configuration_profile', '/JSSResource/osxconfigurationprofiles', profile, 'Configuration profile');
+                this.logger.info('Configuration profile created', { name: params.name, id });
+                return { action: 'created' as const, id, name: params.name };
             }
 
             // Same one-section-per-PUT discipline as upsertPolicy (confirmed live gotcha
@@ -3033,16 +3018,8 @@ export class JamfClient {
             // here defensively given the precedent on this same Classic API family, though
             // not independently confirmed for configuration profiles specifically.
             const id = String(existing.id);
-            const sections = Object.entries(profile).filter(([, v]) => v !== undefined);
-            for (const [key, value] of sections) {
-                const sectionXml = buildXmlDocument('os_x_configuration_profile', { [key]: value });
-                const apiStart = Date.now();
-                const response = await this.client.put(`/JSSResource/osxconfigurationprofiles/id/${id}`, sectionXml, {
-                    headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
-                });
-                logApiCall(this.logger, 'PUT', `/JSSResource/osxconfigurationprofiles/id/${id} (${key})`, response.status, Date.now() - apiStart);
-            }
-            this.logger.info('Configuration profile updated', { name: params.name, id, sections: sections.map(([k]) => k) });
+            const sections = await this.putClassicApiSectionsSequentially('os_x_configuration_profile', '/JSSResource/osxconfigurationprofiles', id, profile);
+            this.logger.info('Configuration profile updated', { name: params.name, id, sections });
             return { action: 'updated' as const, id, name: params.name };
         } catch (error) {
             if (axios.isAxiosError(error) && error.response?.status === 403) {
@@ -3736,19 +3713,19 @@ export class JamfClient {
     // Resolves a computer's `clientManagementId` — the GUID LAPS keys off, distinct
     // from the plain numeric Jamf computer ID `resolveComputerId` returns. Confirmed
     // live: `GET /api/v1/computers-inventory-detail/{id}?section=GENERAL` ->
-    // `general.managementId`.
+    // `general.managementId`. Routed through restGet() like every other non-Classic
+    // REST GET in this file (an earlier version called this.client.get() directly,
+    // bypassing Gateway routing entirely for no reason tied to this specific call —
+    // restGet() already falls back to the direct client when the Gateway isn't
+    // configured, so this only adds robustness, never changes behavior for a
+    // deployment without JAMF_PLATFORM_* configured).
     private async resolveClientManagementId(nameOrSerial: string): Promise<string> {
-        // Uses the direct tenant client (not the Platform Gateway), so it needs the
-        // tenant's own auth ensured — getLapsAccounts/getLapsPassword only ensure the
-        // Gateway's auth before calling this, since resolving a computer ID/managementId
-        // always goes through the tenant's own API regardless of Gateway configuration.
         await this.ensureAuthenticated();
         const computerId = await this.resolveComputerId(nameOrSerial);
         const apiStart = Date.now();
-        const response = await this.client.get(`/api/v1/computers-inventory-detail/${computerId}`, {
-            params: { section: 'GENERAL' }
-        });
-        logApiCall(this.logger, 'GET', `/api/v1/computers-inventory-detail/${computerId}`, response.status, Date.now() - apiStart);
+        const path = `/api/v1/computers-inventory-detail/${computerId}`;
+        const response = await this.restGet(path, { params: { section: 'GENERAL' } });
+        logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
         const managementId = response.data.general?.managementId;
         if (!managementId) {
             throw new Error(`No managementId found for computer "${nameOrSerial}" — it may not be enrolled via modern MDM.`);
@@ -3777,6 +3754,7 @@ export class JamfClient {
                 throw new Error(`No LAPS accounts found for computer "${nameOrSerial}" (managementId ${clientManagementId}) — it may not have LAPS enabled.`);
             }
             this.logger.error('Error fetching LAPS accounts', { nameOrSerial, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/accounts`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -3822,6 +3800,7 @@ export class JamfClient {
                 throw new Error(`Permission denied (${status}). The Platform API Gateway credential may be missing LAPS privileges on its account.jamf.com Integration.`);
             }
             this.logger.error('Error fetching LAPS password', { nameOrSerial, username, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/account/${encodeURIComponent(username)}/password`, undefined, undefined, error as Error);
             throw error;
         }
     }

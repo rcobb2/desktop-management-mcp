@@ -106,6 +106,12 @@ async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPac
     };
 }
 
+// Shared $select field list for managedDevice lookups — was copy-pasted independently
+// across getManagedDeviceByName/BySerialNumber/ById/ByUser/listManagedDevices; any field
+// added or renamed had to be updated in 6+ places by hand.
+const MANAGED_DEVICE_SELECT_FIELDS =
+    'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType';
+
 export class IntuneClient {
     private client: Client;
     private credential: ClientSecretCredential;
@@ -341,7 +347,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`deviceName eq '${escapedName}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
+                .select(MANAGED_DEVICE_SELECT_FIELDS)
                 .get();
             
             const apiDuration = Date.now() - apiStart;
@@ -361,7 +367,7 @@ export class IntuneClient {
                     .api('/deviceManagement/managedDevices')
                     .version('v1.0')
                     .filter(`startswith(deviceName,'${escapedName}')`)
-                    .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
+                    .select(MANAGED_DEVICE_SELECT_FIELDS)
                     .top(25)
                     .get();
 
@@ -392,7 +398,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
+                .select(MANAGED_DEVICE_SELECT_FIELDS)
                 .top(999)
                 .get();
 
@@ -447,7 +453,7 @@ export class IntuneClient {
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
                 .filter(`serialNumber eq '${escapedSerial}'`)
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
+                .select(MANAGED_DEVICE_SELECT_FIELDS)
                 .get();
 
             const apiDuration = Date.now() - apiStart;
@@ -464,7 +470,7 @@ export class IntuneClient {
             const fallbackResponse = await this.client
                 .api('/deviceManagement/managedDevices')
                 .version('v1.0')
-                .select('id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType')
+                .select(MANAGED_DEVICE_SELECT_FIELDS)
                 .top(999)
                 .get();
 
@@ -485,6 +491,39 @@ export class IntuneClient {
         } catch (error) {
             this.logger.error(`Error fetching device by serial number ${normalizedSerial}`, { error: (error as Error).message, stack: (error as Error).stack });
             logApiCall(this.logger, 'GET', '/deviceManagement/managedDevices', undefined, undefined, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get managed device by its own Intune device ID (GUID) — a direct lookup,
+     * unlike getManagedDeviceByName/getManagedDeviceBySerialNumber's filter+fallback
+     * pattern, since an ID is already unambiguous. Added so resolveDevice() (in
+     * intune-server.ts) can resolve azureADDeviceId for a caller-supplied deviceId the
+     * same way it already does for deviceName/serialNumber — a bare deviceId used to
+     * skip this lookup entirely, silently leaving azureADGroups empty for any tool
+     * that needs the Azure AD device ID (e.g. intune_get_device_groups).
+     */
+    public async getManagedDeviceById(deviceId: string) {
+        this.logger.info('Fetching managed device by ID', { deviceId });
+        await this.trackAuthAttempt();
+        try {
+            const apiStart = Date.now();
+            const device = await this.client
+                .api(`/deviceManagement/managedDevices/${deviceId}`)
+                .version('v1.0')
+                .select(MANAGED_DEVICE_SELECT_FIELDS)
+                .get();
+            logApiCall(this.logger, 'GET', `/deviceManagement/managedDevices/${deviceId}`, 200, Date.now() - apiStart);
+            IntuneClient.normalizeDeviceOwnerType([device]);
+            return device;
+        } catch (error) {
+            if ((error as any)?.statusCode === 404) {
+                this.logger.warn('Device not found by ID', { deviceId });
+                return null;
+            }
+            this.logger.error(`Error fetching device by ID ${deviceId}`, { error: (error as Error).message, stack: (error as Error).stack });
+            logApiCall(this.logger, 'GET', `/deviceManagement/managedDevices/${deviceId}`, undefined, undefined, error as Error);
             throw error;
         }
     }
@@ -563,7 +602,7 @@ export class IntuneClient {
             }
 
             const dedupedCandidateUpns = Array.from(new Set(candidateUpns.filter(Boolean).map((upn) => String(upn).toLowerCase())));
-            const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType';
+            const deviceFields = MANAGED_DEVICE_SELECT_FIELDS;
 
             for (const upnLower of dedupedCandidateUpns) {
                 const escapedUpn = this.escapeODataString(upnLower);
@@ -669,7 +708,7 @@ export class IntuneClient {
         await this.trackAuthAttempt();
 
         const MAX_PAGES = 20; // 20 * 999 ≈ 20k devices — far above any real fleet size here
-        const deviceFields = 'id,deviceName,serialNumber,userPrincipalName,azureADDeviceId,managementState,managementAgent,complianceState,lastSyncDateTime,model,manufacturer,operatingSystem,osVersion,enrolledDateTime,userDisplayName,managedDeviceOwnerType';
+        const deviceFields = `${MANAGED_DEVICE_SELECT_FIELDS},managementAgent`;
 
         const filters: string[] = [];
         if (options?.operatingSystem) {
@@ -987,7 +1026,14 @@ export class IntuneClient {
                 logApiCall(this.logger, 'GET', `/deviceManagement/managedDevices/${deviceId}`, 200, apiDuration);
 
                 if (devicesResponse.mobileAppIntentAndStates) {
-                    result.assignedApps = devicesResponse.mobileAppIntentAndStates;
+                    // mobileAppIntentAndStates is a collection of mobileAppIntentAndState objects
+                    // (typically one per device), each of which nests the actual per-app records
+                    // under its own `mobileAppList` (mobileAppIntentAndStateDetail: displayName,
+                    // mobileAppIntent, installState, ...) — flatten so callers get one array of
+                    // per-app records directly, rather than an array of wrapper objects with no
+                    // displayName/intent/state of their own at the top level.
+                    result.assignedApps = (devicesResponse.mobileAppIntentAndStates as any[])
+                        .flatMap((s: any) => s.mobileAppList ?? []);
                     this.logger.info('Assigned apps retrieved', { deviceId, appCount: result.assignedApps.length });
                 }
             } catch (error) {
@@ -1072,16 +1118,36 @@ export class IntuneClient {
                 this.logger.warn('Failed to fetch settings catalog policies', { error: (error as Error).message });
             }
 
-            const normalizedClassic = result.classicDeviceConfigurations.map((policy: any) => ({
-                source: 'classic',
-                id: policy.id,
-                name: policy.displayName,
-                description: policy.description,
-                platforms: '',
-                technologies: '',
-                createdDateTime: policy.createdDateTime,
-                lastModifiedDateTime: policy.lastModifiedDateTime
-            }));
+            // Classic deviceConfigurations has no dedicated `platforms` field — platform is
+            // implied by the specific derived @odata.type (e.g. #microsoft.graph.
+            // macOSGeneralDeviceConfiguration). This used to hardcode platforms: '', which
+            // silently excluded every classic profile from getConfigurationPolicies' own
+            // platform filter (`policy.platforms.includes(platform)` never matches an empty
+            // string) — same @odata.type-substring derivation already used for compliance
+            // policies/apps elsewhere in this file (see platformHint above/below).
+            const normalizedClassic = result.classicDeviceConfigurations.map((policy: any) => {
+                const odataType = String(policy['@odata.type'] || '').toLowerCase();
+                const platforms = odataType.includes('macos')
+                    ? 'macOS'
+                    : odataType.includes('ios')
+                        ? 'iOS'
+                        : odataType.includes('android')
+                            ? 'android'
+                            : odataType.includes('windows')
+                                ? 'windows10'
+                                : '';
+                return {
+                    source: 'classic',
+                    id: policy.id,
+                    name: policy.displayName,
+                    description: policy.description,
+                    platforms,
+                    technologies: '',
+                    odataType: policy['@odata.type'],
+                    createdDateTime: policy.createdDateTime,
+                    lastModifiedDateTime: policy.lastModifiedDateTime
+                };
+            });
 
             // Graph returns `platforms`/`technologies` as a single string for Settings Catalog
             // policies (e.g. "androidEnterprise", "mdm,endpointPrivilegeManagement"), not an array —
@@ -1302,7 +1368,11 @@ export class IntuneClient {
                 this.logger.warn('Failed to fetch compliance policy states', { deviceId, error: (error as Error).message });
             }
 
-            const issueKeywords = ['error', 'conflict'];
+            // Kept in sync with intune-server.ts's hasIssueStatus() and this file's own
+            // hasError/hasConflict/hasFailed checks in getGuidedPolicyTroubleshooting below —
+            // an earlier version of this list omitted 'fail', so a device status containing
+            // "failed" counted as an issue in one of those three places but not the other two.
+            const issueKeywords = ['error', 'conflict', 'fail'];
             const hasIssue = (value: string | undefined): boolean => {
                 const normalized = (value || '').toLowerCase();
                 return issueKeywords.some((keyword) => normalized.includes(keyword));
@@ -2018,6 +2088,11 @@ export class IntuneClient {
                 const hasError = state.includes('error');
                 const hasConflict = state.includes('conflict');
                 const hasPending = state.includes('pending') || state.includes('notapplicable');
+                // A state containing "fail" (e.g. a compliance policy's own state enum, distinct
+                // from configuration policy states) previously matched none of the checks above —
+                // silently producing zero findings for a device actually reporting a failure. Kept
+                // in sync with the 'fail' keyword hasIssueStatus()/hasIssue() above already check.
+                const hasFailed = state.includes('fail') && !hasError && !hasConflict;
 
                 if (hasError) {
                     findings.push({
@@ -2042,6 +2117,19 @@ export class IntuneClient {
                         priority: 'high',
                         action: 'Resolve conflicting settings',
                         details: 'Identify overlapping policies configuring the same setting to different values and consolidate to a single authoritative policy.'
+                    });
+                }
+
+                if (hasFailed) {
+                    findings.push({
+                        severity: 'high',
+                        code: 'DEVICE_POLICY_FAILED',
+                        message: `Device reports policy state '${matchingPolicyState.state}'.`
+                    });
+                    recommendations.push({
+                        priority: 'high',
+                        action: 'Investigate policy failure details',
+                        details: 'Review device-side MDM event logs for the specific failure reason; retry after resolving any underlying connectivity or licensing issue.'
                     });
                 }
 
@@ -2395,21 +2483,24 @@ export class IntuneClient {
                 this.logger.warn('Failed to fetch managed device for app troubleshooting', { deviceId, error: (error as Error).message });
             }
 
+            // Used to call `mobileApps/{id}/deviceStatuses` directly, but that resource is
+            // confirmed to 400 ("Resource not found for the segment 'deviceStatuses'") at both
+            // v1.0 and beta (see getAppInstallStatus's doc comment below, which was built as the
+            // working replacement for exactly this) — so this branch always landed in its catch
+            // and deviceStatus was always null in practice. Now reuses getAppInstallStatus's
+            // working Reports-API path, matched by the device name fetched just above.
             let deviceStatus: any = null;
-            try {
-                const statusStart = Date.now();
-                const statusResponse = await this.client
-                    .api(`/deviceAppManagement/mobileApps/${appId}/deviceStatuses`)
-                    .version('v1.0')
-                    .top(999)
-                    .get();
-
-                const statusDuration = Date.now() - statusStart;
-                logApiCall(this.logger, 'GET', `/deviceAppManagement/mobileApps/${appId}/deviceStatuses`, 200, statusDuration);
-
-                deviceStatus = (statusResponse.value || []).find((status: any) => status.deviceId === deviceId) || null;
-            } catch (error) {
-                this.logger.warn('Failed to fetch app device statuses', { appId, error: (error as Error).message });
+            if (device?.deviceName) {
+                try {
+                    const statusData = await this.getAppInstallStatus(appId, { deviceName: device.deviceName, limit: 50 });
+                    const statuses: any[] = statusData.deviceStatuses ?? [];
+                    const lowerDeviceName = String(device.deviceName).toLowerCase();
+                    deviceStatus = statuses.find((s: any) => String(s.deviceName || '').toLowerCase() === lowerDeviceName) ?? statuses[0] ?? null;
+                } catch (error) {
+                    this.logger.warn('Failed to fetch app install status for device', { appId, deviceId, error: (error as Error).message });
+                }
+            } else {
+                this.logger.warn('Skipping per-device app install status — managed device lookup failed, no deviceName to filter by', { deviceId, appId });
             }
 
             const assignedAppState = (deviceApps.assignedApps || []).find((appState: any) => {
@@ -3462,20 +3553,91 @@ export class IntuneClient {
     }
 
     /**
-     * Add (or move) a group assignment on an Intune configuration policy — classic device
-     * configuration or Settings Catalog. Graph's `/assign` action REPLACES the entire assignment set
-     * rather than appending to it (unlike JAMF's Classic API PUT, which is a partial merge) — so this
-     * always does its own read-modify-write: fetch current assignments, drop any existing assignment
-     * for this same group (so re-running with a different include/exclude direction moves it rather
-     * than duplicating it), append the new one, then POST the full array back.
+     * Shared read-modify-write implementation for Graph's replace-the-whole-set `/assign` action —
+     * used by assignConfigurationPolicyToGroup/assignAppToGroup/assignCompliancePolicyToGroup/
+     * assignAppConfigurationPolicyToGroup below. All four used to independently reimplement this
+     * exact sequence (only the base path, API version, assignment @odata.type, and — for apps —
+     * the `intent` field and response status code differ): resolve the group, GET current
+     * assignments, keep only `source: "direct"` (or sourceless) entries excluding any for this
+     * group, sanitize each retained target, build the new target (include/exclude + optional
+     * filter), append it, POST the whole array back to `{base}/assign`, and return a summary.
      *
-     * Confirmed live: assignments can carry `source: "policySets"` (auto-derived from an Intune Policy
-     * Set the policy belongs to) alongside `source: "direct"` ones. Echoing a `policySets` assignment
-     * back through `/assign` does NOT get recognized as "the same assignment" — it creates a second,
-     * independent `direct` assignment for that group, duplicating scope the Policy Set already grants.
-     * The policySets-derived assignment regenerates itself automatically on every read regardless, so
-     * only `direct` assignments (or ones with no `source` field at all, as classic deviceConfigurations
-     * assignments have) are retained when rebuilding the array to post back.
+     * Confirmed live: assignments can carry `source: "policySets"` (auto-derived from an Intune
+     * Policy Set the resource belongs to) alongside `source: "direct"` ones. Echoing a `policySets`
+     * assignment back through `/assign` does NOT get recognized as "the same assignment" — it
+     * creates a second, independent `direct` assignment for that group, duplicating scope the
+     * Policy Set already grants. The policySets-derived assignment regenerates itself
+     * automatically on every read regardless, so only `direct`/sourceless assignments are ever
+     * retained when rebuilding the array to post back.
+     */
+    private async assignResourceToGroup(params: {
+        base: string;
+        version: 'v1.0' | 'beta';
+        assignmentODataType: string;
+        groupNameOrId: string;
+        options?: { exclude?: boolean; filterId?: string; filterType?: 'include' | 'exclude' };
+        bodyKey?: string; // default 'assignments' — mobileApps' /assign action expects 'mobileAppAssignments' instead
+        buildNewEntry?: (target: any) => any; // lets assignAppToGroup fold `intent` into the new entry
+        mapRetainedEntry?: (existing: any, sanitizedTarget: any) => any; // lets assignAppToGroup carry `intent` forward on retained entries
+        successStatus?: number; // logApiCall status on success — 200 for most, 204 for the mobileApps /assign action
+    }) {
+        const { base, version, assignmentODataType, groupNameOrId, options } = params;
+        const bodyKey = params.bodyKey ?? 'assignments';
+        const successStatus = params.successStatus ?? 200;
+
+        const group = await this.resolveGroupId(groupNameOrId);
+        if (!group) {
+            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
+        }
+
+        const existingResponse = await this.client.api(`${base}/assignments`).version(version).top(999).get();
+        const existing: any[] = existingResponse.value || [];
+        const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
+        const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
+
+        const retained = directOnly
+            .filter((a: any) => a.target?.groupId !== group.id)
+            .map((a: any) => {
+                const sanitizedTarget = this.sanitizeAssignmentTarget(a.target);
+                return params.mapRetainedEntry
+                    ? params.mapRetainedEntry(a, sanitizedTarget)
+                    : { '@odata.type': a['@odata.type'] ?? assignmentODataType, target: sanitizedTarget };
+            });
+
+        const newTarget: any = {
+            '@odata.type': options?.exclude
+                ? '#microsoft.graph.exclusionGroupAssignmentTarget'
+                : '#microsoft.graph.groupAssignmentTarget',
+            groupId: group.id
+        };
+        if (options?.filterId) {
+            newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
+            newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
+        }
+
+        const newEntry = params.buildNewEntry
+            ? params.buildNewEntry(newTarget)
+            : { '@odata.type': assignmentODataType, target: newTarget };
+
+        const updatedAssignments = [...retained, newEntry];
+
+        const apiStart = Date.now();
+        await this.client.api(`${base}/assign`).version(version).post({ [bodyKey]: updatedAssignments });
+        logApiCall(this.logger, 'POST', `${base}/assign`, successStatus, Date.now() - apiStart);
+
+        return {
+            group,
+            exclude: Boolean(options?.exclude),
+            totalAssignments: updatedAssignments.length,
+            previousAssignmentCount: existing.length,
+            replacedExistingForGroup: hadExistingForGroup
+        };
+    }
+
+    /**
+     * Add (or move) a group assignment on an Intune configuration policy — classic device
+     * configuration or Settings Catalog. See assignResourceToGroup's doc comment for the shared
+     * replace-the-whole-set /assign mechanics and Policy Sets caveat.
      */
     public async assignConfigurationPolicyToGroup(
         policyId: string,
@@ -3486,10 +3648,6 @@ export class IntuneClient {
         this.logger.info('Assigning configuration policy to group', { policyId, source, groupNameOrId, ...options });
         await this.trackAuthAttempt();
 
-        const group = await this.resolveGroupId(groupNameOrId);
-        if (!group) {
-            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
-        }
         const base = source === 'classic'
             ? `/deviceManagement/deviceConfigurations/${policyId}`
             : `/deviceManagement/configurationPolicies/${policyId}`;
@@ -3499,48 +3657,11 @@ export class IntuneClient {
             : '#microsoft.graph.deviceManagementConfigurationPolicyAssignment';
 
         try {
-            const existingResponse = await this.client.api(`${base}/assignments`).version(version).top(999).get();
-            const existing: any[] = existingResponse.value || [];
-            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
-            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
-
-            const retained = directOnly
-                .filter((a: any) => a.target?.groupId !== group.id)
-                .map((a: any) => ({
-                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
-                    target: this.sanitizeAssignmentTarget(a.target)
-                }));
-
-            const newTarget: any = {
-                '@odata.type': options?.exclude
-                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
-                    : '#microsoft.graph.groupAssignmentTarget',
-                groupId: group.id
-            };
-            if (options?.filterId) {
-                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
-                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
-            }
-
-            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
-
-            const apiStart = Date.now();
-            await this.client.api(`${base}/assign`).version(version).post({ assignments: updatedAssignments });
-            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
-
+            const result = await this.assignResourceToGroup({ base, version, assignmentODataType, groupNameOrId, options });
             this.logger.info('Configuration policy assignment updated', {
-                policyId, source, groupId: group.id, totalAssignments: updatedAssignments.length
+                policyId, source, groupId: result.group.id, totalAssignments: result.totalAssignments
             });
-
-            return {
-                policyId,
-                source,
-                group,
-                exclude: Boolean(options?.exclude),
-                totalAssignments: updatedAssignments.length,
-                previousAssignmentCount: existing.length,
-                replacedExistingForGroup: hadExistingForGroup
-            };
+            return { policyId, source, ...result };
         } catch (error) {
             this.logger.error('Error assigning configuration policy to group', {
                 policyId, source, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
@@ -3551,13 +3672,9 @@ export class IntuneClient {
 
     /**
      * Add (or move) a group assignment on an Intune app deployment, with the given install intent.
-     * Same replace-the-full-set semantics as assignConfigurationPolicyToGroup — read current
-     * assignments, drop any existing assignment for this group, append the new one, POST the whole
-     * array back to `/assign`. Same Policy Sets caveat too: only `source: "direct"` (or sourceless)
-     * assignments are retained — a `policySets`-derived one gets duplicated as an independent direct
-     * assignment if echoed back, since it regenerates itself automatically and isn't recognized as
-     * "the same assignment" when re-posted (confirmed live on the configuration-policy path; applied
-     * here defensively since mobileApp assignments can equally originate from a Policy Set).
+     * See assignResourceToGroup's doc comment for the shared /assign mechanics — this is the one
+     * caller that needs `intent` carried through on both retained and new assignment entries, and
+     * that logs a 204 (not 200) on success, both handled via assignResourceToGroup's params.
      */
     public async assignAppToGroup(
         appId: string,
@@ -3568,57 +3685,27 @@ export class IntuneClient {
         this.logger.info('Assigning app to group', { appId, groupNameOrId, intent, ...options });
         await this.trackAuthAttempt();
 
-        const group = await this.resolveGroupId(groupNameOrId);
-        if (!group) {
-            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
-        }
         const base = `/deviceAppManagement/mobileApps/${appId}`;
+        const assignmentODataType = '#microsoft.graph.mobileAppAssignment';
 
         try {
-            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
-            const existing: any[] = existingResponse.value || [];
-            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
-            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
-
-            const retained = directOnly
-                .filter((a: any) => a.target?.groupId !== group.id)
-                .map((a: any) => ({
-                    '@odata.type': a['@odata.type'] ?? '#microsoft.graph.mobileAppAssignment',
-                    intent: a.intent,
-                    target: this.sanitizeAssignmentTarget(a.target)
-                }));
-
-            const newTarget: any = {
-                '@odata.type': options?.exclude
-                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
-                    : '#microsoft.graph.groupAssignmentTarget',
-                groupId: group.id
-            };
-            if (options?.filterId) {
-                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
-                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
-            }
-
-            const updatedAssignments = [
-                ...retained,
-                { '@odata.type': '#microsoft.graph.mobileAppAssignment', intent, target: newTarget }
-            ];
-
-            const apiStart = Date.now();
-            await this.client.api(`${base}/assign`).version('v1.0').post({ mobileAppAssignments: updatedAssignments });
-            logApiCall(this.logger, 'POST', `${base}/assign`, 204, Date.now() - apiStart);
-
-            this.logger.info('App assignment updated', { appId, groupId: group.id, intent, totalAssignments: updatedAssignments.length });
-
-            return {
-                appId,
-                group,
-                intent,
-                exclude: Boolean(options?.exclude),
-                totalAssignments: updatedAssignments.length,
-                previousAssignmentCount: existing.length,
-                replacedExistingForGroup: hadExistingForGroup
-            };
+            const result = await this.assignResourceToGroup({
+                base,
+                version: 'v1.0',
+                assignmentODataType,
+                groupNameOrId,
+                options,
+                bodyKey: 'mobileAppAssignments',
+                mapRetainedEntry: (existing, sanitizedTarget) => ({
+                    '@odata.type': existing['@odata.type'] ?? assignmentODataType,
+                    intent: existing.intent,
+                    target: sanitizedTarget
+                }),
+                buildNewEntry: (newTarget) => ({ '@odata.type': assignmentODataType, intent, target: newTarget }),
+                successStatus: 204
+            });
+            this.logger.info('App assignment updated', { appId, groupId: result.group.id, intent, totalAssignments: result.totalAssignments });
+            return { appId, intent, ...result };
         } catch (error) {
             this.logger.error('Error assigning app to group', {
                 appId, groupNameOrId, intent, error: (error as Error).message, stack: (error as Error).stack
@@ -3717,10 +3804,9 @@ export class IntuneClient {
     }
 
     /**
-     * Add (or move) a group assignment on a compliance policy. Same read-modify-write /assign
-     * pattern as assignConfigurationPolicyToGroup/assignAppToGroup (Graph's /assign replaces the
-     * whole set) — reuses resolveGroupId/sanitizeAssignmentTarget as-is. NOT YET CONFIRMED LIVE:
-     * the exact assignment @odata.type (expected #microsoft.graph.deviceCompliancePolicyAssignment).
+     * Add (or move) a group assignment on a compliance policy. See assignResourceToGroup's doc
+     * comment for the shared /assign mechanics. NOT YET CONFIRMED LIVE: the exact assignment
+     * @odata.type (expected #microsoft.graph.deviceCompliancePolicyAssignment).
      */
     public async assignCompliancePolicyToGroup(
         policyId: string,
@@ -3730,53 +3816,13 @@ export class IntuneClient {
         this.logger.info('Assigning compliance policy to group', { policyId, groupNameOrId, ...options });
         await this.trackAuthAttempt();
 
-        const group = await this.resolveGroupId(groupNameOrId);
-        if (!group) {
-            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
-        }
         const base = `/deviceManagement/deviceCompliancePolicies/${policyId}`;
         const assignmentODataType = '#microsoft.graph.deviceCompliancePolicyAssignment';
 
         try {
-            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
-            const existing: any[] = existingResponse.value || [];
-            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
-            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
-
-            const retained = directOnly
-                .filter((a: any) => a.target?.groupId !== group.id)
-                .map((a: any) => ({
-                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
-                    target: this.sanitizeAssignmentTarget(a.target)
-                }));
-
-            const newTarget: any = {
-                '@odata.type': options?.exclude
-                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
-                    : '#microsoft.graph.groupAssignmentTarget',
-                groupId: group.id
-            };
-            if (options?.filterId) {
-                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
-                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
-            }
-
-            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
-
-            const apiStart = Date.now();
-            await this.client.api(`${base}/assign`).version('v1.0').post({ assignments: updatedAssignments });
-            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
-
-            this.logger.info('Compliance policy assignment updated', { policyId, groupId: group.id, totalAssignments: updatedAssignments.length });
-
-            return {
-                policyId,
-                group,
-                exclude: Boolean(options?.exclude),
-                totalAssignments: updatedAssignments.length,
-                previousAssignmentCount: existing.length,
-                replacedExistingForGroup: hadExistingForGroup
-            };
+            const result = await this.assignResourceToGroup({ base, version: 'v1.0', assignmentODataType, groupNameOrId, options });
+            this.logger.info('Compliance policy assignment updated', { policyId, groupId: result.group.id, totalAssignments: result.totalAssignments });
+            return { policyId, ...result };
         } catch (error) {
             this.logger.error('Error assigning compliance policy to group', {
                 policyId, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
@@ -4086,9 +4132,9 @@ export class IntuneClient {
     }
 
     /**
-     * Add (or move) a group assignment on an app configuration policy. Same read-modify-write
-     * /assign pattern as the other assignment methods in this file. NOT LIVE-VERIFIED — see the
-     * section comment above.
+     * Add (or move) a group assignment on an app configuration policy. See
+     * assignResourceToGroup's doc comment for the shared /assign mechanics. NOT LIVE-VERIFIED —
+     * see the section comment above.
      */
     public async assignAppConfigurationPolicyToGroup(
         id: string,
@@ -4098,53 +4144,13 @@ export class IntuneClient {
         this.logger.info('Assigning app configuration policy to group', { id, groupNameOrId, ...options });
         await this.trackAuthAttempt();
 
-        const group = await this.resolveGroupId(groupNameOrId);
-        if (!group) {
-            throw new Error(`Azure AD group "${groupNameOrId}" not found.`);
-        }
         const base = `/deviceAppManagement/mobileAppConfigurations/${id}`;
         const assignmentODataType = '#microsoft.graph.managedDeviceMobileAppConfigurationAssignment';
 
         try {
-            const existingResponse = await this.client.api(`${base}/assignments`).version('v1.0').top(999).get();
-            const existing: any[] = existingResponse.value || [];
-            const directOnly = existing.filter((a: any) => !a.source || a.source === 'direct');
-            const hadExistingForGroup = directOnly.some((a: any) => a.target?.groupId === group.id);
-
-            const retained = directOnly
-                .filter((a: any) => a.target?.groupId !== group.id)
-                .map((a: any) => ({
-                    '@odata.type': a['@odata.type'] ?? assignmentODataType,
-                    target: this.sanitizeAssignmentTarget(a.target)
-                }));
-
-            const newTarget: any = {
-                '@odata.type': options?.exclude
-                    ? '#microsoft.graph.exclusionGroupAssignmentTarget'
-                    : '#microsoft.graph.groupAssignmentTarget',
-                groupId: group.id
-            };
-            if (options?.filterId) {
-                newTarget.deviceAndAppManagementAssignmentFilterId = options.filterId;
-                newTarget.deviceAndAppManagementAssignmentFilterType = options.filterType ?? 'include';
-            }
-
-            const updatedAssignments = [...retained, { '@odata.type': assignmentODataType, target: newTarget }];
-
-            const apiStart = Date.now();
-            await this.client.api(`${base}/assign`).version('v1.0').post({ assignments: updatedAssignments });
-            logApiCall(this.logger, 'POST', `${base}/assign`, 200, Date.now() - apiStart);
-
-            this.logger.info('App configuration policy assignment updated', { id, groupId: group.id, totalAssignments: updatedAssignments.length });
-
-            return {
-                id,
-                group,
-                exclude: Boolean(options?.exclude),
-                totalAssignments: updatedAssignments.length,
-                previousAssignmentCount: existing.length,
-                replacedExistingForGroup: hadExistingForGroup
-            };
+            const result = await this.assignResourceToGroup({ base, version: 'v1.0', assignmentODataType, groupNameOrId, options });
+            this.logger.info('App configuration policy assignment updated', { id, groupId: result.group.id, totalAssignments: result.totalAssignments });
+            return { id, ...result };
         } catch (error) {
             this.logger.error('Error assigning app configuration policy to group', {
                 id, groupNameOrId, error: (error as Error).message, stack: (error as Error).stack
