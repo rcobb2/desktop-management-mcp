@@ -168,6 +168,9 @@ export class JamfClient {
     private tokenExpiresAt: number = 0;
     private platformToken: string | null = null;
     private platformTokenExpiresAt: number = 0;
+    // Set once the Gateway credential is proven bad (401/403), so restGet() stops
+    // retrying it and uses the tenant credential instead. See restGet() below.
+    private platformGatewayUnusable = false;
     private jamfUrl: string;
     private jamfClientId: string;
     private jamfClientSecret: string;
@@ -304,9 +307,8 @@ export class JamfClient {
     }
 
     // Whether all four Platform API Gateway env vars are configured — used by restGet(),
-    // below, to decide per-call whether the Gateway is even an option, rather than a
-    // try-then-catch-and-retry pattern that would silently mask a genuinely broken Gateway
-    // credential as "just fall back."
+    // below, to decide per-call whether the Gateway is even an option. A credential that
+    // is configured but rejected is handled separately, in restGet()'s catch — see there.
     private hasPlatformGateway(): boolean {
         return !!(this.platformClientId && this.platformClientSecret && this.platformTokenUrl && process.env.JAMF_PLATFORM_TENANT_ID);
     }
@@ -314,15 +316,41 @@ export class JamfClient {
     // Shared entry point for every non-Classic REST GET in this file (see the Platform
     // API Gateway section comment near the top of this file for what's confirmed to work
     // through it). Routes through the Gateway when JAMF_PLATFORM_* is configured, else
-    // uses the direct client — a static per-call decision based on config presence, not a
-    // silent runtime fallback-on-error, so a genuinely broken Gateway credential still
-    // surfaces as a real error instead of being masked.
+    // uses the direct client. The Gateway is an OPTIMIZATION for these endpoints, never a
+    // requirement — the tenant credential serves every one of them — so an auth rejection
+    // (401/403) from the Gateway falls back to the direct client rather than failing the
+    // call. Before 2026-09-04 it did not, and an expired account.jamf.com Integration
+    // secret took down ~30 tools that never needed the Gateway at all, each reporting a
+    // bare 401 with no hint the Gateway was even involved. Gateway-ONLY tools (bulk
+    // FileVault, Compliance Benchmarks, Blueprints) call ensurePlatformAuthenticated()
+    // and platformClient directly, are not routed through here, and still fail loudly.
     private async restGet(directPath: string, config?: { params?: Record<string, any> }) {
-        if (this.hasPlatformGateway()) {
-            await this.ensurePlatformAuthenticated();
-            const tenantId = this.getPlatformTenantId();
-            const gatewayPath = toGatewayProPath(directPath, tenantId);
-            return this.platformClient.get(gatewayPath, config);
+        if (this.hasPlatformGateway() && !this.platformGatewayUnusable) {
+            try {
+                await this.ensurePlatformAuthenticated();
+                const tenantId = this.getPlatformTenantId();
+                const gatewayPath = toGatewayProPath(directPath, tenantId);
+                return await this.platformClient.get(gatewayPath, config);
+            } catch (error) {
+                const status = (error as any)?.response?.status;
+                // Only an auth rejection falls through to the tenant credential. Anything
+                // else (5xx, network, a genuine 404 for a resource the Gateway does mirror)
+                // still propagates, so a real Gateway outage isn't silently papered over.
+                if (status !== 401 && status !== 403) throw error;
+
+                // Latch off for the life of the process: without this, all 30 restGet call
+                // sites would each re-pay a doomed token mint. Deliberately NOT reset on a
+                // timer — a renewed credential arrives via an env change, which restarts
+                // the container anyway.
+                this.platformGatewayUnusable = true;
+                this.logger.error(
+                    `Platform API Gateway rejected our credential (HTTP ${status}). Falling back to the ` +
+                    'tenant JAMF_CLIENT_ID/SECRET for all non-Gateway REST reads for the life of this ' +
+                    'process. Gateway-ONLY tools (bulk FileVault, Compliance Benchmarks, Blueprints) will ' +
+                    'keep failing until JAMF_PLATFORM_CLIENT_ID/SECRET is renewed at account.jamf.com.',
+                    { directPath }
+                );
+            }
         }
         return this.client.get(directPath, config);
     }
