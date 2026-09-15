@@ -94,6 +94,11 @@ The Intune app registration needs these **Application** permissions (with admin 
 
 ## Client Configuration
 
+**For Claude Code (TUI/desktop) and the Claude desktop app against the podman02 deployment, see
+[`CLIENT_SETUP.md`](CLIENT_SETUP.md)** — a step-by-step guide covering the Entra OAuth flows (browser
+PKCE and headless device code), config file locations, and troubleshooting. Note that the static-token
+configs below apply to locally-started servers only: podman02 retired static tokens on 2026-07-15.
+
 Point clients at `http://localhost:<port>/mcp` for a locally-running server, or at the `https://` hostname below when talking to the podman02 deployment (Caddy terminates TLS and reverse-proxies to the container over plain HTTP — the servers themselves never speak TLS directly).
 
 | Environment | JAMF URL | Intune URL |
