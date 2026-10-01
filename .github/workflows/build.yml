@@ -1,0 +1,38 @@
+name: Build and publish container image
+
+# Builds the one shared image (JAMF and Intune servers both run from it, via
+# each quadlet unit's own Exec= override) and publishes it to GHCR, tagged
+# with the commit SHA (immutable — never :latest) so a deploy can pin an
+# exact, reproducible image. Runs entirely on GitHub-hosted runners: this
+# repo is public, so it deliberately has NO self-hosted runner and NO
+# deploy secrets — see rcobb2/desktop-management-mcp-deploy (private) for
+# the actual deploy step, which just bumps the tag referenced there.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push desktop-management-mcp
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/rcobb2/desktop-management-mcp:${{ github.sha }}
+            ghcr.io/rcobb2/desktop-management-mcp:latest
