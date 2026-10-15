@@ -169,9 +169,10 @@ export class JamfClient {
     private tokenExpiresAt: number = 0;
     private platformToken: string | null = null;
     private platformTokenExpiresAt: number = 0;
-    // Set once the Gateway credential is proven bad (401/403), so restGet() stops
-    // retrying it and uses the tenant credential instead. See restGet() below.
-    private platformGatewayUnusable = false;
+    // In-flight token mints, shared so concurrent requests at expiry mint once.
+    private tenantAuthInFlight: Promise<void> | null = null;
+    private platformAuthInFlight: Promise<void> | null = null;
+    private lapsAuthInFlight: Promise<void> | null = null;
     private jamfUrl: string;
     private jamfClientId: string;
     private jamfClientSecret: string;
@@ -224,6 +225,16 @@ export class JamfClient {
             baseURL: this.jamfUrl,
             headers: { 'Accept': 'application/json' },
         });
+
+        // A partly-set optional credential is silently unusable — say so at startup.
+        const platformVars = ['JAMF_PLATFORM_CLIENT_ID', 'JAMF_PLATFORM_CLIENT_SECRET', 'JAMF_PLATFORM_URL', 'JAMF_PLATFORM_TENANT_ID'];
+        const lapsVars = ['JAMF_LAPS_CLIENT_ID', 'JAMF_LAPS_CLIENT_SECRET'];
+        for (const vars of [platformVars, lapsVars]) {
+            const missing = vars.filter(v => !process.env[v]);
+            if (missing.length > 0 && missing.length < vars.length) {
+                this.logger.warn(`Credential partly configured — missing ${missing.join(', ')}; it will not be used`);
+            }
+        }
     }
 
     private async authenticate() {
@@ -262,9 +273,9 @@ export class JamfClient {
     }
 
     private async ensureAuthenticated() {
-        if (!this.token || Date.now() >= this.tokenExpiresAt) {
-            await this.authenticate();
-        }
+        if (this.token && Date.now() < this.tokenExpiresAt) return;
+        this.tenantAuthInFlight ??= this.authenticate().finally(() => { this.tenantAuthInFlight = null; });
+        await this.tenantAuthInFlight;
     }
 
     // Separate OAuth2 client-credentials flow for the Platform API Gateway — confirmed
@@ -283,7 +294,11 @@ export class JamfClient {
             );
         }
         if (this.platformToken && Date.now() < this.platformTokenExpiresAt) return;
+        this.platformAuthInFlight ??= this.authenticatePlatform().finally(() => { this.platformAuthInFlight = null; });
+        await this.platformAuthInFlight;
+    }
 
+    private async authenticatePlatform() {
         this.logger.info("Authenticating with Jamf Platform API Gateway");
         try {
             const apiStart = Date.now();
@@ -328,46 +343,38 @@ export class JamfClient {
         return !!(this.platformClientId && this.platformClientSecret && this.platformTokenUrl && process.env.JAMF_PLATFORM_TENANT_ID);
     }
 
-    // Shared entry point for every non-Classic REST GET in this file (see the Platform
-    // API Gateway section comment near the top of this file for what's confirmed to work
-    // through it). Routes through the Gateway when JAMF_PLATFORM_* is configured, else
-    // uses the direct client. The Gateway is an OPTIMIZATION for these endpoints, never a
-    // requirement — the tenant credential serves every one of them — so an auth rejection
-    // (401/403) from the Gateway falls back to the direct client rather than failing the
-    // call. Before 2026-09-04 it did not, and an expired account.jamf.com Integration
-    // secret took down ~30 tools that never needed the Gateway at all, each reporting a
-    // bare 401 with no hint the Gateway was even involved. Gateway-ONLY tools (bulk
-    // FileVault, Compliance Benchmarks, Blueprints) call ensurePlatformAuthenticated()
-    // and platformClient directly, are not routed through here, and still fail loudly.
+    // Shared entry point for every non-Classic REST GET in this file. Uses the tenant
+    // client (JAMF_CLIENT_*), which can serve every one of these reads, and only falls
+    // back to the Platform API Gateway when the tenant client is rejected (401/403) and
+    // JAMF_PLATFORM_* is configured. Least privilege: the Gateway credential can also
+    // delete computers/config profiles and read LAPS, so it shouldn't be the default for
+    // ordinary reads. (Before 2026-10-15 this was Gateway-first with a fallback latch;
+    // before 2026-09-04 it had no fallback, and an expired Gateway secret took down ~30
+    // tools that never needed it.) Gateway-ONLY tools (bulk FileVault, Compliance
+    // Benchmarks, Blueprints) don't come through here.
     private async restGet(directPath: string, config?: { params?: Record<string, any> }) {
-        if (this.hasPlatformGateway() && !this.platformGatewayUnusable) {
-            try {
-                await this.ensurePlatformAuthenticated();
-                const tenantId = this.getPlatformTenantId();
-                const gatewayPath = toGatewayProPath(directPath, tenantId);
-                return await this.platformClient.get(gatewayPath, config);
-            } catch (error) {
-                const status = (error as any)?.response?.status;
-                // Only an auth rejection falls through to the tenant credential. Anything
-                // else (5xx, network, a genuine 404 for a resource the Gateway does mirror)
-                // still propagates, so a real Gateway outage isn't silently papered over.
-                if (status !== 401 && status !== 403) throw error;
-
-                // Latch off for the life of the process: without this, all 30 restGet call
-                // sites would each re-pay a doomed token mint. Deliberately NOT reset on a
-                // timer — a renewed credential arrives via an env change, which restarts
-                // the container anyway.
-                this.platformGatewayUnusable = true;
-                this.logger.error(
-                    `Platform API Gateway rejected our credential (HTTP ${status}). Falling back to the ` +
-                    'tenant JAMF_CLIENT_ID/SECRET for all non-Gateway REST reads for the life of this ' +
-                    'process. Gateway-ONLY tools (bulk FileVault, Compliance Benchmarks, Blueprints) will ' +
-                    'keep failing until JAMF_PLATFORM_CLIENT_ID/SECRET is renewed at account.jamf.com.',
-                    { directPath }
-                );
+        try {
+            await this.ensureAuthenticated();
+            return await this.client.get(directPath, config);
+        } catch (error) {
+            let status = (error as any)?.response?.status;
+            if (status === 401) {
+                // Token revoked/expired early on Jamf's side — re-mint once before giving up on it.
+                this.token = null;
+                try {
+                    await this.ensureAuthenticated();
+                    return await this.client.get(directPath, config);
+                } catch (retryError) {
+                    status = (retryError as any)?.response?.status;
+                    if ((status !== 401 && status !== 403) || !this.hasPlatformGateway()) throw retryError;
+                }
+            } else if (status !== 403 || !this.hasPlatformGateway()) {
+                throw error;
             }
+            this.logger.warn(`Tenant client rejected (HTTP ${status}); retrying via the Platform API Gateway`, { directPath });
+            await this.ensurePlatformAuthenticated();
+            return this.platformClient.get(toGatewayProPath(directPath, this.getPlatformTenantId()), config);
         }
-        return this.client.get(directPath, config);
     }
 
     // Shared two-step "resolve ID via an RSQL filter, then fetch full detail" fetch — used by
@@ -3777,6 +3784,11 @@ export class JamfClient {
 
     private async ensureLapsAuthenticated() {
         if (this.lapsToken && Date.now() < this.lapsTokenExpiresAt) return;
+        this.lapsAuthInFlight ??= this.authenticateLaps().finally(() => { this.lapsAuthInFlight = null; });
+        await this.lapsAuthInFlight;
+    }
+
+    private async authenticateLaps() {
         this.logger.info("Authenticating with JAMF (LAPS client)");
         logAuth(this.logger, 'attempt', 'jamf-laps');
         const apiStart = Date.now();

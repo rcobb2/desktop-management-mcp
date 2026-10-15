@@ -53,6 +53,10 @@ import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt
 import { hasRole, assertRole, JAMF_READ, JAMF_WRITE, JAMF_ALL_ROLES } from "../utils/roles.js";
 import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
 import { limitConcurrentRequests } from "../utils/concurrency.js";
+import { createLogger } from "../utils/logger.js";
+
+// Audit trail for LAPS reads (who read which Mac's admin account — never the password).
+const auditLogger = createLogger("jamf-audit");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1800,7 +1804,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
     }
 
     // ── 23c. jamf_get_laps_accounts ──────────────────────────────────────────
-    if (hasRole(roles, JAMF_READ)) {
+    if (hasRole(roles, JAMF_WRITE)) {
         server.registerTool(
             "jamf_get_laps_accounts",
             {
@@ -1808,7 +1812,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     "List LAPS-managed local admin accounts on a computer (username, account GUID, source), by " +
                     "name or serial. Uses the narrow-scope JAMF_LAPS_CLIENT_* tenant client, falling back to the " +
                     "Jamf Platform API Gateway (JAMF_PLATFORM_*) — the main tenant client lacks 'View Local Admin Password'. Use " +
-                    "jamf_get_laps_password to read a specific account's current password.",
+                    "jamf_get_laps_password to read a specific account's current password. Requires Jamf.Write.",
                 inputSchema: {
                     computer: z.string().describe("Computer name or serial number"),
                     response_format: ResponseFormatSchema,
@@ -1817,6 +1821,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
             },
             async ({ computer, response_format = "markdown" }) => {
                 try {
+                    assertRole(roles, JAMF_WRITE);
                     const data: any = await client.getLapsAccounts(computer);
                     const accounts: any[] = data.results ?? [];
 
@@ -1837,7 +1842,7 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
     }
 
     // ── 23d. jamf_get_laps_password ──────────────────────────────────────────
-    if (hasRole(roles, JAMF_READ)) {
+    if (hasRole(roles, JAMF_WRITE)) {
         server.registerTool(
             "jamf_get_laps_password",
             {
@@ -1845,16 +1850,20 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     "Read a LAPS-managed local admin account's CURRENT password on a computer, by name/serial and " +
                     "username. Returns a real, live credential — use deliberately for a specific troubleshooting " +
                     "need, not in a loop across many machines. Uses JAMF_LAPS_CLIENT_*, falling back to the Jamf " +
-                    "Platform API Gateway (JAMF_PLATFORM_*). Use jamf_get_laps_accounts first to find the account username.",
+                    "Platform API Gateway (JAMF_PLATFORM_*). Use jamf_get_laps_accounts first to find the account username. " +
+                    "Requires Jamf.Write; every call is audit-logged with the caller.",
                 inputSchema: {
                     computer: z.string().describe("Computer name or serial number"),
                     username: z.string().describe("LAPS account username — use jamf_get_laps_accounts to find one"),
                     response_format: ResponseFormatSchema,
                 },
-                annotations: { readOnlyHint: true, openWorldHint: true },
+                // Not readOnlyHint: returns a live admin credential, so clients should not auto-approve it.
+                annotations: { readOnlyHint: false, openWorldHint: true },
             },
             async ({ computer, username, response_format = "markdown" }) => {
                 try {
+                    assertRole(roles, JAMF_WRITE);
+                    auditLogger.info("LAPS password read", { caller, computer, username });
                     const data = await client.getLapsPassword(computer, username);
 
                     const text = toText(data, response_format, () =>
