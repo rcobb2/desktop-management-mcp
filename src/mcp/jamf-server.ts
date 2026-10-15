@@ -1806,8 +1806,8 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
             {
                 description:
                     "List LAPS-managed local admin accounts on a computer (username, account GUID, source), by " +
-                    "name or serial. Routed through the Jamf Platform API Gateway (JAMF_PLATFORM_* env vars) — " +
-                    "the tenant's own direct API client lacks 'View Local Admin Password' privileges. Use " +
+                    "name or serial. Uses the narrow-scope JAMF_LAPS_CLIENT_* tenant client, falling back to the " +
+                    "Jamf Platform API Gateway (JAMF_PLATFORM_*) — the main tenant client lacks 'View Local Admin Password'. Use " +
                     "jamf_get_laps_password to read a specific account's current password.",
                 inputSchema: {
                     computer: z.string().describe("Computer name or serial number"),
@@ -1844,8 +1844,8 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                 description:
                     "Read a LAPS-managed local admin account's CURRENT password on a computer, by name/serial and " +
                     "username. Returns a real, live credential — use deliberately for a specific troubleshooting " +
-                    "need, not in a loop across many machines. Routed through the Jamf Platform API Gateway " +
-                    "(JAMF_PLATFORM_* env vars). Use jamf_get_laps_accounts first to find the account username.",
+                    "need, not in a loop across many machines. Uses JAMF_LAPS_CLIENT_*, falling back to the Jamf " +
+                    "Platform API Gateway (JAMF_PLATFORM_*). Use jamf_get_laps_accounts first to find the account username.",
                 inputSchema: {
                     computer: z.string().describe("Computer name or serial number"),
                     username: z.string().describe("LAPS account username — use jamf_get_laps_accounts to find one"),

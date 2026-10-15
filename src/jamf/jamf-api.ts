@@ -178,6 +178,13 @@ export class JamfClient {
     private platformClientId: string;
     private platformClientSecret: string;
     private platformTokenUrl: string;
+    // Optional narrow-scope tenant API client (Read Computers + View Local Admin
+    // Password) used for LAPS ahead of the Gateway — see lapsGet() below.
+    private lapsClient: AxiosInstance;
+    private lapsClientId: string;
+    private lapsClientSecret: string;
+    private lapsToken: string | null = null;
+    private lapsTokenExpiresAt: number = 0;
     private logger = createLogger('jamf-api');
 
     constructor() {
@@ -208,6 +215,13 @@ export class JamfClient {
 
         this.platformClient = axios.create({
             baseURL: platformApiBaseUrl(),
+            headers: { 'Accept': 'application/json' },
+        });
+
+        this.lapsClientId = process.env.JAMF_LAPS_CLIENT_ID ?? '';
+        this.lapsClientSecret = process.env.JAMF_LAPS_CLIENT_SECRET ?? '';
+        this.lapsClient = axios.create({
+            baseURL: this.jamfUrl,
             headers: { 'Accept': 'application/json' },
         });
     }
@@ -3740,20 +3754,78 @@ export class JamfClient {
         }
     }
 
-    // ─── LAPS (Local Admin Password, Platform API Gateway) ──────────────────
+    // ─── LAPS (Local Admin Password) ─────────────────────────────────────────
     // The tenant's own JAMF_CLIENT_ID/SECRET role 403s (INVALID_PRIVILEGE, missing
-    // "View Local Admin Password") on both LAPS endpoints directly — same shape as
-    // the bulk FileVault gap above, and the same Gateway credential covers it. No new
-    // credential or privilege grant needed beyond the existing JAMF_PLATFORM_* Gateway
-    // credential already wired up for FileVault/Compliance Benchmarks/Blueprints.
-    // CONFIRMED LIVE 2026-07-30 against a real device (managementId resolved, 2 real
-    // LAPS accounts listed with real username/guid fields, and a real current password
-    // successfully retrieved for one of them). One real bug caught by this testing:
-    // an earlier version of the password path dropped `clientManagementId` (passing it
-    // as a query param instead of keeping it in the path like the accounts-list
-    // endpoint does) and got a 403 back that looked exactly like a missing-privilege
-    // error — it wasn't; the fix was purely the path shape, confirmed by retesting
-    // after the fix with no credential/privilege change at all.
+    // "View Local Admin Password") on both LAPS endpoints. Two credentials can read
+    // them, tried in this order by lapsGet():
+    //   1. JAMF_LAPS_CLIENT_ID/SECRET — a narrow-scope tenant API client (Read
+    //      Computers + View Local Admin Password) made 2026-08-06 for bootstrap-token
+    //      escrow. Hits the tenant's own /api/v2/local-admin-password/... directly.
+    //   2. The JAMF_PLATFORM_* Gateway credential, via its mirrored
+    //      /pro/v2/tenant/{tenantId}/local-admin-password/... path.
+    // Before 2026-10-15 LAPS used the Gateway only, so when that credential died
+    // (401 at token mint, 2026-09-04 → 2026-10-15) LAPS went down with it and the
+    // LAPS-password-into-SSH troubleshooting workflow had no path at all, even though
+    // the narrow tenant client was working the whole time.
+    // CONFIRMED LIVE 2026-07-30 (Gateway path). Path-shape gotcha caught then:
+    // clientManagementId must stay in the password path, not a query param — the
+    // malformed form 403s exactly like a missing privilege.
+
+    private hasLapsClient(): boolean {
+        return !!(this.lapsClientId && this.lapsClientSecret);
+    }
+
+    private async ensureLapsAuthenticated() {
+        if (this.lapsToken && Date.now() < this.lapsTokenExpiresAt) return;
+        this.logger.info("Authenticating with JAMF (LAPS client)");
+        const apiStart = Date.now();
+        const response = await axios.post(`${this.jamfUrl}/api/v1/oauth/token`,
+            new URLSearchParams({
+                grant_type: 'client_credentials',
+                client_id: this.lapsClientId,
+                client_secret: this.lapsClientSecret
+            }), {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            }
+        );
+        logApiCall(this.logger, 'POST', '/api/v1/oauth/token', response.status, Date.now() - apiStart);
+        this.lapsToken = response.data.access_token;
+        this.lapsTokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
+        this.lapsClient.defaults.headers.common['Authorization'] = `Bearer ${this.lapsToken}`;
+    }
+
+    // GET a LAPS endpoint by its direct tenant path (/api/v2/local-admin-password/...).
+    // Uses the LAPS tenant client when configured; an auth rejection (401/403, at token
+    // mint or on the call) falls through to the Gateway when that is configured too,
+    // so either credential alone keeps LAPS working. Anything else (404, 5xx) propagates.
+    private async lapsGet(directPath: string) {
+        if (this.hasLapsClient()) {
+            try {
+                await this.ensureLapsAuthenticated();
+                return await this.lapsClient.get(directPath);
+            } catch (error) {
+                const status = (error as any)?.response?.status;
+                if ((status !== 401 && status !== 403) || !this.hasPlatformGateway()) throw error;
+                this.lapsToken = null;
+                this.logger.warn(`LAPS tenant client rejected (HTTP ${status}); trying the Platform API Gateway`, { directPath });
+            }
+        }
+        if (!this.hasPlatformGateway()) {
+            throw new Error(
+                "LAPS needs a credential with 'View Local Admin Password': set JAMF_LAPS_CLIENT_ID/" +
+                "JAMF_LAPS_CLIENT_SECRET (narrow-scope tenant API client) or the JAMF_PLATFORM_* Gateway credential."
+            );
+        }
+        await this.ensurePlatformAuthenticated();
+        return this.platformClient.get(toGatewayProPath(directPath, this.getPlatformTenantId()));
+    }
+
+    private lapsPermissionError(status: number): Error {
+        return new Error(
+            `Permission denied (${status}) reading LAPS. Check that JAMF_LAPS_CLIENT_* has 'View Local Admin ` +
+            `Password' in its Jamf Pro API role, or that the JAMF_PLATFORM_* Gateway credential is current and has LAPS privileges.`
+        );
+    }
 
     // Resolves a computer's `clientManagementId` — the GUID LAPS keys off, distinct
     // from the plain numeric Jamf computer ID `resolveComputerId` returns. Confirmed
@@ -3778,46 +3850,42 @@ export class JamfClient {
         return managementId;
     }
 
-    /** List LAPS-managed local admin accounts on a computer, by name or serial. */
-    public async getLapsAccounts(nameOrSerial: string) {
-        await this.ensurePlatformAuthenticated();
-        const tenantId = this.getPlatformTenantId();
-        const clientManagementId = await this.resolveClientManagementId(nameOrSerial);
+    private async fetchLapsAccounts(nameOrSerial: string, clientManagementId: string) {
         this.logger.info('Fetching LAPS accounts', { nameOrSerial, clientManagementId });
+        const path = `/api/v2/local-admin-password/${clientManagementId}/accounts`;
         try {
-            const path = `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/accounts`;
             const apiStart = Date.now();
-            const response = await this.platformClient.get(path);
+            const response = await this.lapsGet(path);
             logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
             return response.data;
         } catch (error) {
             const status = (error as any)?.response?.status;
-            if (status === 403 || status === 401) {
-                throw new Error(`Permission denied (${status}). The Platform API Gateway credential may be missing LAPS privileges on its account.jamf.com Integration.`);
-            }
+            logApiCall(this.logger, 'GET', path, undefined, undefined, error as Error);
+            if (status === 403 || status === 401) throw this.lapsPermissionError(status);
             if (status === 404) {
                 throw new Error(`No LAPS accounts found for computer "${nameOrSerial}" (managementId ${clientManagementId}) — it may not have LAPS enabled.`);
             }
             this.logger.error('Error fetching LAPS accounts', { nameOrSerial, error: (error as Error).message });
-            logApiCall(this.logger, 'GET', `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/accounts`, undefined, undefined, error as Error);
             throw error;
         }
+    }
+
+    /** List LAPS-managed local admin accounts on a computer, by name or serial. */
+    public async getLapsAccounts(nameOrSerial: string) {
+        const clientManagementId = await this.resolveClientManagementId(nameOrSerial);
+        return this.fetchLapsAccounts(nameOrSerial, clientManagementId);
     }
 
     /**
      * Read a LAPS-managed local admin account's current password, by computer
      * name/serial and account username. Resolves the account's own GUID (a distinct
-     * identifier from clientManagementId, needed for the password path) from
-     * getLapsAccounts rather than requiring the caller to already know it. Confirmed
-     * live 2026-07-30 against a real device/account, including the exact field names
-     * parsed here (username/guid).
+     * identifier from clientManagementId, needed for the password path) from the
+     * accounts list rather than requiring the caller to already know it.
      */
     public async getLapsPassword(nameOrSerial: string, username: string) {
-        await this.ensurePlatformAuthenticated();
-        const tenantId = this.getPlatformTenantId();
         const clientManagementId = await this.resolveClientManagementId(nameOrSerial);
 
-        const accountsData = await this.getLapsAccounts(nameOrSerial);
+        const accountsData = await this.fetchLapsAccounts(nameOrSerial, clientManagementId);
         const accounts: any[] = accountsData.results ?? accountsData.accounts ?? (Array.isArray(accountsData) ? accountsData : []);
         const account = accounts.find((a: any) => String(a.username ?? a.userName ?? '').toLowerCase() === username.toLowerCase());
         if (!account) {
@@ -3829,23 +3897,18 @@ export class JamfClient {
         }
 
         this.logger.info('Fetching LAPS password', { nameOrSerial, clientManagementId, username });
+        // Account username from the list, not the caller's casing — the path is case-sensitive.
+        const path = `/api/v2/local-admin-password/${clientManagementId}/account/${encodeURIComponent(account.username ?? username)}/${guid}/password`;
         try {
-            // clientManagementId stays in the path here, same as the accounts-list
-            // endpoint above — an earlier version of this method dropped it (passing it
-            // as a query param instead) and got a 403 back that looked like a privilege
-            // gap but was actually just a malformed path; confirmed live once fixed.
-            const path = `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/account/${encodeURIComponent(username)}/${guid}/password`;
             const apiStart = Date.now();
-            const response = await this.platformClient.get(path);
+            const response = await this.lapsGet(path);
             logApiCall(this.logger, 'GET', path, response.status, Date.now() - apiStart);
-            return { username, clientManagementId, ...response.data };
+            return { username: account.username ?? username, clientManagementId, ...response.data };
         } catch (error) {
             const status = (error as any)?.response?.status;
-            if (status === 403 || status === 401) {
-                throw new Error(`Permission denied (${status}). The Platform API Gateway credential may be missing LAPS privileges on its account.jamf.com Integration.`);
-            }
+            logApiCall(this.logger, 'GET', path, undefined, undefined, error as Error);
+            if (status === 403 || status === 401) throw this.lapsPermissionError(status);
             this.logger.error('Error fetching LAPS password', { nameOrSerial, username, error: (error as Error).message });
-            logApiCall(this.logger, 'GET', `/pro/v2/tenant/${tenantId}/local-admin-password/${clientManagementId}/account/${encodeURIComponent(username)}/password`, undefined, undefined, error as Error);
             throw error;
         }
     }
