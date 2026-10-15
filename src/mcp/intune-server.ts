@@ -1367,7 +1367,7 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                     installCommandLine: z.string().describe('e.g. "msiexec /i \\"App.msi\\" /qn"'),
                     uninstallCommandLine: z.string().describe('e.g. "msiexec /x \\"{GUID}\\" /qn"'),
                     applicableArchitectures: z.enum(["x86", "x64", "none"]).optional().describe("Default: x64"),
-                    minimumSupportedWindowsRelease: z.string().optional().describe('e.g. "Windows10_1607", "Windows11_23H2" — default: "Windows10_1607"'),
+                    minimumSupportedWindowsRelease: z.string().optional().describe('Graph release string, e.g. "1607", "21H2" — default: "1607". Graph rejects the "Windows10_1607" form with "Unknown MinimumSupportedWindowsRelease".'),
                     runAsAccount: z.enum(["system", "user"]).optional().describe("Default: system"),
                     deviceRestartBehavior: z.enum(["basedOnReturnCode", "allow", "suppress", "force"]).optional().describe("Default: basedOnReturnCode"),
                     returnCodes: z

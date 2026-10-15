@@ -1114,13 +1114,16 @@ export class JamfClient {
     // fetch/FormData rather than axios — axios's Node adapter doesn't cleanly
     // multipart-encode a standard FormData without the extra `form-data` package,
     // which isn't a dependency here.
-    private async uploadPackageFile(id: string, localFilePath: string): Promise<any> {
+    // fileName must be the same name the package metadata was created with:
+    // Jamf rejects the upload (400 INVALID_FILE_NAME) otherwise. That differs
+    // from the path's basename for staged uploads, whose on-disk name carries a
+    // `<uuid>-` prefix.
+    private async uploadPackageFile(id: string, localFilePath: string, fileName: string): Promise<any> {
         await this.ensureAuthenticated();
         const { openAsBlob } = await import('node:fs');
-        const path = await import('node:path');
         const fileBlob = await openAsBlob(localFilePath);
         const form = new FormData();
-        form.append('file', fileBlob, path.basename(localFilePath));
+        form.append('file', fileBlob, fileName);
 
         const apiStart = Date.now();
         const response = await fetch(`${this.jamfUrl}/api/v1/packages/${id}/upload`, {
@@ -1275,7 +1278,7 @@ export class JamfClient {
 
         const uploadResult = fileBuffer
             ? await this.uploadPackageFileBuffer(id, fileBuffer, fileName)
-            : await this.uploadPackageFile(id, resolvedFilePath!);
+            : await this.uploadPackageFile(id, resolvedFilePath!, fileName);
         // Consumed — free the disk now instead of waiting for the TTL sweeper. Only reached on
         // success, so a failed upload can be retried against the same staged path.
         if (stagedFile) removeStagedFile(resolvedFilePath!);
