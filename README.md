@@ -65,7 +65,7 @@ Injected by `bws run` from your BWS project (see `bws-secrets.map`):
 - `JAMF_CLIENT_ID`, `JAMF_CLIENT_SECRET`
 - `JAMF_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 - `JAMF_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://jamf-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`, used to build RFC 9728 resource metadata)
-- `JAMF_PACKAGE_UPLOAD_DIR` — directory `jamf_upload_package` may read files from on this server's own filesystem. Required for that tool; it refuses every call if unset.
+- `JAMF_PACKAGE_UPLOAD_DIR` — directory `jamf_upload_package` may read files from on this server's own filesystem. Optional since staged uploads (see below): `jamf_upload_package` also accepts files staged via `PUT /uploads`. Paths outside both directories are refused.
 - `JAMF_PLATFORM_CLIENT_ID` / `JAMF_PLATFORM_CLIENT_SECRET` — OAuth2 client-credentials pair for the Jamf Platform API Gateway, from a separate account.jamf.com Integration (not the same as `JAMF_CLIENT_ID`/`JAMF_CLIENT_SECRET`). Required by `jamf_list_filevault_status`, the `jamf_*_compliance_*` tools, and the `jamf_*_blueprint*` tools; see `src/jamf/jamf-api.ts` for details.
 - `JAMF_PLATFORM_URL` — token endpoint for the above credential (e.g. `https://us.apigw.jamf.com/auth/token`)
 - `JAMF_PLATFORM_TENANT_ID` — tenant UUID for the Platform API Gateway (distinct from `JAMF_URL`)
@@ -75,6 +75,11 @@ Injected by `bws run` from your BWS project (see `bws-secrets.map`):
 - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` — Graph app-only client credentials for device data; unrelated to the Entra auth vars below
 - `INTUNE_MCP_AUTH_TOKEN` — bearer token(s) MCP clients must present (comma-separated to allow rotation)
 - `INTUNE_MCP_PUBLIC_URL` — this server's externally-visible origin, e.g. `https://intune-mcp.colgate.edu` (required only when `ENTRA_OAUTH_ENABLED=true`)
+
+**Staged uploads** (optional; shared by both servers — see [Staged uploads](#staged-uploads)):
+- `MCP_UPLOAD_DIR` — staging directory for `PUT /uploads` (created mode 0700). Default: `<os tmpdir>/mcp-uploads` — container-local and ephemeral, which is fine for staging
+- `MCP_UPLOAD_MAX_BYTES` — max size of one staged file (default 8 GiB)
+- `MCP_UPLOAD_TTL_HOURS` — staged files not consumed within this many hours are swept (default 24; abandoned `.part` files after 1h)
 
 **Entra ID auth** (optional; shared by both servers — see `CLAUDE.md` for the caveat that a single shared deployment env file means both servers currently enable/disable together despite the per-service naming):
 - `ENTRA_OAUTH_ENABLED` — `"true"` to accept Entra-issued bearer tokens on `/mcp` in addition to the static token
@@ -91,6 +96,23 @@ The Intune app registration needs these **Application** permissions (with admin 
 - `DeviceManagementConfiguration.Read.All`
 - `Group.Read.All`
 - `User.Read.All`
+
+## Staged uploads
+
+Tool-call arguments are limited to ~100KB (the JSON body limit on `/mcp`), so installers can't be passed inline. Both servers expose `PUT /uploads/<fileName>` to stage a file on the server first:
+
+```bash
+scripts/stage-upload.sh jamf   ./Office.pkg          # -> {"path": "/tmp/mcp-uploads/<uuid>-Office.pkg", "sha256": ..., ...}
+scripts/stage-upload.sh intune ./App.intunewin
+```
+
+Then pass the returned `path` as `localFilePath` to `jamf_upload_package` or as `intunewinFilePath` to `intune_create_win32_app`. The staged copy is deleted after a successful tool call (and by the TTL sweeper otherwise).
+
+- Same auth as `/mcp` (Bearer token), plus the `Jamf.Write` / `Intune.Write` role; 403 otherwise.
+- File names must match `^[A-Za-z0-9][A-Za-z0-9._ -]{0,199}$` with extension `.pkg`/`.dmg` (Jamf) or `.intunewin` (Intune).
+- The body is streamed to disk (never buffered), capped by `MCP_UPLOAD_MAX_BYTES` (413), at most 2 concurrent uploads (429). An optional `X-Content-SHA256` header is verified (400 on mismatch). Responds `201 {path, fileName, size, sha256, expiresAt}`.
+- `scripts/stage-upload.sh` fetches a token via `entra-device-auth.js` (`ENTRA_DEVICE_AUTH_JS`, else this repo's built `dist/src/cli/entra-device-auth.js`, else `~/DesktopManagement/scripts/mcp-wrappers/entra-device-auth.js`); override the target with `MCP_BASE_URL`.
+- Any reverse proxy in front (Caddy, APIM) must allow large request bodies and long uploads on `/uploads`.
 
 ## Client Configuration
 
@@ -235,7 +257,7 @@ The write tools below require the `Jamf.Write` role under Entra auth. `jamf_crea
 | `jamf_update_computer` | Update computer inventory fields | `computerNameOrSerial`, `username?`, `realName?`, `emailAddress?`, `department?`, `building?`, `room?`, `assetTag?` |
 | `jamf_flush_mdm_commands` | Flush pending/failed MDM commands | `computerNameOrSerial`, `status?` |
 | `jamf_create_script` | Create/update a script (upsert by name) | `name`, `scriptContents`, `categoryName?`, `info?`, `notes?`, `priority?`, `osRequirements?`, `parameter4?`...`parameter11?` |
-| `jamf_upload_package` | Upload a .pkg/.dmg and create/update its package object (upsert by name) | `localFilePath` (server-side path, inside `JAMF_PACKAGE_UPLOAD_DIR`), `packageName`, `categoryName?`, `priority?`, plus install-behavior flags |
+| `jamf_upload_package` | Upload a .pkg/.dmg and create/update its package object (upsert by name). Large files: stage via `PUT /uploads` first | `localFilePath` (server-side path: the staged `path`, or inside `JAMF_PACKAGE_UPLOAD_DIR`), `packageName`, `categoryName?`, `priority?`, plus install-behavior flags |
 | `jamf_create_smart_group` | Create/update an Application Title+Version detection smart group (upsert by name) | `name`, `applicationTitle`, `applicationVersion`, `siteId?` |
 | `jamf_create_policy` | Create a policy scoped to smart/static groups; script-only policies supported | `name`, `enabled?`, trigger/frequency fields, `categoryName?`, `targetGroupNames?`, `exclusionGroupNames?`, `scripts?`, `packages?`, `selfService?`, `maintenanceRecon?` |
 | `jamf_update_policy` | Enable/disable + widen/narrow an existing policy's scope | `policy`, `enabled?`, `addTargetGroupNames?`, `removeTargetGroupNames?`, `addExclusionGroupNames?`, `removeExclusionGroupNames?` |
@@ -270,6 +292,7 @@ Compliance Benchmarks, Blueprints, and `jamf_list_filevault_status` all hit the 
 | `intune_list_app_deployments` | Intune app deployments | `appName?`, `publisher?`, `platform?` |
 | `intune_get_app_assignments` | Assignment targets for an app, by ID or name | `appId?`, `appName?` |
 | `intune_troubleshoot_app` | Correlates app assignment + device app status | `deviceName?`, `deviceId?`, `serialNumber?`, `appId?`, `appName?` |
+| `intune_create_win32_app` | Publish a Win32 app (create object, upload + commit .intunewin). Large packages: stage via `PUT /uploads` first | `displayName`, `publisher`, `installCommandLine`, `uninstallCommandLine`, `rules`, `intunewinFilePath` (staged `path`) or `intunewinFileBase64` (tiny packages only), plus install-behavior options |
 
 ## Running Tests
 

@@ -48,6 +48,7 @@ import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@mo
 import { z } from "zod";
 import { JamfClient } from "../jamf/jamf-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
+import { createUploadRouter, startUploadSweeper } from "../utils/uploads.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, JAMF_READ, JAMF_WRITE, JAMF_ALL_ROLES } from "../utils/roles.js";
 import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
@@ -2013,16 +2014,19 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
                     "same packageName already exists) its package object. Re-running with the same packageName " +
                     "updates that package's metadata and replaces its uploaded bytes — it does not create a " +
                     "duplicate (the yearly re-publish case, e.g. Office or MATLAB version bumps). " +
-                    "Pass exactly ONE of localFilePath or fileContentBase64: " +
-                    "localFilePath must be a path on THIS MCP SERVER'S OWN FILESYSTEM (not the MCP client's " +
-                    "machine), inside the directory configured by JAMF_PACKAGE_UPLOAD_DIR, and streams the file " +
-                    "off disk — the only sane option for large installers. fileContentBase64 (with fileName) " +
-                    "lets the file live on the MCP client's machine instead — practical for smaller packages, " +
-                    "but the whole decoded file is buffered in memory with no streaming, so it's a poor fit for " +
-                    "multi-GB installers; use localFilePath for those.",
+                    "Pass exactly ONE of localFilePath or fileContentBase64. " +
+                    "WORKFLOW FOR REAL INSTALLERS: tool-call arguments are capped at ~100KB by the HTTP layer, so " +
+                    "for anything larger than ~70KB, first PUT the file to https://<this server>/uploads/<fileName> " +
+                    "with the same Bearer token (see scripts/stage-upload.sh — `scripts/stage-upload.sh jamf <file>`), " +
+                    "then pass the returned `path` as localFilePath. The file is streamed from disk (no buffering) " +
+                    "and the staged copy is deleted after a successful upload. localFilePath must be a path on THIS " +
+                    "MCP SERVER'S OWN FILESYSTEM (not the client's machine): either that staged path or, if " +
+                    "configured, inside JAMF_PACKAGE_UPLOAD_DIR. fileContentBase64 (with fileName) is only practical " +
+                    "for tiny packages — the whole decoded file is buffered in memory.",
                 inputSchema: {
                     localFilePath: z.string().optional().describe(
-                        "Absolute path to the .pkg/.dmg file on the MCP server's local filesystem, inside JAMF_PACKAGE_UPLOAD_DIR. " +
+                        "Absolute path on the MCP server's local filesystem: the `path` returned by PUT https://<this server>/uploads/<fileName> " +
+                        "(required for anything larger than ~70KB — see scripts/stage-upload.sh), or a file inside JAMF_PACKAGE_UPLOAD_DIR if configured. " +
                         "Pass this OR fileContentBase64, not both."
                     ),
                     fileContentBase64: z.string().optional().describe(
@@ -3340,9 +3344,10 @@ function createJamfMcpServer(roles: string[], caller: string): McpServer {
 
 async function main() {
     const app = express();
-    app.use(express.json());
     // Mounted before routes so it wraps everything below, including /health and /metrics itself.
     app.use(metricsMiddleware);
+    // NOTE: no global express.json() — its 100KB limit applies only to /mcp (mounted below), and
+    // /uploads must see the raw request stream so installers can be piped straight to disk.
 
     const PORT = parseInt(process.env.PORT ?? "3001", 10);
     const publicUrl = process.env.JAMF_MCP_PUBLIC_URL;
@@ -3366,21 +3371,34 @@ async function main() {
         );
     }
 
+    // Shared by /mcp and /uploads so both endpoints accept exactly the same credentials.
+    const mcpAuthOptions = {
+        staticTokenEnvVar: "JAMF_MCP_AUTH_TOKEN",
+        allRoles: JAMF_ALL_ROLES,
+        entraVerifier: createEntraVerifier({
+            tenantId: process.env.ENTRA_TENANT_ID ?? "",
+            audience: [process.env.ENTRA_RESOURCE_APP_ID_URI, process.env.ENTRA_RESOURCE_APP_ID].filter(
+                (v): v is string => !!v
+            ),
+        }),
+        entraEnabledEnvVar: "ENTRA_OAUTH_ENABLED",
+        resourceMetadataUrl,
+    };
+
+    app.use("/mcp", requireMcpAuth(mcpAuthOptions));
+    // Parsed after auth so unauthenticated callers can't make us buffer a JSON body.
+    app.use("/mcp", express.json());
+
+    // Staged-upload side door for installers too large for a JSON tool call (see utils/uploads.ts).
     app.use(
-        "/mcp",
-        requireMcpAuth({
-            staticTokenEnvVar: "JAMF_MCP_AUTH_TOKEN",
-            allRoles: JAMF_ALL_ROLES,
-            entraVerifier: createEntraVerifier({
-                tenantId: process.env.ENTRA_TENANT_ID ?? "",
-                audience: [process.env.ENTRA_RESOURCE_APP_ID_URI, process.env.ENTRA_RESOURCE_APP_ID].filter(
-                    (v): v is string => !!v
-                ),
-            }),
-            entraEnabledEnvVar: "ENTRA_OAUTH_ENABLED",
-            resourceMetadataUrl,
+        createUploadRouter({
+            auth: mcpAuthOptions,
+            requiredRole: JAMF_WRITE,
+            allowedExtensions: [".pkg", ".dmg"],
+            label: "jamf-mcp",
         })
     );
+    startUploadSweeper();
 
     // Bounds how many /mcp requests this process handles concurrently — see
     // limitConcurrentRequests()'s doc comment (closes MCP_TOOL_GAPS.md gap #15).
