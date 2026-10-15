@@ -3778,16 +3778,28 @@ export class JamfClient {
     private async ensureLapsAuthenticated() {
         if (this.lapsToken && Date.now() < this.lapsTokenExpiresAt) return;
         this.logger.info("Authenticating with JAMF (LAPS client)");
+        logAuth(this.logger, 'attempt', 'jamf-laps');
         const apiStart = Date.now();
-        const response = await axios.post(`${this.jamfUrl}/api/v1/oauth/token`,
-            new URLSearchParams({
-                grant_type: 'client_credentials',
-                client_id: this.lapsClientId,
-                client_secret: this.lapsClientSecret
-            }), {
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-            }
-        );
+        let response;
+        try {
+            response = await axios.post(`${this.jamfUrl}/api/v1/oauth/token`,
+                new URLSearchParams({
+                    grant_type: 'client_credentials',
+                    client_id: this.lapsClientId,
+                    client_secret: this.lapsClientSecret
+                }), {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                }
+            );
+        } catch (error) {
+            logAuth(this.logger, 'failure', 'jamf-laps', error as Error);
+            // A bad client ID/secret comes back from the token endpoint as 400
+            // (invalid_client) or 401 — tag it so lapsGet() treats both as an auth
+            // rejection and falls back to the Gateway.
+            if ((error as any)?.response?.status === 400) (error as any).response.status = 401;
+            throw error;
+        }
+        logAuth(this.logger, 'success', 'jamf-laps');
         logApiCall(this.logger, 'POST', '/api/v1/oauth/token', response.status, Date.now() - apiStart);
         this.lapsToken = response.data.access_token;
         this.lapsTokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
