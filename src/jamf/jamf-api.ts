@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { createLogger, logApiCall, logAuth } from '../utils/logger.js';
+import { isInsideUploadDir, removeStagedFile, stagedOriginalName } from '../utils/uploads.js';
 
 /**
  * Escapes a value for safe interpolation into a JAMF Pro RSQL filter string
@@ -1204,21 +1205,30 @@ export class JamfClient {
         let fileBuffer: Buffer | undefined;
         const path = await import('node:path');
 
+        let stagedFile = false;
         if (params.localFilePath) {
+            // Two places a server-side path may live: the operator-configured
+            // JAMF_PACKAGE_UPLOAD_DIR (existing behavior, when set), or the staging
+            // dir that PUT /uploads writes to (new — the only way for a remote client
+            // to get a multi-GB file onto this server). The staging check is
+            // realpath-based; the legacy one stays lexical, exactly as before.
             const uploadDir = process.env.JAMF_PACKAGE_UPLOAD_DIR;
-            if (!uploadDir) {
-                throw new Error(
-                    "JAMF_PACKAGE_UPLOAD_DIR is not set — refusing to read any local file for package upload. " +
-                    "Set this env var to the directory package files are staged in, or pass fileContentBase64 " +
-                    "instead if the file lives on the MCP client's machine rather than this server's."
-                );
-            }
-            const resolvedUploadDir = path.resolve(uploadDir);
             resolvedFilePath = path.resolve(params.localFilePath);
-            if (resolvedFilePath !== resolvedUploadDir && !resolvedFilePath.startsWith(resolvedUploadDir + path.sep)) {
-                throw new Error(
-                    `Refusing to read file outside the allowed upload directory. "${params.localFilePath}" is not inside JAMF_PACKAGE_UPLOAD_DIR ("${uploadDir}").`
-                );
+            stagedFile = isInsideUploadDir(resolvedFilePath);
+            if (!stagedFile) {
+                if (!uploadDir) {
+                    throw new Error(
+                        "JAMF_PACKAGE_UPLOAD_DIR is not set — refusing to read any local file for package upload outside the staging directory. " +
+                        "Stage the file first with PUT /uploads/<fileName> (see scripts/stage-upload.sh) and pass the returned `path`, " +
+                        "or pass fileContentBase64 instead if the file is small."
+                    );
+                }
+                const resolvedUploadDir = path.resolve(uploadDir);
+                if (resolvedFilePath !== resolvedUploadDir && !resolvedFilePath.startsWith(resolvedUploadDir + path.sep)) {
+                    throw new Error(
+                        `Refusing to read file outside the allowed upload directories. "${params.localFilePath}" is not inside JAMF_PACKAGE_UPLOAD_DIR ("${uploadDir}") or the staged-upload directory.`
+                    );
+                }
             }
 
             const fsPromises = await import('node:fs/promises');
@@ -1226,7 +1236,8 @@ export class JamfClient {
             if (!stat || !stat.isFile()) {
                 throw new Error(`Local file not found or not a regular file: "${params.localFilePath}"`);
             }
-            fileName = path.basename(resolvedFilePath);
+            // Staged files carry a `<uuid>-` prefix for uniqueness — Jamf should see the original name.
+            fileName = stagedFile ? stagedOriginalName(resolvedFilePath) : path.basename(resolvedFilePath);
         } else {
             if (!params.fileName) {
                 throw new Error("`fileName` is required when uploading via fileContentBase64 (there's no local path to derive it from).");
@@ -1265,6 +1276,9 @@ export class JamfClient {
         const uploadResult = fileBuffer
             ? await this.uploadPackageFileBuffer(id, fileBuffer, fileName)
             : await this.uploadPackageFile(id, resolvedFilePath!);
+        // Consumed — free the disk now instead of waiting for the TTL sweeper. Only reached on
+        // success, so a failed upload can be retried against the same staged path.
+        if (stagedFile) removeStagedFile(resolvedFilePath!);
         this.logger.info('Package upserted and uploaded', { id, packageName: params.packageName, action });
         return { action, id, packageName: params.packageName, fileName, uploadResult };
     }

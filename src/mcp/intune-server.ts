@@ -36,6 +36,7 @@ import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@mo
 import { z } from "zod";
 import { IntuneClient } from "../intune/graph-api.js";
 import { requireMcpAuth } from "../utils/auth.js";
+import { createUploadRouter, startUploadSweeper } from "../utils/uploads.js";
 import { createEntraVerifier, buildEntraOAuthMetadata } from "../utils/entra-jwt.js";
 import { hasRole, assertRole, INTUNE_READ, INTUNE_WRITE, INTUNE_ALL_ROLES } from "../utils/roles.js";
 import { metricsMiddleware, metricsHandler, instrumentToolCalls } from "../utils/metrics.js";
@@ -1345,9 +1346,14 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                     "and marks it ready to assign. Always creates a NEW app object — this does not upsert by " +
                     "displayName; updating an existing app's installer means adding a new content version, a " +
                     "materially different operation. Use intune_assign_app_to_groups afterward to actually deploy " +
-                    "it. `intunewinFileBase64` must be the raw .intunewin file produced by the Win32 Content Prep " +
-                    "Tool, base64-encoded — practical for typical app sizes, but the whole decoded package is " +
-                    "held in memory (no streaming), so very large installers may need a different path. `rules` " +
+                    "it. Pass exactly ONE of `intunewinFilePath` or `intunewinFileBase64` (the raw .intunewin from the " +
+                    "Win32 Content Prep Tool). WORKFLOW FOR REAL PACKAGES: tool-call arguments are capped at ~100KB " +
+                    "by the HTTP layer, so for anything larger than ~70KB, first PUT the file to " +
+                    "https://<this server>/uploads/<fileName> with the same Bearer token (see scripts/stage-upload.sh " +
+                    "— `scripts/stage-upload.sh intune <file>`), then pass the returned `path` as intunewinFilePath. " +
+                    "That path is streamed to Azure without buffering the package, and the staged copy is deleted " +
+                    "after a successful publish. intunewinFileBase64 is only practical for tiny packages (the whole " +
+                    "decoded file is held in memory). `rules` " +
                     "must be Microsoft Graph win32LobAppRule objects (detection AND requirement rules in one " +
                     "array, each tagged with its own `ruleType` and `@odata.type`) — e.g. a file-existence " +
                     "detection rule: " +
@@ -1372,7 +1378,13 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
                         .array(z.record(z.any()))
                         .min(1)
                         .describe("Microsoft Graph win32LobAppRule objects — see tool description for the required shape"),
-                    intunewinFileBase64: z.string().describe("Base64-encoded .intunewin file contents"),
+                    intunewinFilePath: z.string().optional().describe(
+                        "Server-side path returned by PUT https://<this server>/uploads/<fileName> (see scripts/stage-upload.sh). " +
+                        "Required for packages larger than ~70KB. Pass this OR intunewinFileBase64, not both."
+                    ),
+                    intunewinFileBase64: z.string().optional().describe(
+                        "Base64-encoded .intunewin file contents — tiny packages only. Pass this OR intunewinFilePath, not both."
+                    ),
                     response_format: ResponseFormatSchema,
                 },
                 annotations: { readOnlyHint: false, openWorldHint: true },
@@ -1380,14 +1392,14 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
             async ({
                 displayName, description, publisher, installCommandLine, uninstallCommandLine,
                 applicableArchitectures, minimumSupportedWindowsRelease, runAsAccount, deviceRestartBehavior,
-                returnCodes, rules, intunewinFileBase64, response_format = "markdown",
+                returnCodes, rules, intunewinFilePath, intunewinFileBase64, response_format = "markdown",
             }) => {
                 try {
                     assertRole(roles, INTUNE_WRITE);
                     const result = await client.createWin32App({
                         displayName, description, publisher, installCommandLine, uninstallCommandLine,
                         applicableArchitectures, minimumSupportedWindowsRelease, runAsAccount, deviceRestartBehavior,
-                        returnCodes, rules, intunewinFileBase64,
+                        returnCodes, rules, intunewinFilePath, intunewinFileBase64,
                     });
                     const text = toText(result, response_format, () =>
                         `Created and published Win32 app **${result.displayName}** (ID ${result.appId}, content version ${result.contentVersionId}). ` +
@@ -2972,9 +2984,10 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
 
 async function main() {
     const app = express();
-    app.use(express.json());
     // Mounted before routes so it wraps everything below, including /health and /metrics itself.
     app.use(metricsMiddleware);
+    // NOTE: no global express.json() — its 100KB limit applies only to /mcp (mounted below), and
+    // /uploads must see the raw request stream so installers can be piped straight to disk.
 
     const PORT = parseInt(process.env.PORT ?? "3002", 10);
     const publicUrl = process.env.INTUNE_MCP_PUBLIC_URL;
@@ -2998,21 +3011,34 @@ async function main() {
         );
     }
 
+    // Shared by /mcp and /uploads so both endpoints accept exactly the same credentials.
+    const mcpAuthOptions = {
+        staticTokenEnvVar: "INTUNE_MCP_AUTH_TOKEN",
+        allRoles: INTUNE_ALL_ROLES,
+        entraVerifier: createEntraVerifier({
+            tenantId: process.env.ENTRA_TENANT_ID ?? "",
+            audience: [process.env.ENTRA_RESOURCE_APP_ID_URI, process.env.ENTRA_RESOURCE_APP_ID].filter(
+                (v): v is string => !!v
+            ),
+        }),
+        entraEnabledEnvVar: "ENTRA_OAUTH_ENABLED",
+        resourceMetadataUrl,
+    };
+
+    app.use("/mcp", requireMcpAuth(mcpAuthOptions));
+    // Parsed after auth so unauthenticated callers can't make us buffer a JSON body.
+    app.use("/mcp", express.json());
+
+    // Staged-upload side door for installers too large for a JSON tool call (see utils/uploads.ts).
     app.use(
-        "/mcp",
-        requireMcpAuth({
-            staticTokenEnvVar: "INTUNE_MCP_AUTH_TOKEN",
-            allRoles: INTUNE_ALL_ROLES,
-            entraVerifier: createEntraVerifier({
-                tenantId: process.env.ENTRA_TENANT_ID ?? "",
-                audience: [process.env.ENTRA_RESOURCE_APP_ID_URI, process.env.ENTRA_RESOURCE_APP_ID].filter(
-                    (v): v is string => !!v
-                ),
-            }),
-            entraEnabledEnvVar: "ENTRA_OAUTH_ENABLED",
-            resourceMetadataUrl,
+        createUploadRouter({
+            auth: mcpAuthOptions,
+            requiredRole: INTUNE_WRITE,
+            allowedExtensions: [".intunewin"],
+            label: "intune-mcp",
         })
     );
+    startUploadSweeper();
 
     // Bounds how many /mcp requests this process handles concurrently — see
     // limitConcurrentRequests()'s doc comment (closes MCP_TOOL_GAPS.md gap #9).

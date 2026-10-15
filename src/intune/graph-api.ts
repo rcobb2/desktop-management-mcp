@@ -3,6 +3,8 @@ import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-grap
 import { ClientSecretCredential } from "@azure/identity";
 import { createLogger, logApiCall } from '../utils/logger.js';
 import yauzl from 'yauzl';
+import type { Readable } from 'node:stream';
+import { isInsideUploadDir, removeStagedFile } from '../utils/uploads.js';
 
 // ─── .intunewin package parsing ─────────────────────────────────────────────
 // A .intunewin file (produced by Microsoft's Win32 Content Prep Tool) is a ZIP
@@ -74,15 +76,12 @@ function readIntunewinZipEntries(buffer: Buffer): Promise<{ detectionXml?: Buffe
     });
 }
 
-async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPackage> {
-    const entries = await readIntunewinZipEntries(buffer);
-    if (!entries.detectionXml) {
-        throw new Error('.intunewin package is missing Metadata/Detection.xml — is this a valid Win32 Content Prep Tool package?');
-    }
-    if (!entries.content) {
-        throw new Error('.intunewin package is missing its Contents/ payload.');
-    }
-    const xml = entries.detectionXml.toString('utf8');
+type IntunewinMetadata = Omit<ParsedIntunewinPackage, 'encryptedContent'>;
+
+// Builds everything except the encrypted payload from Detection.xml. Shared by
+// the buffer-based and file-based parsers so the two can't drift apart.
+function parseIntunewinMetadata(detectionXml: Buffer): IntunewinMetadata {
+    const xml = detectionXml.toString('utf8');
     return {
         setupFileName: extractDetectionXmlTag(xml, 'SetupFile'),
         // <FileName> is the encrypted content archive's own name (e.g.
@@ -102,7 +101,122 @@ async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPac
             fileDigest: extractDetectionXmlTag(xml, 'FileDigest'),
             fileDigestAlgorithm: extractDetectionXmlTag(xml, 'FileDigestAlgorithm'),
         },
-        encryptedContent: entries.content,
+    };
+}
+
+export async function parseIntunewinPackage(buffer: Buffer): Promise<ParsedIntunewinPackage> {
+    const entries = await readIntunewinZipEntries(buffer);
+    if (!entries.detectionXml) {
+        throw new Error('.intunewin package is missing Metadata/Detection.xml — is this a valid Win32 Content Prep Tool package?');
+    }
+    if (!entries.content) {
+        throw new Error('.intunewin package is missing its Contents/ payload.');
+    }
+    return { ...parseIntunewinMetadata(entries.detectionXml), encryptedContent: entries.content };
+}
+
+// ─── File-based .intunewin parsing (no whole-package buffering) ─────────────
+// Staged uploads can be GBs, so instead of fromBuffer this opens the zip on
+// disk, keeps only the tiny Detection.xml in memory, and streams the encrypted
+// payload entry straight to Azure. Entry matching mirrors readIntunewinZipEntries
+// exactly (same regexes, last matching Contents/ entry wins).
+
+interface IntunewinFilePackage {
+    metadata: IntunewinMetadata;
+    /** Decompressed byte length of the encrypted payload — what `content.length` is on the buffer path. */
+    encryptedSize: number;
+    /** Streams the encrypted payload as chunks; opens its own zip handle and closes it when done. */
+    streamEncryptedContent(): AsyncGenerator<Buffer>;
+}
+
+function openZipFile(filePath: string): Promise<yauzl.ZipFile> {
+    return new Promise((resolve, reject) => {
+        // autoClose:false — we may call openReadStream after the last entry event, and close explicitly.
+        yauzl.open(filePath, { lazyEntries: true, autoClose: false }, (err, zipfile) => {
+            if (err || !zipfile) return reject(err ?? new Error('Failed to open .intunewin as a zip archive'));
+            resolve(zipfile);
+        });
+    });
+}
+
+function readZipEntryStream(zipfile: yauzl.ZipFile, entry: yauzl.Entry): Promise<Readable> {
+    return new Promise((resolve, reject) => {
+        zipfile.openReadStream(entry, (err, stream) => {
+            if (err || !stream) return reject(err ?? new Error(`Failed to read zip entry ${entry.fileName}`));
+            resolve(stream);
+        });
+    });
+}
+
+async function readStreamToBuffer(stream: Readable): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const c of stream) chunks.push(c as Buffer);
+    return Buffer.concat(chunks);
+}
+
+function isIntunewinContentEntry(fileName: string): boolean {
+    return /(^|\/)Contents\//i.test(fileName) && !/\/$/.test(fileName);
+}
+
+export async function parseIntunewinPackageFile(filePath: string): Promise<IntunewinFilePackage> {
+    const zipfile = await openZipFile(filePath);
+    let detectionXml: Buffer | undefined;
+    let contentEntry: yauzl.Entry | undefined;
+    try {
+        await new Promise<void>((resolve, reject) => {
+            zipfile.on('error', reject);
+            zipfile.on('end', () => resolve());
+            zipfile.on('entry', async (entry: yauzl.Entry) => {
+                try {
+                    if (/Metadata\/Detection\.xml$/i.test(entry.fileName) && !/\/$/.test(entry.fileName)) {
+                        detectionXml = await readStreamToBuffer(await readZipEntryStream(zipfile, entry));
+                    } else if (isIntunewinContentEntry(entry.fileName)) {
+                        contentEntry = entry;
+                    }
+                    zipfile.readEntry();
+                } catch (e) {
+                    reject(e);
+                }
+            });
+            zipfile.readEntry();
+        });
+    } finally {
+        zipfile.close();
+    }
+    if (!detectionXml) {
+        throw new Error('.intunewin package is missing Metadata/Detection.xml — is this a valid Win32 Content Prep Tool package?');
+    }
+    if (!contentEntry) {
+        throw new Error('.intunewin package is missing its Contents/ payload.');
+    }
+    const entryName = (contentEntry as yauzl.Entry).fileName;
+    const encryptedSize = (contentEntry as yauzl.Entry).uncompressedSize;
+
+    return {
+        metadata: parseIntunewinMetadata(detectionXml),
+        encryptedSize,
+        async *streamEncryptedContent() {
+            const zf = await openZipFile(filePath);
+            try {
+                const entry = await new Promise<yauzl.Entry>((resolve, reject) => {
+                    zf.on('error', reject);
+                    zf.on('end', () => reject(new Error(`.intunewin payload entry ${entryName} disappeared between reads`)));
+                    zf.on('entry', (e: yauzl.Entry) => (e.fileName === entryName ? resolve(e) : zf.readEntry()));
+                    zf.readEntry();
+                });
+                const stream = await readZipEntryStream(zf, entry);
+                let total = 0;
+                for await (const chunk of stream) {
+                    total += (chunk as Buffer).length;
+                    yield chunk as Buffer;
+                }
+                if (total !== encryptedSize) {
+                    throw new Error(`.intunewin payload size mismatch: read ${total} bytes, expected ${encryptedSize}`);
+                }
+            } finally {
+                zf.close();
+            }
+        },
     };
 }
 
@@ -2802,12 +2916,37 @@ export class IntuneClient {
     // API requirement, just the value every reference implementation uses.
     private static readonly AZURE_BLOCK_CHUNK_SIZE = 6 * 1024 * 1024;
 
-    private async uploadEncryptedContentToAzure(azureStorageUri: string, content: Buffer): Promise<void> {
+    // Re-slices an arbitrary chunk stream (zip read-stream chunks are ~16-64KB) into
+    // exact AZURE_BLOCK_CHUNK_SIZE blocks, so the block layout is identical to what
+    // slicing a fully-buffered Buffer produces. Holds at most ~one block in memory.
+    private static async *rechunk(source: Buffer | AsyncIterable<Buffer>): AsyncGenerator<Buffer> {
+        const size = IntuneClient.AZURE_BLOCK_CHUNK_SIZE;
+        const iterable: AsyncIterable<Buffer> | Iterable<Buffer> = Buffer.isBuffer(source) ? [source] : source;
+        let pending: Buffer[] = [];
+        let pendingLen = 0;
+        for await (const piece of iterable as AsyncIterable<Buffer>) {
+            pending.push(piece);
+            pendingLen += piece.length;
+            if (pendingLen >= size) {
+                const all = Buffer.concat(pending, pendingLen);
+                let off = 0;
+                while (all.length - off >= size) {
+                    yield all.subarray(off, off + size);
+                    off += size;
+                }
+                const rest = all.subarray(off);
+                pending = rest.length ? [rest] : [];
+                pendingLen = rest.length;
+            }
+        }
+        if (pendingLen > 0) yield Buffer.concat(pending, pendingLen);
+    }
+
+    private async uploadEncryptedContentToAzure(azureStorageUri: string, content: Buffer | AsyncIterable<Buffer>): Promise<void> {
         const blockIds: string[] = [];
         let offset = 0;
         let blockNumber = 0;
-        while (offset < content.length) {
-            const chunk = content.subarray(offset, Math.min(offset + IntuneClient.AZURE_BLOCK_CHUNK_SIZE, content.length));
+        for await (const chunk of IntuneClient.rechunk(content)) {
             const blockId = Buffer.from(String(blockNumber).padStart(6, '0')).toString('base64');
             blockIds.push(blockId);
             const apiStart = Date.now();
@@ -2821,7 +2960,7 @@ export class IntuneClient {
                 const text = await response.text().catch(() => '');
                 throw new Error(`Azure block upload failed at offset ${offset} (${response.status}): ${text}`);
             }
-            offset += IntuneClient.AZURE_BLOCK_CHUNK_SIZE;
+            offset += chunk.length;
             blockNumber++;
         }
 
@@ -2866,8 +3005,11 @@ export class IntuneClient {
     // Always creates a NEW app object (no upsert-by-displayName — updating an
     // existing app's content means adding a new content version, a materially
     // different operation from creating one, so it isn't folded in here).
-    // `intunewinFileBase64` is the raw .intunewin file's bytes, base64-encoded —
-    // the same file the Win32 Content Prep Tool produces, unmodified.
+    // Exactly one of `intunewinFileBase64` (raw .intunewin bytes, base64-encoded —
+    // the same file the Win32 Content Prep Tool produces, unmodified; buffered in
+    // memory, so small packages only) or `intunewinFilePath` (a file staged via
+    // PUT /uploads; parsed and streamed to Azure without buffering, and deleted
+    // after a successful publish) is required.
     public async createWin32App(params: {
         displayName: string;
         description?: string;
@@ -2880,13 +3022,38 @@ export class IntuneClient {
         deviceRestartBehavior?: 'basedOnReturnCode' | 'allow' | 'suppress' | 'force';
         returnCodes?: { returnCode: number; type: string }[];
         rules: any[];
-        intunewinFileBase64: string;
+        intunewinFileBase64?: string;
+        intunewinFilePath?: string;
     }) {
         this.logger.info('Creating Win32 app', { displayName: params.displayName });
         await this.trackAuthAttempt();
 
-        const packageBuffer = Buffer.from(params.intunewinFileBase64, 'base64');
-        const pkg = await parseIntunewinPackage(packageBuffer);
+        if (Boolean(params.intunewinFileBase64) === Boolean(params.intunewinFilePath)) {
+            throw new Error('Pass exactly one of `intunewinFilePath` (a file staged via PUT /uploads) or `intunewinFileBase64`, not both/neither.');
+        }
+        if (params.intunewinFilePath && !isInsideUploadDir(params.intunewinFilePath)) {
+            throw new Error(
+                `Refusing to read "${params.intunewinFilePath}": it is not an existing file inside the staged-upload directory. ` +
+                'Stage the .intunewin first with PUT /uploads/<fileName> (see scripts/stage-upload.sh) and pass the returned `path`.'
+            );
+        }
+
+        // Both branches normalize to the same three things the rest of the pipeline needs:
+        // metadata, the encrypted payload's byte length, and a source for the Azure upload.
+        let pkg: IntunewinMetadata;
+        let encryptedSize: number;
+        let encryptedSource: Buffer | AsyncIterable<Buffer>;
+        if (params.intunewinFilePath) {
+            const filePkg = await parseIntunewinPackageFile(params.intunewinFilePath);
+            pkg = filePkg.metadata;
+            encryptedSize = filePkg.encryptedSize;
+            encryptedSource = filePkg.streamEncryptedContent();
+        } else {
+            const parsed = await parseIntunewinPackage(Buffer.from(params.intunewinFileBase64!, 'base64'));
+            pkg = parsed;
+            encryptedSize = parsed.encryptedContent.length;
+            encryptedSource = parsed.encryptedContent;
+        }
 
         const appBody: Record<string, any> = {
             '@odata.type': '#microsoft.graph.win32LobApp',
@@ -2936,14 +3103,14 @@ export class IntuneClient {
                     '@odata.type': '#microsoft.graph.mobileAppContentFile',
                     name: pkg.contentFileName,
                     size: pkg.unencryptedContentSize,
-                    sizeEncrypted: pkg.encryptedContent.length,
+                    sizeEncrypted: encryptedSize,
                     isDependency: false,
                 });
             logApiCall(this.logger, 'POST', `contentVersions/${versionId}/files`, 201, Date.now() - apiStart);
             const fileId = contentFile.id;
 
             const fileWithUri = await this.pollContentFile(appId, versionId, fileId, (f) => Boolean(f.azureStorageUri));
-            await this.uploadEncryptedContentToAzure(fileWithUri.azureStorageUri, pkg.encryptedContent);
+            await this.uploadEncryptedContentToAzure(fileWithUri.azureStorageUri, encryptedSource);
 
             apiStart = Date.now();
             await this.client
@@ -2960,6 +3127,9 @@ export class IntuneClient {
                 .version('beta')
                 .patch({ '@odata.type': '#microsoft.graph.win32LobApp', committedContentVersion: versionId });
             logApiCall(this.logger, 'PATCH', `mobileApps/${appId}`, 204, Date.now() - apiStart);
+
+            // Consumed — free the disk now; only reached on full success so a failed run can be retried.
+            if (params.intunewinFilePath) removeStagedFile(params.intunewinFilePath);
 
             this.logger.info('Win32 app created and content committed', { appId, displayName: params.displayName, versionId });
             return { appId, displayName: params.displayName, contentVersionId: versionId, setupFileName: pkg.setupFileName };
