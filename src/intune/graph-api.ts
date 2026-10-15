@@ -3065,7 +3065,7 @@ export class IntuneClient {
             installCommandLine: params.installCommandLine,
             uninstallCommandLine: params.uninstallCommandLine,
             applicableArchitectures: params.applicableArchitectures ?? 'x64',
-            minimumSupportedWindowsRelease: params.minimumSupportedWindowsRelease ?? 'Windows10_1607',
+            minimumSupportedWindowsRelease: params.minimumSupportedWindowsRelease ?? '1607',
             installExperience: {
                 '@odata.type': '#microsoft.graph.win32LobAppInstallExperience',
                 runAsAccount: params.runAsAccount ?? 'system',
