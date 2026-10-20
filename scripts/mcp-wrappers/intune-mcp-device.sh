@@ -17,7 +17,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DESKTOP_MCP_DIR="${DESKTOP_MCP_DIR:-$(cd "${SCRIPT_DIR}/../../../desktop-management-mcp" && pwd)}"
+# This script lives inside the desktop-management-mcp repo itself (whatever the
+# checkout is named — e.g. "mcpservers"), so default to that repo; fall back to
+# the old sibling-checkout layout for copies placed in another repo.
+if [[ -z "${DESKTOP_MCP_DIR:-}" ]]; then
+  for candidate in "${SCRIPT_DIR}/../.." "${SCRIPT_DIR}/.." "${SCRIPT_DIR}/../../../desktop-management-mcp"; do
+    if [[ -f "${candidate}/dist/src/cli/entra-device-auth.js" ]]; then
+      DESKTOP_MCP_DIR="$(cd "${candidate}" && pwd)"; break
+    fi
+  done
+fi
+if [[ ! -f "${DESKTOP_MCP_DIR:-}/dist/src/cli/entra-device-auth.js" ]]; then
+  echo "mcp wrapper: can't find dist/src/cli/entra-device-auth.js — run 'npm run build' or set DESKTOP_MCP_DIR" >&2
+  exit 1
+fi
 PROFILE="${1:-intune}"          # matches the --profile used with `entra-device-auth login`
 MCP_URL="${2:-https://intune-mcp.colgate.edu/mcp}"
 CALLBACK_PORT="${3:-3335}"      # unused by mcp-remote once --header bypasses OAuth, but it still binds this port
