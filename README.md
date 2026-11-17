@@ -286,12 +286,15 @@ Compliance Benchmarks, Blueprints, and `jamf_list_filevault_status` all hit the 
 | `intune_get_device_groups` | Device group memberships | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_get_device_apps` | Detected & assigned apps | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_list_configuration_policies` | Configuration policies (classic + settings catalog) | `policyName?`, `platform?` |
+| `intune_search_setting_definitions` | Search Settings Catalog setting definitions (IDs, choice options, children) to build a `settings` array | `idPrefix?`, `keyword?`, `top?` |
 | `intune_troubleshoot_device_policies` | Device-level policy deployment diagnostics | `deviceName?`, `deviceId?`, `serialNumber?` |
 | `intune_get_policy_assignments` | Assignment targets for a policy, by ID or name | `policyId?`, `policyName?`, `source?` |
 | `intune_troubleshoot_policy` | Correlates policy assignment + device state | `deviceName?`, `deviceId?`, `serialNumber?`, `policyId?`, `policyName?`, `source?` |
 | `intune_list_app_deployments` | Intune app deployments | `appName?`, `publisher?`, `platform?` |
 | `intune_get_app_assignments` | Assignment targets for an app, by ID or name | `appId?`, `appName?` |
 | `intune_troubleshoot_app` | Correlates app assignment + device app status | `deviceName?`, `deviceId?`, `serialNumber?`, `appId?`, `appName?` |
+| `intune_create_windows_configuration_profile` | Create an unassigned Windows Settings Catalog policy from a raw `settings` array | `name`, `description?`, `settings` |
+| `intune_delete_remediation` | Permanently delete a Proactive Remediation package | `scriptId` |
 | `intune_create_win32_app` | Publish a Win32 app (create object, upload + commit .intunewin). Large packages: stage via `PUT /uploads` first | `displayName`, `publisher`, `installCommandLine`, `uninstallCommandLine`, `rules`, `intunewinFilePath` (staged `path`) or `intunewinFileBase64` (tiny packages only), plus install-behavior options |
 
 ## Running Tests

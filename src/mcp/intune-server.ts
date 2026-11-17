@@ -1599,6 +1599,33 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
         );
     }
 
+    // ── intune_delete_remediation ────────────────────────────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_delete_remediation",
+            {
+                description:
+                    "Permanently delete a Proactive Remediation script package (and with it, its assignments) by " +
+                    "ID. IRREVERSIBLE. Already-applied changes on devices are not rolled back; the scripts just " +
+                    "stop running.",
+                inputSchema: {
+                    scriptId: z.string().describe("Remediation script package ID (GUID)"),
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true, destructiveHint: true },
+            },
+            async ({ scriptId }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.deleteRemediation(scriptId);
+                    const text = `Deleted remediation script package **${result.displayName}** (ID ${result.id}). This cannot be undone.`;
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
     // ── intune_run_remediation_now ───────────────────────────────────────────
     if (hasRole(roles, INTUNE_WRITE)) {
         server.registerTool(
@@ -2417,6 +2444,86 @@ function createIntuneMcpServer(roles: string[], caller: string): McpServer {
 
                     const text = toText(result, response_format, () =>
                         `## Configuration profile created — "${result.name}"\n- ID: ${result.id}\n- Platform: ${result.platforms} | Technologies: ${result.technologies}`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 29a. intune_create_windows_configuration_profile ─────────────────────
+    if (hasRole(roles, INTUNE_WRITE)) {
+        server.registerTool(
+            "intune_create_windows_configuration_profile",
+            {
+                description:
+                    "Create a Windows configuration profile as a Settings Catalog policy (platforms \"windows10\", " +
+                    "technologies \"mdm\"). Creates it UNASSIGNED — scope it afterwards with intune_assign_policy. " +
+                    "`settings` is a raw passthrough array of Graph settingInstance objects. Build it from " +
+                    "intune_search_setting_definitions (definition IDs, choice option itemIds, child IDs), or copy " +
+                    "the `settings` array of an existing Windows policy via intune_get_configuration_profile " +
+                    "(response_format=\"json\").",
+                inputSchema: {
+                    name: z.string().describe("Display name for the new configuration profile"),
+                    description: z.string().optional(),
+                    settings: z.array(z.record(z.any())).describe("Raw Settings Catalog settingInstance objects"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: false, openWorldHint: true },
+            },
+            async ({ name, description, settings, response_format = "markdown" }) => {
+                try {
+                    assertRole(roles, INTUNE_WRITE);
+                    const result = await client.createSettingsCatalogPolicy({
+                        name, description, settings, platforms: "windows10", technologies: "mdm",
+                    });
+
+                    const text = toText(result, response_format, () =>
+                        `## Configuration profile created — "${result.name}"\n- ID: ${result.id}\n- Platform: ${result.platforms} | Technologies: ${result.technologies}\n- Unassigned — use intune_assign_policy to scope it.`
+                    );
+                    return { content: [{ type: "text", text }] };
+                } catch (err) {
+                    return errorResult(err);
+                }
+            }
+        );
+    }
+
+    // ── 29b. intune_search_setting_definitions ───────────────────────────────
+    if (hasRole(roles, INTUNE_READ)) {
+        server.registerTool(
+            "intune_search_setting_definitions",
+            {
+                description:
+                    "Search Intune Settings Catalog setting definitions (any platform) to find the definition IDs, " +
+                    "choice option itemIds and child setting IDs needed to build a `settings` array for " +
+                    "intune_create_windows_configuration_profile / intune_create_android_configuration_profile. " +
+                    "Pass idPrefix (definition IDs are the lowercased CSP path, e.g. " +
+                    "\"device_vendor_msft_policy_config_applicationmanagement_\") and/or a keyword.",
+                inputSchema: {
+                    idPrefix: z.string().optional().describe("Setting definition ID prefix (startswith match)"),
+                    keyword: z.string().optional().describe("Free-text search over display name/description"),
+                    top: z.number().int().min(1).max(200).optional().describe("Max results (default 50)"),
+                    response_format: ResponseFormatSchema,
+                },
+                annotations: { readOnlyHint: true, openWorldHint: true },
+            },
+            async ({ idPrefix, keyword, top, response_format = "markdown" }) => {
+                try {
+                    if (!idPrefix && !keyword) {
+                        return { content: [{ type: "text", text: "Provide idPrefix and/or keyword." }], isError: true };
+                    }
+                    const defs = await client.searchSettingDefinitions({ idPrefix, keyword, top });
+                    const text = toText(defs, response_format, () =>
+                        defs.length === 0
+                            ? "No setting definitions matched."
+                            : `## Setting definitions (${defs.length})\n` + defs.map((d: any) =>
+                                `- **${d.displayName}** — \`${d.id}\` (${d.odataType?.replace('#microsoft.graph.', '')}, ${d.platform})` +
+                                (d.options?.length ? `\n  - options: ${d.options.map((o: any) => `\`${o.itemId}\` (${o.displayName})`).join(', ')}` : '') +
+                                (d.childIds?.length ? `\n  - children: ${d.childIds.map((c: string) => `\`${c}\``).join(', ')}` : '')
+                            ).join('\n')
                     );
                     return { content: [{ type: "text", text }] };
                 } catch (err) {

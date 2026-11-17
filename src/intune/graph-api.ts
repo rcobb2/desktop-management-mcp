@@ -3265,17 +3265,20 @@ export class IntuneClient {
         }
     }
 
-    // Test-only: deletes a remediation script package by ID, used solely so
-    // test/intune-api.test.ts can self-clean one it creates via createRemediation. Not
-    // exposed as an MCP tool — no delete tools exist anywhere in this codebase's MCP surface.
+    // Deletes a remediation script package by ID. Exposed as intune_delete_remediation, and
+    // also used by test/intune-api.test.ts to self-clean one it creates via createRemediation.
     public async deleteRemediation(scriptId: string) {
-        this.logger.info('Deleting remediation script package (test cleanup)', { scriptId });
+        this.logger.info('Deleting remediation script package', { scriptId });
         await this.trackAuthAttempt();
         const path = `/deviceManagement/deviceHealthScripts/${scriptId}`;
         try {
+            // Read first so a bad ID fails with Graph's 404 before anything is deleted, and so
+            // the caller gets the name of what was actually removed.
+            const existing = await this.client.api(path).version('beta').select('id,displayName').get();
             const apiStart = Date.now();
             await this.client.api(path).version('beta').delete();
             logApiCall(this.logger, 'DELETE', path, 204, Date.now() - apiStart);
+            return { id: existing.id as string, displayName: existing.displayName as string };
         } catch (error) {
             this.logger.error('Error deleting remediation script package', { scriptId, error: (error as Error).message });
             logApiCall(this.logger, 'DELETE', path, undefined, undefined, error as Error);
@@ -4053,6 +4056,45 @@ export class IntuneClient {
             return { id: created.id, name: input.name, platforms: body.platforms, technologies: body.technologies };
         } catch (error) {
             this.logger.error('Error creating settings catalog policy', { name: input.name, error: (error as Error).message, stack: (error as Error).stack });
+            throw error;
+        }
+    }
+
+    /**
+     * Search Settings Catalog setting definitions, so a caller can build a `settings` array for
+     * createSettingsCatalogPolicy without an existing policy to copy from. `idPrefix` uses a
+     * `startswith(id, ...)` filter (definition IDs are the lowercased CSP path, e.g.
+     * `device_vendor_msft_policy_config_applicationmanagement_`); `keyword` uses Graph's `$search`
+     * over display name/description. Returns the trimmed fields needed to construct a
+     * settingInstance: id, odata type, options (choice settings) and child IDs.
+     */
+    public async searchSettingDefinitions(input: { idPrefix?: string; keyword?: string; top?: number }) {
+        this.logger.info('Searching settings catalog definitions', input);
+        await this.trackAuthAttempt();
+
+        const path = '/deviceManagement/configurationSettings';
+        try {
+            let req = this.client.api(path).version('beta').top(input.top ?? 50);
+            if (input.idPrefix) req = req.filter(`startswith(id,'${input.idPrefix.toLowerCase().replace(/'/g, "''")}')`);
+            if (input.keyword) req = req.search(`"${input.keyword.replace(/"/g, '')}"`);
+            const apiStart = Date.now();
+            const response = await req.get();
+            logApiCall(this.logger, 'GET', path, 200, Date.now() - apiStart);
+
+            return (response.value || []).map((d: any) => ({
+                id: d.id,
+                displayName: d.displayName,
+                odataType: d['@odata.type'],
+                description: d.description,
+                platform: d.applicability?.platform,
+                technologies: d.applicability?.technologies,
+                options: (d.options || []).map((o: any) => ({ itemId: o.itemId, displayName: o.displayName })),
+                childIds: d.childIds,
+                dependentOn: (d.dependentOn || []).map((x: any) => x.dependentOn),
+            }));
+        } catch (error) {
+            this.logger.error('Error searching settings catalog definitions', { ...input, error: (error as Error).message });
+            logApiCall(this.logger, 'GET', path, undefined, undefined, error as Error);
             throw error;
         }
     }
